@@ -1,72 +1,80 @@
 # randomtrader
 
-# Momentum Scanner & Auto-Trader System
+A Python-based momentum scanner and auto-trader design for small-cap day trading strategies. This repository currently contains the system specification and operating guidelines. Use it as the blueprint for building the scanner, entry logic, risk controls, and reporting pipeline.
 
-## Overview
-Build a Python-based day trading system that:
-1. Scans for stocks up 50%+ by 10:30 AM EST with high relative volume
-2. Enters positions based on specific criteria
-3. Manages exits via profit target or stop loss
-4. Runs in paper trading mode by default
+## What this project is
 
-## Technical Stack
+The system is designed to:
+
+1. Scan for small-cap stocks up **50%+** by late morning with high relative volume.
+2. Enter trades only when price action and liquidity checks are favorable.
+3. Exit via profit targets, stop losses, or time-based stops.
+4. Run in paper trading mode by default.
+
+> ⚠️ **Disclaimer**: This project is for educational purposes. Trading is risky; nothing here is financial advice.
+
+## Technical stack
+
 - Python 3.11+
-- Alpaca API (free paper trading + market data)
+- Alpaca API (paper trading + market data)
 - SQLite for trade logging
 - Discord/Telegram webhook for alerts (optional)
 
-## Core Components
+## Core components
 
 ### 1. Market Scanner (`scanner.py`)
-- Run at 10:30 AM EST daily
-- Query for stocks meeting criteria:
-  - Price change from open: +20% to +150%
-  - Current price: $1 - $50 (avoid penny stocks under $1)
-  - Volume: At least 5x average daily volume (relative volume > 5)
-  - Market cap: $50M - $2B (small caps, not micro-caps)
-  - Shares outstanding / float: Under 50M shares preferred
+- Run at **10:30 AM EST** daily
+- Criteria:
+  - Price change from open: **+50% to +150%**
+  - Price: **$1 - $50**
+  - Relative volume: **≥ 5x** average daily volume
+  - Market cap: **$50M - $2B**
+  - Shares outstanding / float: **< 50M** preferred
   - Must be tradeable on Alpaca (no OTC)
-- Return ranked list by: (% gain × relative volume)
+- Ranking score: **(% gain × relative volume)**
 
 ### 2. Entry Logic (`entry.py`)
-- For each candidate from scanner:
-  - Check if price is within 10% of day's high (don't buy on a dump)
-  - Check bid-ask spread < 1% (liquidity filter)
-  - Check that it's not halted
-  - Position size: Risk no more than 2% of account per trade
-  - Max 3 positions open simultaneously
-  - Use LIMIT orders at ask price (don't market order)
+- Only consider stocks:
+  - Within **10%** of the day’s high
+  - Bid-ask spread **< 1%**
+  - Not halted
+- Position size:
+  - Risk no more than **2%** of account per trade
+  - Max **3 positions** open simultaneously
+  - **LIMIT** orders at ask price (avoid market orders)
 
 ### 3. Position Manager (`positions.py`)
-- Monitor all open positions in real-time (1-second polling)
+- Poll open positions every **1 second**
 - Exit conditions:
-  - PROFIT TARGET: +5% from entry → sell 100%
-  - STOP LOSS: -3% from entry → sell 100%
-  - TIME STOP: If neither hit by 3:45 PM EST → sell 100%
-- Use LIMIT orders for exits when possible, MARKET if urgent (stop loss)
-- Track partial fills
+  - **Profit target**: +5% from entry → sell 100%
+  - **Stop loss**: -3% from entry → sell 100%
+  - **Time stop**: exit at 3:45 PM EST if neither hit
+- Use **LIMIT** orders for exits when possible, **MARKET** for urgent stops
+- Track partial fills and log outcomes
 
 ### 4. Risk Management (`risk.py`)
-- Daily loss limit: -5% of account → stop trading for day
-- Per-trade risk: Max 2% of account
-- No trading in first 15 min or last 15 min of market
-- Blacklist: No trading on FOMC days, monthly options expiry
-- Track win rate, average win, average loss in real-time
+- Daily loss limit: **-5% of account** → stop trading
+- Per-trade risk: **max 2%**
+- No trading in first 15 minutes or last 15 minutes of market
+- Blacklist trading on:
+  - FOMC days
+  - Monthly options expiration (OPEX)
+- Track win rate, average win, and average loss in real time
 
 ### 5. Database & Logging (`db.py`)
-- SQLite database with tables:
+- SQLite database tables:
   - `scans`: timestamp, symbols found, criteria met
   - `trades`: entry_time, symbol, entry_price, exit_price, exit_time, pnl, exit_reason
   - `daily_summary`: date, trades, wins, losses, net_pnl
-- Log every decision with reasoning
+- Log every decision with reasoning for post-analysis
 
 ### 6. Main Orchestrator (`main.py`)
 - Scheduler using `schedule` library:
-  - 9:30 AM: Initialize, check account status
-  - 11:00 AM: Run scanner, evaluate entries
-  - 11:01 AM onwards: Monitor positions every second
-  - 4:00 PM: Generate daily report
-- Paper trading mode by default (set `PAPER_TRADING=True`)
+  - **9:30 AM**: Initialize, check account status
+  - **11:00 AM**: Run scanner, evaluate entries
+  - **11:01 AM onward**: Monitor positions every second
+  - **4:00 PM**: Generate daily report
+- Paper trading by default (`PAPER_TRADING=True`)
 - Command line args: `--live` for real trading (requires confirmation)
 
 ### 7. Configuration (`config.py`)
@@ -84,13 +92,21 @@ MIN_GAIN_PCT = 0.50       # 50% up from open
 MIN_REL_VOLUME = 5        # 5x average volume
 ```
 
-## Alpaca Setup
-- Use Alpaca's free paper trading API
-- Endpoint: `https://paper-api.alpaca.markets`
-- Get API keys from alpaca.markets
-- Store keys in `.env` file (never commit)
+## Alpaca setup
 
-## File Structure
+1. Create an Alpaca account at <https://alpaca.markets>.
+2. Generate paper trading API keys.
+3. Store keys in a `.env` file (never commit real keys).
+
+Example `.env`:
+```
+ALPACA_API_KEY=your_key
+ALPACA_API_SECRET=your_secret
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+```
+
+## Suggested repo structure
+
 ```
 momentum_trader/
 ├── main.py
@@ -108,19 +124,33 @@ momentum_trader/
     └── trades.db
 ```
 
-## Key Implementation Notes
-1. Always use Eastern Time for market hours
-2. Handle market halts gracefully (common on big movers)
-3. Implement exponential backoff for API rate limits
-4. Log EVERYTHING for post-analysis
-5. Include a `--backtest` mode using historical data if time permits
+## Implementation notes
 
-## Testing
-- Dry run scanner on historical "big mover" days
-- Paper trade for minimum 2 weeks before considering live
+- Use **Eastern Time** for all market times.
+- Handle market halts (common on big movers).
+- Implement exponential backoff for API rate limits.
+- Log **everything** for post-analysis.
+- Consider a `--backtest` mode using historical data when possible.
+
+## Testing checklist
+
+- Dry-run scanner on historical big-mover days
+- Paper trade for at least 2 weeks
 - Generate daily P&L reports
 
-## Output
-- Console output showing scan results, entries, exits
+## Outputs
+
+- Console output showing scan results, entries, and exits
 - Daily summary email/Discord notification
-- Trade log exportable to CSV for analysis
+- Trade log exportable to CSV
+
+## Next steps
+
+If you plan to implement the system in this repo, start with:
+
+1. `config.py` for configurable thresholds
+2. `scanner.py` for market filtering logic
+3. `entry.py` and `positions.py` for trade lifecycle management
+4. `db.py` and logging utilities for observability
+
+From there, integrate Alpaca and wire up `main.py` to the scheduler.
