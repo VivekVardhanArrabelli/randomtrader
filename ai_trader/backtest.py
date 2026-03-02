@@ -368,6 +368,10 @@ class BacktestConfig:
     max_positions: int = 5
     llm_delay_seconds: float = 1.0
     use_journal: bool = True
+    journal_max_active: int = 8
+    journal_max_full_display: int = 5
+    journal_stale_cycles: int = 8
+    journal_stale_conviction: float = 0.4
 
 
 @dataclass
@@ -490,30 +494,20 @@ def _build_performance_summary(
         s["trades"].append(t)
     top_tickers = sorted(ticker_stats.items(), key=lambda x: x[1]["wins"] + x[1]["losses"], reverse=True)[:5]
 
-    lines = [
-        "\n--- Running Performance ---",
-        f"Total trades: {total} | Wins: {n_wins} | Losses: {n_losses} | Win rate: {win_rate:.1f}%",
-        f"Net P&L: ${net_pnl:+,.2f} | Equity: ${equity:,.2f} ({ret_pct:+.1f}% vs start)",
-        f"Avg winner: ${avg_win:+,.2f} | Avg loser: ${avg_loss:+,.2f} | W/L ratio: {wl_ratio:.2f}",
-        f"Recent streak (last {len(recent)}): {streak}",
-    ]
-    if top_tickers:
-        lines.append("Top tickers:")
-        for sym, s in top_tickers:
-            lines.append(f"  {sym}: {s['wins']}W/{s['losses']}L net=${s['pnl']:+,.2f}")
+    lines = ["\n--- Running Performance ---"]
 
-    # Repeat losers: tickers with 2+ losses and 0 wins
+    # Repeat losers FIRST — most actionable signal, must not get buried
     repeat_losers = [
         (sym, s) for sym, s in ticker_stats.items()
         if s["losses"] >= 2 and s["wins"] == 0
     ]
     repeat_losers.sort(key=lambda x: x[1]["losses"], reverse=True)
     if repeat_losers:
-        lines.append("Repeat losers:")
+        lines.append("WARNING — REPEAT LOSERS (you keep losing on these tickers):")
         for sym, s in repeat_losers:
             n_trades = s["losses"]
-            avg_loss_val = s["pnl"] / n_trades if n_trades else 0
-            # Compute avg holding period from entry_date and timestamp (exit date)
+            total_lost = s["pnl"]
+            avg_loss_val = total_lost / n_trades if n_trades else 0
             hold_days = []
             for t in s["trades"]:
                 entry_str = t.get("entry_date", "")
@@ -527,9 +521,30 @@ def _build_performance_summary(
                         pass
             avg_hold = sum(hold_days) / len(hold_days) if hold_days else 0
             lines.append(
-                f"  {sym}: {n_trades} trades, 0 wins"
+                f"  {sym}: {n_trades} trades, 0 wins, ${total_lost:+,.0f} total lost"
                 f" — avg hold: {avg_hold:.1f} days, avg loss: ${avg_loss_val:+,.0f}"
             )
+
+    # Equity momentum (last 5 trades)
+    if recent:
+        momentum = sum(t.get("pnl", 0) for t in recent)
+        m_wins = sum(1 for t in recent if (t.get("pnl") or 0) > 0)
+        m_losses = sum(1 for t in recent if (t.get("pnl") or 0) < 0)
+        lines.append(
+            f"Equity momentum (last {len(recent)} trades): ${momentum:+,.0f} "
+            f"({m_wins}W/{m_losses}L)"
+        )
+
+    lines.extend([
+        f"Total trades: {total} | Wins: {n_wins} | Losses: {n_losses} | Win rate: {win_rate:.1f}%",
+        f"Net P&L: ${net_pnl:+,.2f} | Equity: ${equity:,.2f} ({ret_pct:+.1f}% vs start)",
+        f"Avg winner: ${avg_win:+,.2f} | Avg loser: ${avg_loss:+,.2f} | W/L ratio: {wl_ratio:.2f}",
+        f"Recent streak (last {len(recent)}): {streak}",
+    ])
+    if top_tickers:
+        lines.append("Top tickers:")
+        for sym, s in top_tickers:
+            lines.append(f"  {sym}: {s['wins']}W/{s['losses']}L net=${s['pnl']:+,.2f}")
 
     return "\n".join(lines)
 
@@ -846,6 +861,10 @@ def _build_enriched_portfolio_context(
                 f"    entry=${pos.entry_premium:.2f} current=${current_premium:.2f} "
                 f"unrealized={pnl_pct:+.1f}% (${pnl_dollar:+,.2f}) qty={pos.qty}"
             )
+            if dte > 0:
+                daily_decay = current_premium / dte
+                total_daily = daily_decay * pos.qty * 100
+                lines.append(f"    time decay ≈${total_daily:.0f}/day")
             # Flag proximity to exit triggers
             flags = []
             if pnl_pct >= profit_target_pct * 100 * 0.8:
@@ -878,7 +897,12 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
         raise ValueError("POLYGON_API_KEY required for backtesting")
 
     brain = TradingBrain(api_key=anthropic_key)
-    journal = ThesisJournal() if bt_config.use_journal else None
+    journal = ThesisJournal(
+        max_active=bt_config.journal_max_active,
+        max_full_display=bt_config.journal_max_full_display,
+        stale_cycles=bt_config.journal_stale_cycles,
+        stale_conviction=bt_config.journal_stale_conviction,
+    ) if bt_config.use_journal else None
     trading_days = _trading_days(bt_config.start_date, bt_config.end_date)
 
     result = BacktestResult(initial_equity=bt_config.initial_equity)
@@ -1047,8 +1071,91 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 }
 
                 if decision.action == "close_position":
-                    trade_record["skip_reason"] = "close_position (not supported in backtest)"
+                    # Find matching position
+                    target = decision.target_symbol
+                    matched_pos = None
+                    if target:
+                        matched_pos = next(
+                            (p for p in positions if p.polygon_ticker == target), None
+                        )
+                    if matched_pos is None:
+                        # Fallback: match by underlying
+                        matched_pos = next(
+                            (p for p in positions
+                             if p.underlying.upper() == decision.underlying.upper()),
+                            None,
+                        )
+
+                    if matched_pos is None:
+                        trade_record["skip_reason"] = "no matching position"
+                        trade_results.append(trade_record)
+                        log(f"  SKIP close {decision.underlying}: no matching position")
+                        continue
+
+                    # Get current option premium
+                    option_bar = fetch_option_daily_bar(
+                        polygon_key, matched_pos.polygon_ticker, trade_date, cache=cache
+                    )
+                    if option_bar is None:
+                        trade_record["skip_reason"] = "no option price data for close"
+                        trade_results.append(trade_record)
+                        log(f"  SKIP close {matched_pos.polygon_ticker}: no price data")
+                        continue
+
+                    exit_premium = _option_bar_price(option_bar)
+                    if exit_premium <= 0:
+                        trade_record["skip_reason"] = "invalid exit price for close"
+                        trade_results.append(trade_record)
+                        continue
+
+                    # Calculate P&L and update equity
+                    trade_pnl = (exit_premium - matched_pos.entry_premium) * matched_pos.qty * 100
+                    equity += trade_pnl
+
+                    # Create SimTrade record
+                    sim_trade = SimTrade(
+                        entry_date=matched_pos.entry_date,
+                        exit_date=trade_date,
+                        underlying=matched_pos.underlying,
+                        option_type=matched_pos.option_type,
+                        strike=matched_pos.strike,
+                        entry_premium=matched_pos.entry_premium,
+                        exit_premium=exit_premium,
+                        qty=matched_pos.qty,
+                        pnl=trade_pnl,
+                        exit_reason="manual_close",
+                        conviction=matched_pos.conviction,
+                        polygon_ticker=matched_pos.polygon_ticker,
+                        reasoning=matched_pos.reasoning,
+                    )
+                    result.trades.append(sim_trade)
+
+                    # Append to closed_trades for portfolio context
+                    closed_trades.append({
+                        "timestamp": trade_date.isoformat(),
+                        "entry_date": matched_pos.entry_date.isoformat(),
+                        "underlying": matched_pos.underlying,
+                        "option_type": matched_pos.option_type,
+                        "entry_premium": matched_pos.entry_premium,
+                        "exit_premium": exit_premium,
+                        "pnl": trade_pnl,
+                        "reason": "manual_close",
+                        "polygon_ticker": matched_pos.polygon_ticker,
+                    })
+
+                    # Remove position and update trade_record
+                    positions.remove(matched_pos)
+
+                    trade_record["status"] = "executed"
+                    trade_record["contract"] = matched_pos.polygon_ticker
+                    trade_record["qty"] = matched_pos.qty
+                    trade_record["premium"] = exit_premium
+                    trade_record["pnl"] = trade_pnl
                     trade_results.append(trade_record)
+                    log(
+                        f"  CLOSE {matched_pos.polygon_ticker} "
+                        f"exit=${exit_premium:.2f} pnl=${trade_pnl:+,.2f}"
+                    )
                     continue
                 if len(positions) >= bt_config.max_positions:
                     trade_record["skip_reason"] = "max positions reached"
@@ -1414,9 +1521,16 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
                     contract = tr.get("contract", "")
                     qty = tr.get("qty", 0)
                     premium = tr.get("premium", 0)
-                    lines.append(
-                        f"  → Executed: {contract} qty={qty} premium=${premium:.2f}"
-                    )
+                    if tr.get("action") == "close_position":
+                        pnl = tr.get("pnl", 0)
+                        lines.append(
+                            f"  → Closed: {contract} qty={qty} "
+                            f"exit=${premium:.2f} pnl=${pnl:+,.2f}"
+                        )
+                    else:
+                        lines.append(
+                            f"  → Executed: {contract} qty={qty} premium=${premium:.2f}"
+                        )
                 else:
                     skip_reason = tr.get("skip_reason", "unknown")
                     lines.append(f"  → SKIPPED: {skip_reason}")
@@ -1470,6 +1584,14 @@ def run() -> None:
         "--no-journal", action="store_true",
         help="Disable thesis journal and trade history (stateless mode)",
     )
+    parser.add_argument(
+        "--journal-max-active", type=int, default=8,
+        help="Max active theses in journal (0=unlimited, default=8)",
+    )
+    parser.add_argument(
+        "--journal-max-display", type=int, default=5,
+        help="Max theses shown in full detail (0=all, default=5)",
+    )
     args = parser.parse_args()
 
     env_path = Path(__file__).with_name(".env")
@@ -1483,6 +1605,8 @@ def run() -> None:
         initial_equity=args.equity,
         llm_delay_seconds=args.delay,
         use_journal=not args.no_journal,
+        journal_max_active=args.journal_max_active,
+        journal_max_full_display=args.journal_max_display,
     )
 
     result = run_backtest(bt_config)

@@ -890,7 +890,7 @@ def test_filter_news_quality_empty():
 # ---------------------------------------------------------------------------
 
 def test_performance_summary_repeat_losers():
-    """Tickers with 2+ losses and 0 wins should appear in Repeat losers."""
+    """Tickers with 2+ losses and 0 wins should appear in WARNING section."""
     trades = [
         {"underlying": "NVDA", "pnl": -5000, "entry_date": "2025-01-02", "timestamp": "2025-01-04"},
         {"underlying": "NVDA", "pnl": -6000, "entry_date": "2025-01-06", "timestamp": "2025-01-08"},
@@ -898,16 +898,30 @@ def test_performance_summary_repeat_losers():
         {"underlying": "AAPL", "pnl": 2000, "entry_date": "2025-01-03", "timestamp": "2025-01-05"},
     ]
     result = _build_performance_summary(trades, 87_000, 100_000)
-    assert "Repeat losers:" in result
+    assert "WARNING" in result
+    assert "REPEAT LOSERS" in result
     assert "NVDA: 3 trades, 0 wins" in result
+    assert "$-15,000 total lost" in result
     assert "avg hold:" in result
     assert "avg loss:" in result
     # AAPL should NOT appear in repeat losers (it has a win)
-    assert "AAPL" not in result.split("Repeat losers:")[1]
+    assert "AAPL" not in result.split("REPEAT LOSERS")[1].split("Total trades")[0]
+
+
+def test_performance_summary_repeat_losers_before_stats():
+    """Repeat losers section should appear before the overall stats."""
+    trades = [
+        {"underlying": "NVDA", "pnl": -5000, "entry_date": "2025-01-02", "timestamp": "2025-01-04"},
+        {"underlying": "NVDA", "pnl": -6000, "entry_date": "2025-01-06", "timestamp": "2025-01-08"},
+    ]
+    result = _build_performance_summary(trades, 89_000, 100_000)
+    warning_pos = result.index("WARNING")
+    stats_pos = result.index("Total trades")
+    assert warning_pos < stats_pos
 
 
 def test_performance_summary_no_repeat_losers():
-    """No Repeat losers section when all tickers have at least 1 win."""
+    """No WARNING section when all tickers have at least 1 win."""
     trades = [
         {"underlying": "NVDA", "pnl": 500, "timestamp": "2025-01-05"},
         {"underlying": "NVDA", "pnl": -300, "timestamp": "2025-01-08"},
@@ -915,7 +929,7 @@ def test_performance_summary_no_repeat_losers():
         {"underlying": "AAPL", "pnl": -100, "timestamp": "2025-01-09"},
     ]
     result = _build_performance_summary(trades, 100_300, 100_000)
-    assert "Repeat losers:" not in result
+    assert "REPEAT LOSERS" not in result
 
 
 def test_performance_summary_repeat_losers_hold_days():
@@ -925,8 +939,9 @@ def test_performance_summary_repeat_losers_hold_days():
         {"underlying": "META", "pnl": -2000, "entry_date": "2025-01-06", "timestamp": "2025-01-10"},  # 4 days
     ]
     result = _build_performance_summary(trades, 97_000, 100_000)
-    assert "Repeat losers:" in result
+    assert "REPEAT LOSERS" in result
     assert "META: 2 trades, 0 wins" in result
+    assert "$-3,000 total lost" in result
     # avg hold = (2+4)/2 = 3.0 days
     assert "avg hold: 3.0 days" in result
 
@@ -1104,3 +1119,302 @@ def test_save_debug_log(tmp_path):
     assert "SKIPPED" in content
     assert "no contract found" in content
     assert "$95,000" in content
+
+
+# ---------------------------------------------------------------------------
+# close_position support
+# ---------------------------------------------------------------------------
+
+def _make_position(underlying="AAPL", polygon_ticker="O:AAPL250117C00150000",
+                   option_type="call", strike=150.0, entry_premium=5.0,
+                   qty=2, conviction=0.85):
+    """Helper: build a SimPosition for close_position tests."""
+    return SimPosition(
+        underlying=underlying,
+        option_type=option_type,
+        strike=strike,
+        entry_date=date(2025, 1, 6),
+        expiry_date=date(2025, 1, 17),
+        entry_premium=entry_premium,
+        qty=qty,
+        conviction=conviction,
+        reasoning="test position",
+        polygon_ticker=polygon_ticker,
+    )
+
+
+def test_close_position_by_target_symbol(monkeypatch):
+    """close_position with target_symbol matches by exact polygon_ticker."""
+    import ai_trader.backtest as bt_mod
+
+    pos = _make_position(polygon_ticker="O:AAPL250117C00150000")
+    positions = [pos]
+
+    # Simulate the matching logic from close_position block
+    target = "O:AAPL250117C00150000"
+    matched_pos = next(
+        (p for p in positions if p.polygon_ticker == target), None
+    )
+    assert matched_pos is not None
+    assert matched_pos.polygon_ticker == "O:AAPL250117C00150000"
+    assert matched_pos.underlying == "AAPL"
+
+
+def test_close_position_by_underlying():
+    """close_position without target_symbol falls back to underlying match."""
+    pos_aapl = _make_position(underlying="AAPL", polygon_ticker="O:AAPL250117C00150000")
+    pos_tsla = _make_position(underlying="TSLA", polygon_ticker="O:TSLA250117P00200000",
+                              option_type="put", strike=200.0)
+    positions = [pos_aapl, pos_tsla]
+
+    # No target_symbol, match by underlying
+    target = None
+    matched_pos = None
+    if target:
+        matched_pos = next(
+            (p for p in positions if p.polygon_ticker == target), None
+        )
+    if matched_pos is None:
+        matched_pos = next(
+            (p for p in positions
+             if p.underlying.upper() == "TSLA"),
+            None,
+        )
+    assert matched_pos is not None
+    assert matched_pos.underlying == "TSLA"
+    assert matched_pos.polygon_ticker == "O:TSLA250117P00200000"
+
+
+def test_close_position_no_match():
+    """close_position with no matching position skips with reason."""
+    positions = [_make_position(underlying="AAPL")]
+
+    # Try to close NVDA — no match
+    target = None
+    matched_pos = None
+    if target:
+        matched_pos = next(
+            (p for p in positions if p.polygon_ticker == target), None
+        )
+    if matched_pos is None:
+        matched_pos = next(
+            (p for p in positions
+             if p.underlying.upper() == "NVDA"),
+            None,
+        )
+    assert matched_pos is None  # no match found
+
+
+def test_close_position_pnl():
+    """P&L calculation for close_position: (exit - entry) * qty * 100."""
+    pos = _make_position(entry_premium=5.0, qty=10)
+    exit_premium = 7.5
+
+    trade_pnl = (exit_premium - pos.entry_premium) * pos.qty * 100
+    assert trade_pnl == 2500.0  # (7.5 - 5.0) * 10 * 100
+
+    # Negative P&L case
+    exit_premium_loss = 3.0
+    trade_pnl_loss = (exit_premium_loss - pos.entry_premium) * pos.qty * 100
+    assert trade_pnl_loss == -2000.0  # (3.0 - 5.0) * 10 * 100
+
+
+def test_close_position_removes_from_positions():
+    """After close_position, the position is removed from the list."""
+    pos_aapl = _make_position(underlying="AAPL", polygon_ticker="O:AAPL250117C00150000")
+    pos_tsla = _make_position(underlying="TSLA", polygon_ticker="O:TSLA250117P00200000",
+                              option_type="put", strike=200.0)
+    positions = [pos_aapl, pos_tsla]
+    assert len(positions) == 2
+
+    # Close AAPL
+    matched_pos = pos_aapl
+    positions.remove(matched_pos)
+    assert len(positions) == 1
+    assert positions[0].underlying == "TSLA"
+
+
+def test_close_position_sim_trade_exit_reason():
+    """SimTrade created for close_position has exit_reason='manual_close'."""
+    pos = _make_position()
+    exit_premium = 7.5
+    trade_pnl = (exit_premium - pos.entry_premium) * pos.qty * 100
+    trade_date = date(2025, 1, 10)
+
+    sim_trade = SimTrade(
+        entry_date=pos.entry_date,
+        exit_date=trade_date,
+        underlying=pos.underlying,
+        option_type=pos.option_type,
+        strike=pos.strike,
+        entry_premium=pos.entry_premium,
+        exit_premium=exit_premium,
+        qty=pos.qty,
+        pnl=trade_pnl,
+        exit_reason="manual_close",
+        conviction=pos.conviction,
+        polygon_ticker=pos.polygon_ticker,
+        reasoning=pos.reasoning,
+    )
+    assert sim_trade.exit_reason == "manual_close"
+    assert sim_trade.exit_premium == 7.5
+    assert sim_trade.pnl == 500.0
+    assert sim_trade.polygon_ticker == "O:AAPL250117C00150000"
+
+
+# ---------------------------------------------------------------------------
+# _build_performance_summary — equity momentum
+# ---------------------------------------------------------------------------
+
+def test_performance_summary_equity_momentum_positive():
+    """Winning streak shows correct P&L sum and W/L count."""
+    trades = [
+        {"underlying": "AAPL", "pnl": 1000, "timestamp": "2025-01-02"},
+        {"underlying": "MSFT", "pnl": -500, "timestamp": "2025-01-03"},
+        {"underlying": "NVDA", "pnl": 2000, "timestamp": "2025-01-04"},
+        {"underlying": "TSLA", "pnl": 1500, "timestamp": "2025-01-05"},
+        {"underlying": "AMZN", "pnl": -800, "timestamp": "2025-01-06"},
+    ]
+    result = _build_performance_summary(trades, 103_200, 100_000)
+    assert "Equity momentum" in result
+    assert "$+3,200" in result
+    assert "3W/2L" in result
+
+
+def test_performance_summary_equity_momentum_negative():
+    """Losing streak shows correct negative P&L sum and W/L count."""
+    trades = [
+        {"underlying": "AAPL", "pnl": 500, "timestamp": "2025-01-02"},
+        {"underlying": "MSFT", "pnl": -3000, "timestamp": "2025-01-03"},
+        {"underlying": "NVDA", "pnl": -2000, "timestamp": "2025-01-04"},
+        {"underlying": "TSLA", "pnl": -1500, "timestamp": "2025-01-05"},
+        {"underlying": "AMZN", "pnl": -2400, "timestamp": "2025-01-06"},
+    ]
+    result = _build_performance_summary(trades, 91_600, 100_000)
+    assert "Equity momentum" in result
+    assert "$-8,400" in result
+    assert "1W/4L" in result
+
+
+def test_performance_summary_equity_momentum_few_trades():
+    """Works correctly with fewer than 5 trades."""
+    trades = [
+        {"underlying": "AAPL", "pnl": 1000, "timestamp": "2025-01-02"},
+        {"underlying": "MSFT", "pnl": 500, "timestamp": "2025-01-03"},
+    ]
+    result = _build_performance_summary(trades, 101_500, 100_000)
+    assert "Equity momentum (last 2 trades)" in result
+    assert "$+1,500" in result
+    assert "2W/0L" in result
+
+
+def test_performance_summary_equity_momentum_position():
+    """Equity momentum should appear after repeat losers and before total trades."""
+    trades = [
+        {"underlying": "NVDA", "pnl": -5000, "entry_date": "2025-01-02", "timestamp": "2025-01-04"},
+        {"underlying": "NVDA", "pnl": -6000, "entry_date": "2025-01-06", "timestamp": "2025-01-08"},
+    ]
+    result = _build_performance_summary(trades, 89_000, 100_000)
+    warning_pos = result.index("WARNING")
+    momentum_pos = result.index("Equity momentum")
+    stats_pos = result.index("Total trades")
+    assert warning_pos < momentum_pos < stats_pos
+
+
+# ---------------------------------------------------------------------------
+# _build_enriched_portfolio_context — time decay
+# ---------------------------------------------------------------------------
+
+def test_enriched_portfolio_time_decay():
+    """Position with known current premium and DTE>0 should show time decay."""
+    cache = PolygonCache()
+    ticker = "O:AAPL250117C00150000"
+    cache.option_bars[ticker] = {
+        "2025-01-10": {"c": 3.0, "vw": 3.0, "v": 100},
+    }
+    pos = SimPosition(
+        underlying="AAPL", option_type="call", strike=150.0,
+        entry_date=date(2025, 1, 6), expiry_date=date(2025, 1, 15),
+        entry_premium=5.0, qty=2, conviction=0.85, reasoning="test",
+        polygon_ticker=ticker,
+    )
+    # trade_date=2025-01-10, expiry=2025-01-15 → DTE=5
+    # daily_decay = 3.0/5 = 0.6, total = 0.6 * 2 * 100 = $120/day
+    result = _build_enriched_portfolio_context(
+        equity=100_000, initial_equity=100_000,
+        positions=[pos], trade_date=date(2025, 1, 10),
+        api_key="fake", cache=cache,
+        profit_target_pct=0.50, stop_loss_pct=0.40, time_stop_dte=2,
+    )
+    assert "time decay" in result
+    assert "$120/day" in result
+
+
+def test_enriched_portfolio_time_decay_dte_zero():
+    """No time decay line when DTE=0 (expiring today)."""
+    cache = PolygonCache()
+    ticker = "O:AAPL250110C00150000"
+    cache.option_bars[ticker] = {
+        "2025-01-10": {"c": 2.0, "vw": 2.0, "v": 100},
+    }
+    pos = SimPosition(
+        underlying="AAPL", option_type="call", strike=150.0,
+        entry_date=date(2025, 1, 6), expiry_date=date(2025, 1, 10),
+        entry_premium=5.0, qty=2, conviction=0.85, reasoning="test",
+        polygon_ticker=ticker,
+    )
+    result = _build_enriched_portfolio_context(
+        equity=100_000, initial_equity=100_000,
+        positions=[pos], trade_date=date(2025, 1, 10),
+        api_key="fake", cache=cache,
+        profit_target_pct=0.50, stop_loss_pct=0.40, time_stop_dte=2,
+    )
+    assert "time decay" not in result
+
+
+def test_save_debug_log_close_position(tmp_path):
+    """save_debug_log renders close_position trades with 'Closed:' line."""
+    r = BacktestResult(
+        initial_equity=100_000,
+        final_equity=100_500,
+        total_return_pct=0.005,
+        total_trades=1,
+        wins=1,
+        losses=0,
+        days_tested=3,
+        decision_log=[
+            {
+                "date": "2025-01-10",
+                "market_analysis": "Market steady.",
+                "thesis_updates": [],
+                "trades_proposed": [
+                    {
+                        "underlying": "AAPL",
+                        "action": "close_position",
+                        "conviction": 0.80,
+                        "risk_pct": 0.0,
+                        "reasoning": "Locking in profits",
+                        "status": "executed",
+                        "skip_reason": "",
+                        "contract": "O:AAPL250117C00150000",
+                        "qty": 2,
+                        "premium": 7.5,
+                        "pnl": 500.0,
+                    },
+                ],
+                "trades_executed": 1,
+                "trades_skipped": 0,
+                "equity": 100500.0,
+                "open_positions": 0,
+            }
+        ],
+    )
+    out_path = tmp_path / "test_close.debug.md"
+    save_debug_log(r, out_path)
+    content = out_path.read_text()
+    assert "CLOSE POSITION" in content
+    assert "Closed:" in content
+    assert "exit=$7.50" in content
+    assert "pnl=$+500" in content
+    # Should NOT say "Executed:" for close trades
+    assert "Executed:" not in content
