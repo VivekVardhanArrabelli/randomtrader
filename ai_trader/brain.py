@@ -67,6 +67,11 @@ You maintain a thesis journal across trading cycles. This is your memory.
 - A good thesis builds over 2-3 cycles before becoming a trade.
 - Not every thesis needs to become a trade — invalidating is fine.
 - Reference thesis IDs when making trade decisions so there's a clear link.
+- Your journal has limited active slots. If it's full, the system will auto-prune \
+your lowest-conviction developing theses. Proactively invalidate weak theses to \
+make room for stronger ones. Quality over quantity — 5 strong theses beat 15 mediocre ones.
+- Developing theses you don't update or raise conviction on for many cycles will \
+be automatically pruned. Keep your journal fresh.
 
 SELF-ASSESSMENT:
 Your trade history shows your actual results. Study it carefully each cycle:
@@ -314,13 +319,23 @@ class TradingBrain:
         ])
         if options_context:
             sections.extend(["", "=== AVAILABLE OPTIONS ===", options_context])
-        sections.extend([
-            "",
+        instruction = (
             "Analyze the above. First update your thesis journal with what you're "
             "seeing — create new theses, update existing ones, or invalidate stale ones. "
+            "If your journal is near capacity, prioritize: invalidate your weakest theses "
+            "before creating new ones. "
+        )
+        if "REPEAT LOSERS" in trade_history_context:
+            instruction += (
+                "You have repeat-loser tickers in your history. Before trading them "
+                "again, state what is genuinely different this time — a new catalyst, "
+                "not the same thesis repackaged. "
+            )
+        instruction += (
             "Then decide whether to make any trades. Prefer trading on mature theses "
-            "over snap decisions.",
-        ])
+            "over snap decisions."
+        )
+        sections.extend(["", instruction])
         return "\n".join(sections)
 
     def _parse_response(self, response) -> MarketAnalysis:

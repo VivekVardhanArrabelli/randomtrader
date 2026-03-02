@@ -1,0 +1,15 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local env / secrets
+.env
+momentum_trader/.env
+ai_trader/.env
+
+# Local runtime artifacts
+momentum_trader/logs/
+ai_trader/logs/

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.randomtrader.momentumtrader</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/vivekvardhanarrabelli/randomtrader</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/vivekvardhanarrabelli/randomtrader/scripts/run_live.sh</string>
+    </array>
+
+    <!-- Weekdays in launchd: 1=Sunday ... 7=Saturday -->
+    <!-- This uses local machine time (e.g. 08:40 CST ~= 09:40 ET). -->
+    <key>StartCalendarInterval</key>
+    <array>
+      <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>40</integer></dict>
+      <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>40</integer></dict>
+      <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>40</integer></dict>
+      <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>40</integer></dict>
+      <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>40</integer></dict>
+    </array>
+
+    <!-- Restart on crashes, but do not restart after a normal exit (the app exits after LIVE_EXIT_TIME). -->
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vivekvardhanarrabelli/randomtrader/momentum_trader/logs/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/vivekvardhanarrabelli/randomtrader/momentum_trader/logs/launchd.err</string>
+  </dict>
+</plist>
+

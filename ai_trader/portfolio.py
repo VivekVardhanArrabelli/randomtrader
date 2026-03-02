@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from . import config
 from .alpaca_client import AlpacaClient
 from .utils import AccountSnapshot, log, now_eastern
 
@@ -44,12 +45,23 @@ class OptionPosition:
             daily_decay = self.current_price / self.dte
             total_daily = daily_decay * abs(self.qty) * 100
             decay_info = f" decay≈${total_daily:.0f}/day"
+        # Exit-trigger proximity flags
+        flags: list[str] = []
+        if self.cost_basis > 0 and self.current_price > 0:
+            if self.pnl_pct >= config.PROFIT_TARGET_PCT * 0.8:
+                flags.append(f"approaching profit target of {config.PROFIT_TARGET_PCT:.0%}")
+            if self.pnl_pct <= -config.STOP_LOSS_PCT * 0.8:
+                flags.append(f"approaching stop loss of {config.STOP_LOSS_PCT:.0%}")
+        if self.dte != 999 and self.dte <= config.TIME_STOP_DTE + 1:
+            flags.append(f"approaching time stop ({config.TIME_STOP_DTE} DTE)")
+        flag_str = f" [{'; '.join(flags)}]" if flags else ""
+
         return (
             f"{self.underlying} {direction} ${self.strike:.2f} exp={self.expiration} "
             f"qty={self.qty} entry=${self.avg_entry_price:.2f} "
             f"current=${self.current_price:.2f} "
             f"P&L=${self.unrealized_pl:.2f} ({self.pnl_pct:.1%}) "
-            f"DTE={self.dte}{decay_info}"
+            f"DTE={self.dte}{decay_info}{flag_str}"
         )
 
 
