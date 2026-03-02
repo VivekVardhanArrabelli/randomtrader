@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import os
+import re
 import time as time_module
 from collections import Counter
 from dataclasses import dataclass, field
@@ -40,8 +41,10 @@ def _polygon_request(api_key: str, path: str, params: dict | None = None) -> dic
     params["apiKey"] = api_key
     url = f"https://api.polygon.io{path}"
     response = requests.get(url, params=params, timeout=30)
-    if response.status_code == 429:
-        time_module.sleep(12)
+    for attempt in range(3):
+        if response.status_code != 429:
+            break
+        time_module.sleep(12 + attempt * 5)
         response = requests.get(url, params=params, timeout=30)
     if response.status_code >= 400:
         raise RuntimeError(f"Polygon {response.status_code}: {response.text[:200]}")
@@ -396,6 +399,40 @@ def _trading_days(start: date, end: date) -> list[date]:
     return days
 
 
+# ---------------------------------------------------------------------------
+# News quality filter — remove lawsuit spam & corporate housekeeping
+# ---------------------------------------------------------------------------
+
+_JUNK_TITLE_PATTERNS = [
+    # Lawsuit/legal spam
+    "securities fraud",
+    "class action",
+    "loss recovery",
+    "reminds investors",
+    "encourages.*investors",
+    "investor rights",
+    "deadline reminder",
+    "deadline tuesday",
+    "deadline alert",
+    "recover your losses",
+    "leading law firm",
+    "have suffered losses",
+    "securities class action",
+    # Corporate housekeeping
+    "inducement grant",
+    "listing rule 5635",
+    "repurchase of own shares",
+    "omien osakkeiden",            # Nokia Finnish filings
+]
+
+_JUNK_RE = re.compile("|".join(_JUNK_TITLE_PATTERNS), re.IGNORECASE)
+
+
+def _filter_news_quality(articles: list[dict]) -> list[dict]:
+    """Remove junk articles (lawsuit spam, corporate housekeeping) by title."""
+    return [a for a in articles if not _JUNK_RE.search(a.get("title", ""))]
+
+
 def _format_news_for_backtest(articles: list[dict]) -> str:
     lines = []
     for a in articles[:30]:
@@ -441,13 +478,14 @@ def _build_performance_summary(
     ticker_stats: dict[str, dict] = {}
     for t in closed_trades:
         sym = t.get("underlying", "???")
-        s = ticker_stats.setdefault(sym, {"wins": 0, "losses": 0, "pnl": 0.0})
+        s = ticker_stats.setdefault(sym, {"wins": 0, "losses": 0, "pnl": 0.0, "trades": []})
         pnl = t.get("pnl", 0)
         if pnl > 0:
             s["wins"] += 1
         elif pnl < 0:
             s["losses"] += 1
         s["pnl"] += pnl
+        s["trades"].append(t)
     top_tickers = sorted(ticker_stats.items(), key=lambda x: x[1]["wins"] + x[1]["losses"], reverse=True)[:5]
 
     lines = [
@@ -462,7 +500,197 @@ def _build_performance_summary(
         for sym, s in top_tickers:
             lines.append(f"  {sym}: {s['wins']}W/{s['losses']}L net=${s['pnl']:+,.2f}")
 
+    # Repeat losers: tickers with 2+ losses and 0 wins
+    repeat_losers = [
+        (sym, s) for sym, s in ticker_stats.items()
+        if s["losses"] >= 2 and s["wins"] == 0
+    ]
+    repeat_losers.sort(key=lambda x: x[1]["losses"], reverse=True)
+    if repeat_losers:
+        lines.append("Repeat losers:")
+        for sym, s in repeat_losers:
+            n_trades = s["losses"]
+            avg_loss_val = s["pnl"] / n_trades if n_trades else 0
+            # Compute avg holding period from entry_date and timestamp (exit date)
+            hold_days = []
+            for t in s["trades"]:
+                entry_str = t.get("entry_date", "")
+                exit_str = t.get("timestamp", "")
+                if entry_str and exit_str:
+                    try:
+                        ed = date.fromisoformat(str(entry_str)[:10])
+                        xd = date.fromisoformat(str(exit_str)[:10])
+                        hold_days.append((xd - ed).days)
+                    except (ValueError, TypeError):
+                        pass
+            avg_hold = sum(hold_days) / len(hold_days) if hold_days else 0
+            lines.append(
+                f"  {sym}: {n_trades} trades, 0 wins"
+                f" — avg hold: {avg_hold:.1f} days, avg loss: ${avg_loss_val:+,.0f}"
+            )
+
     return "\n".join(lines)
+
+
+def _build_market_trend_context(
+    api_key: str, trade_date: date, lookback_days: int = 10,
+) -> str:
+    """Build multi-day market trend context for major indices.
+
+    Fetches lookback_days of daily bars for SPY, QQQ, IWM and computes
+    today's change, 5-day change, 10-day change, and simple trend direction.
+    """
+    start = trade_date - timedelta(days=int(lookback_days * 1.8))  # buffer for weekends/holidays
+    lines = [f"Major Indices ({lookback_days}-day view):"]
+
+    for idx_sym in ["SPY", "QQQ", "IWM"]:
+        bars = fetch_historical_daily_bars_range(api_key, idx_sym, start, trade_date)
+        time_module.sleep(0.25)
+        if not bars:
+            continue
+
+        # bars are sorted ascending by date; last bar is today (or most recent)
+        today_bar = bars[-1]
+        today_close = float(today_bar.get("c", 0))
+        today_open = float(today_bar.get("o", 0))
+        if today_close <= 0:
+            continue
+
+        intraday_chg = ((today_close - today_open) / today_open * 100) if today_open > 0 else 0
+
+        # 5-day change: compare today's close to close 5 bars ago
+        five_d_chg = 0.0
+        if len(bars) >= 6:
+            ref = float(bars[-6].get("c", 0))
+            if ref > 0:
+                five_d_chg = (today_close - ref) / ref * 100
+
+        # 10-day change: compare today's close to close 10 bars ago
+        ten_d_chg = 0.0
+        if len(bars) >= 11:
+            ref = float(bars[-11].get("c", 0))
+            if ref > 0:
+                ten_d_chg = (today_close - ref) / ref * 100
+
+        # Trend: above or below 10-day average close
+        recent_bars = bars[-lookback_days:] if len(bars) >= lookback_days else bars
+        avg_close = sum(float(b.get("c", 0)) for b in recent_bars) / len(recent_bars)
+        trend = "up" if today_close >= avg_close else "down"
+
+        lines.append(
+            f"  {idx_sym}: ${today_close:.2f}"
+            f" today({intraday_chg:+.2f}%)"
+            f" 5d({five_d_chg:+.1f}%)"
+            f" 10d({ten_d_chg:+.1f}%)"
+            f" trend={trend}"
+        )
+
+    return "\n".join(lines)
+
+
+def _build_ticker_price_context(
+    api_key: str, ticker: str, trade_date: date, lookback_days: int = 10,
+) -> tuple[str | None, float]:
+    """Build price trend context for a single ticker.
+
+    Returns (context_string, spot_price).  context_string looks like:
+      spot=$140.00 today(-1.5%) 5d(+8.2%) 10d(+12.1%) hi/lo=$145/$125
+    Returns (None, 0.0) if no data available.
+    """
+    start = trade_date - timedelta(days=int(lookback_days * 1.8))
+    bars = fetch_historical_daily_bars_range(api_key, ticker, start, trade_date)
+    if not bars:
+        return None, 0.0
+
+    today_bar = bars[-1]
+    today_close = float(today_bar.get("c", 0))
+    today_open = float(today_bar.get("o", 0))
+    if today_close <= 0:
+        return None, 0.0
+
+    intraday_chg = ((today_close - today_open) / today_open * 100) if today_open > 0 else 0
+
+    five_d_chg = 0.0
+    if len(bars) >= 6:
+        ref = float(bars[-6].get("c", 0))
+        if ref > 0:
+            five_d_chg = (today_close - ref) / ref * 100
+
+    ten_d_chg = 0.0
+    if len(bars) >= 11:
+        ref = float(bars[-11].get("c", 0))
+        if ref > 0:
+            ten_d_chg = (today_close - ref) / ref * 100
+
+    recent_bars = bars[-lookback_days:] if len(bars) >= lookback_days else bars
+    recent_high = max(float(b.get("h", 0)) for b in recent_bars)
+    recent_low = min(float(b.get("l", float("inf"))) for b in recent_bars)
+
+    ctx = (
+        f"spot=${today_close:.2f}"
+        f" today({intraday_chg:+.1f}%)"
+        f" 5d({five_d_chg:+.1f}%)"
+        f" 10d({ten_d_chg:+.1f}%)"
+        f" hi/lo=${recent_high:.0f}/${recent_low:.0f}"
+    )
+    return ctx, today_close
+
+
+def _annotate_closed_trades(
+    closed_trades: list[dict],
+    api_key: str,
+    cache: PolygonCache,
+) -> list[dict]:
+    """Annotate closed trades with underlying price movement over holding period.
+
+    Adds a 'context' field to all closed trades with valid entry/exit dates,
+    showing what the underlying stock did while the position was held.
+    Uses cached bars when available to minimize API calls.
+    """
+    annotated = []
+    # Cache underlying bars per ticker to avoid redundant fetches
+    underlying_bars_cache: dict[str, list[dict]] = {}
+
+    for trade in closed_trades:
+        trade = dict(trade)  # shallow copy to avoid mutating original
+        underlying = trade.get("underlying", "")
+        entry_date_str = trade.get("entry_date", "")
+        exit_date_str = trade.get("timestamp", "")  # timestamp is exit date
+
+        if underlying and entry_date_str and exit_date_str:
+            try:
+                entry_dt = date.fromisoformat(entry_date_str) if isinstance(entry_date_str, str) else entry_date_str
+                exit_dt = date.fromisoformat(exit_date_str) if isinstance(exit_date_str, str) else exit_date_str
+            except (ValueError, TypeError):
+                annotated.append(trade)
+                continue
+
+            cache_key = underlying
+            if cache_key not in underlying_bars_cache:
+                # Fetch full range — usually already available from other queries
+                bars = fetch_historical_daily_bars_range(
+                    api_key, underlying, entry_dt, exit_dt,
+                )
+                underlying_bars_cache[cache_key] = bars
+
+            bars = underlying_bars_cache[cache_key]
+            if len(bars) >= 2:
+                entry_price = float(bars[0].get("c", 0))
+                exit_price = float(bars[-1].get("c", 0))
+                if entry_price > 0 and exit_price > 0:
+                    move_pct = (exit_price - entry_price) / entry_price * 100
+                    option_type = trade.get("option_type", "")
+                    direction = "bearish" if option_type == "put" else "bullish"
+                    trade["context"] = (
+                        f"Underlying moved: {underlying}"
+                        f" ${entry_price:.0f}→${exit_price:.0f}"
+                        f" ({move_pct:+.1f}%)"
+                        f" while holding {direction} position"
+                    )
+
+        annotated.append(trade)
+
+    return annotated
 
 
 def _extract_top_news_tickers(
@@ -510,15 +738,21 @@ def _build_options_context(
     expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
     for ticker in tickers:
-        # Fetch spot price
-        bar = fetch_historical_daily_bar(api_key, ticker, trade_date)
-        if bar is None:
-            continue
-        spot = float(bar.get("close") or bar.get("c") or 0)
+        # Fetch spot price + trend context (single range query, no extra call)
+        trend_ctx, spot = _build_ticker_price_context(api_key, ticker, trade_date)
         if spot <= 0:
-            continue
+            # Fallback: try single-day bar
+            bar = fetch_historical_daily_bar(api_key, ticker, trade_date)
+            if bar is None:
+                continue
+            spot = float(bar.get("close") or bar.get("c") or 0)
+            if spot <= 0:
+                continue
 
-        lines.append(f"  {ticker} (spot=${spot:.2f}):")
+        if trend_ctx:
+            lines.append(f"  {ticker} ({trend_ctx}):")
+        else:
+            lines.append(f"  {ticker} (spot=${spot:.2f}):")
         strike_gte = round(spot * 0.97, 2)
         strike_lte = round(spot * 1.03, 2)
 
@@ -543,14 +777,20 @@ def _build_options_context(
             vol = opt_bar.get("v", 0) if opt_bar else 0
 
             if premium > 0:
+                day_range = ""
+                if opt_bar:
+                    bar_hi = opt_bar.get("h")
+                    bar_lo = opt_bar.get("l")
+                    if bar_hi and bar_lo:
+                        day_range = f" day_range=${bar_lo:.2f}-${bar_hi:.2f}"
                 lines.append(
                     f"    {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
-                    f" premium=${premium:.2f} vol={vol}"
+                    f" premium=${premium:.2f} vol={vol}{day_range}"
                 )
                 found_any = True
 
-        # Rate limit between tickers
-        time_module.sleep(0.3)
+        # Rate limit between tickers (range bars + contract lookups + option bars)
+        time_module.sleep(1.0)
 
     if not found_any:
         return "(Backtest mode: real Polygon options data used for pricing)"
@@ -715,7 +955,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 result.trades.append(sim_trade)
                 closed_trades.append({
                     "timestamp": trade_date.isoformat(),
+                    "entry_date": pos.entry_date.isoformat(),
                     "underlying": pos.underlying,
+                    "option_type": pos.option_type,
                     "entry_premium": pos.entry_premium,
                     "exit_premium": current_premium,
                     "pnl": trade_pnl,
@@ -731,20 +973,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
         positions = remaining
 
-        # 2. Fetch news for this day
-        news = fetch_historical_news(polygon_key, trade_date)
+        # 2. Fetch and filter news
+        news_raw = fetch_historical_news(polygon_key, trade_date)
+        news = _filter_news_quality(news_raw)
+        log(f"  news: {len(news_raw)} raw → {len(news)} after quality filter")
         news_context = _format_news_for_backtest(news)
 
-        # 3. Build market context from index prices
-        market_lines = ["Major Indices:"]
-        for idx_sym in ["SPY", "QQQ", "IWM"]:
-            bar = fetch_historical_daily_bar(polygon_key, idx_sym, trade_date)
-            if bar:
-                o = float(bar.get("open") or bar.get("o") or 0)
-                c = float(bar.get("close") or bar.get("c") or 0)
-                chg = ((c - o) / o * 100) if o > 0 else 0
-                market_lines.append(f"  {idx_sym}: ${c:.2f} ({chg:+.2f}%)")
-        market_context = "\n".join(market_lines)
+        # 3. Build market context with multi-day trend
+        market_context = _build_market_trend_context(polygon_key, trade_date)
 
         # 4. Portfolio context (enriched with mark-to-market)
         portfolio_context = _build_enriched_portfolio_context(
@@ -756,7 +992,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
         # 5. Build journal and trade history context
         journal_context = journal.to_context_str() if journal else ""
-        trade_history_context = format_trade_history([], closed_trades[-10:]) if journal else ""
+        # Annotate closed trades with underlying price context (stop_loss trades)
+        annotated_trades = _annotate_closed_trades(closed_trades, polygon_key, cache)
+        trade_history_context = format_trade_history([], annotated_trades[-10:]) if journal else ""
 
         # 5b. Append running performance summary
         perf_summary = _build_performance_summary(closed_trades, equity, bt_config.initial_equity)
@@ -782,7 +1020,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 journal_context=journal_context,
                 trade_history_context=trade_history_context,
             )
-            log(f"  LLM: {analysis.analysis[:120]}")
+            log(f"  LLM: {analysis.analysis}")
 
             # Apply thesis journal updates
             if journal and analysis.thesis_updates:

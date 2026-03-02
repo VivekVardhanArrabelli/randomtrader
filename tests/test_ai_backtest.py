@@ -8,9 +8,13 @@ from ai_trader.backtest import (
     PolygonCache,
     SimPosition,
     SimTrade,
+    _annotate_closed_trades,
     _build_enriched_portfolio_context,
+    _build_market_trend_context,
     _build_performance_summary,
+    _build_ticker_price_context,
     _extract_top_news_tickers,
+    _filter_news_quality,
     _option_bar_price,
     _select_real_contract,
     _trading_days,
@@ -566,3 +570,401 @@ def test_enriched_portfolio_time_stop_flag():
         profit_target_pct=0.50, stop_loss_pct=0.40, time_stop_dte=2,
     )
     assert "approaching time stop" in result
+
+
+# ---------------------------------------------------------------------------
+# _build_market_trend_context
+# ---------------------------------------------------------------------------
+
+def _make_bars(closes: list[float], start_date: date = date(2024, 12, 16)) -> list[dict]:
+    """Helper: build mock daily bar list from close prices."""
+    bars = []
+    d = start_date
+    for c in closes:
+        bars.append({"o": c * 0.99, "h": c * 1.01, "l": c * 0.98, "c": c, "v": 1_000_000})
+        d += timedelta(days=1)
+    return bars
+
+
+def test_build_market_trend_context_basic(monkeypatch):
+    """Should show today's price, 5d/10d change, and trend direction."""
+    import ai_trader.backtest as bt_mod
+
+    # 12 bars: indices 0-11, so bars[-1] = today, bars[-6] = 5d ago, bars[-11] = 10d ago
+    spy_closes = [570, 571, 572, 573, 574, 575, 576, 577, 578, 579, 580, 582]
+    qqq_closes = [490, 491, 492, 493, 494, 495, 496, 497, 498, 499, 500, 498]
+    iwm_closes = [230, 229, 228, 227, 226, 225, 224, 223, 222, 221, 220, 218]
+
+    def mock_bars_range(api_key, symbol, start, end):
+        if symbol == "SPY":
+            return _make_bars(spy_closes)
+        elif symbol == "QQQ":
+            return _make_bars(qqq_closes)
+        elif symbol == "IWM":
+            return _make_bars(iwm_closes)
+        return []
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", mock_bars_range)
+
+    result = _build_market_trend_context("fake", date(2025, 1, 10))
+    assert "Major Indices (10-day view):" in result
+    assert "SPY:" in result
+    assert "QQQ:" in result
+    assert "IWM:" in result
+    assert "today(" in result
+    assert "5d(" in result
+    assert "10d(" in result
+    assert "trend=" in result
+
+
+def test_build_market_trend_context_trend_direction(monkeypatch):
+    """Trend should be 'up' when price is above 10-day avg, 'down' when below."""
+    import ai_trader.backtest as bt_mod
+
+    # Rising: today=582, avg of last 10 ~ 575 → up
+    spy_closes = [570, 571, 572, 573, 574, 575, 576, 577, 578, 579, 580, 582]
+    # Falling: today=218, avg of last 10 ~ 224 → down
+    iwm_closes = [230, 229, 228, 227, 226, 225, 224, 223, 222, 221, 220, 218]
+
+    def mock_bars(api_key, symbol, start, end):
+        if symbol == "SPY":
+            return _make_bars(spy_closes)
+        elif symbol == "IWM":
+            return _make_bars(iwm_closes)
+        return []
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", mock_bars)
+
+    result = _build_market_trend_context("fake", date(2025, 1, 10))
+    # SPY rising → trend=up
+    spy_line = [l for l in result.split("\n") if "SPY:" in l]
+    assert spy_line and "trend=up" in spy_line[0]
+    # IWM falling → trend=down
+    iwm_line = [l for l in result.split("\n") if "IWM:" in l]
+    assert iwm_line and "trend=down" in iwm_line[0]
+
+
+def test_build_market_trend_context_no_data(monkeypatch):
+    """Should handle empty bar data gracefully."""
+    import ai_trader.backtest as bt_mod
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: [])
+
+    result = _build_market_trend_context("fake", date(2025, 1, 10))
+    assert "Major Indices (10-day view):" in result
+    # No index lines since no data
+    lines = [l for l in result.split("\n") if l.strip().startswith("SPY:")]
+    assert len(lines) == 0
+
+
+# ---------------------------------------------------------------------------
+# _build_ticker_price_context
+# ---------------------------------------------------------------------------
+
+def test_build_ticker_price_context_basic(monkeypatch):
+    """Should show spot, today change, 5d/10d change, hi/lo and return spot price."""
+    import ai_trader.backtest as bt_mod
+
+    closes = [130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 142]
+    monkeypatch.setattr(
+        bt_mod, "fetch_historical_daily_bars_range",
+        lambda *a, **k: _make_bars(closes),
+    )
+
+    ctx, spot = _build_ticker_price_context("fake", "NVDA", date(2025, 1, 10))
+    assert ctx is not None
+    assert spot == 142.0
+    assert "spot=$142.00" in ctx
+    assert "today(" in ctx
+    assert "5d(" in ctx
+    assert "10d(" in ctx
+    assert "hi/lo=" in ctx
+
+
+def test_build_ticker_price_context_no_data(monkeypatch):
+    """Should return (None, 0.0) when no bars available."""
+    import ai_trader.backtest as bt_mod
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: [])
+
+    ctx, spot = _build_ticker_price_context("fake", "NVDA", date(2025, 1, 10))
+    assert ctx is None
+    assert spot == 0.0
+
+
+def test_build_ticker_price_context_short_history(monkeypatch):
+    """Should handle fewer than 10 bars (no 10d change, limited hi/lo)."""
+    import ai_trader.backtest as bt_mod
+
+    # Only 3 bars — not enough for 5d or 10d change
+    closes = [140, 141, 142]
+    monkeypatch.setattr(
+        bt_mod, "fetch_historical_daily_bars_range",
+        lambda *a, **k: _make_bars(closes),
+    )
+
+    ctx, spot = _build_ticker_price_context("fake", "NVDA", date(2025, 1, 10))
+    assert ctx is not None
+    assert spot == 142.0
+    assert "spot=$142.00" in ctx
+    # 5d and 10d changes should be 0 (not enough data)
+    assert "5d(+0.0%)" in ctx
+    assert "10d(+0.0%)" in ctx
+
+
+# ---------------------------------------------------------------------------
+# _annotate_closed_trades
+# ---------------------------------------------------------------------------
+
+def test_annotate_closed_trades_stop_loss(monkeypatch):
+    """Stop-loss trade should get underlying movement annotation."""
+    import ai_trader.backtest as bt_mod
+
+    bars = [
+        {"o": 140, "h": 142, "l": 139, "c": 140, "v": 100},  # entry day
+        {"o": 141, "h": 145, "l": 140, "c": 144, "v": 100},
+        {"o": 144, "h": 149, "l": 143, "c": 148, "v": 100},  # exit day
+    ]
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: bars)
+
+    trades = [{
+        "timestamp": "2025-01-12",
+        "entry_date": "2025-01-10",
+        "underlying": "NVDA",
+        "option_type": "put",
+        "entry_premium": 5.0,
+        "exit_premium": 3.0,
+        "pnl": -200,
+        "reason": "stop_loss",
+        "polygon_ticker": "O:NVDA250117P00140000",
+    }]
+    result = _annotate_closed_trades(trades, "fake", PolygonCache())
+    assert len(result) == 1
+    assert "context" in result[0]
+    assert "NVDA" in result[0]["context"]
+    assert "$140→$148" in result[0]["context"]
+    assert "bearish" in result[0]["context"]
+
+
+def test_annotate_closed_trades_profit_target(monkeypatch):
+    """Profit target trades should also get annotations."""
+    import ai_trader.backtest as bt_mod
+
+    bars = [
+        {"o": 150, "h": 151, "l": 149, "c": 150, "v": 100},  # entry day
+        {"o": 151, "h": 160, "l": 150, "c": 158, "v": 100},  # exit day
+    ]
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: bars)
+
+    trades = [{
+        "timestamp": "2025-01-12",
+        "entry_date": "2025-01-10",
+        "underlying": "AAPL",
+        "option_type": "call",
+        "entry_premium": 5.0,
+        "exit_premium": 8.0,
+        "pnl": 300,
+        "reason": "profit_target",
+        "polygon_ticker": "O:AAPL250117C00150000",
+    }]
+    result = _annotate_closed_trades(trades, "fake", PolygonCache())
+    assert len(result) == 1
+    assert "context" in result[0]
+    assert "AAPL" in result[0]["context"]
+    assert "bullish" in result[0]["context"]
+
+
+def test_annotate_closed_trades_bullish_direction(monkeypatch):
+    """Call option stop-loss should say 'bullish' direction."""
+    import ai_trader.backtest as bt_mod
+
+    bars = [
+        {"o": 150, "h": 151, "l": 149, "c": 150, "v": 100},
+        {"o": 149, "h": 150, "l": 145, "c": 145, "v": 100},
+    ]
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: bars)
+
+    trades = [{
+        "timestamp": "2025-01-11",
+        "entry_date": "2025-01-10",
+        "underlying": "AAPL",
+        "option_type": "call",
+        "entry_premium": 5.0,
+        "exit_premium": 2.5,
+        "pnl": -250,
+        "reason": "stop_loss",
+        "polygon_ticker": "O:AAPL250117C00150000",
+    }]
+    result = _annotate_closed_trades(trades, "fake", PolygonCache())
+    assert "bullish" in result[0]["context"]
+
+
+def test_annotate_closed_trades_empty():
+    """Empty trades list should return empty list."""
+    result = _annotate_closed_trades([], "fake", PolygonCache())
+    assert result == []
+
+
+def test_annotate_closed_trades_no_mutation(monkeypatch):
+    """Original trade dicts should not be mutated."""
+    import ai_trader.backtest as bt_mod
+
+    bars = [
+        {"o": 140, "h": 142, "l": 139, "c": 140, "v": 100},
+        {"o": 138, "h": 140, "l": 135, "c": 136, "v": 100},
+    ]
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: bars)
+
+    original = {
+        "timestamp": "2025-01-12",
+        "entry_date": "2025-01-10",
+        "underlying": "NVDA",
+        "option_type": "put",
+        "pnl": -200,
+        "reason": "time_stop",
+        "polygon_ticker": "O:NVDA250117P00140000",
+    }
+    trades = [original]
+    result = _annotate_closed_trades(trades, "fake", PolygonCache())
+    assert "context" not in original  # original not modified
+    assert "context" in result[0]  # but annotated copy has it
+
+
+# ---------------------------------------------------------------------------
+# _filter_news_quality
+# ---------------------------------------------------------------------------
+
+def test_filter_news_quality_removes_lawsuit_spam():
+    articles = [
+        {"title": "ROSEN, A LEADING LAW FIRM, Encourages Investors to Secure Counsel"},
+        {"title": "Securities Fraud Class Action Filed Against XYZ Corp"},
+        {"title": "DEADLINE REMINDER: Recover Your Losses in ABC Lawsuit"},
+        {"title": "Investor Rights Law Firm Reminds Investors of Deadline"},
+        {"title": "Have Suffered Losses? Contact Our Securities Class Action Team"},
+        {"title": "Apple Reports Record Q4 Earnings"},  # real news — keep
+    ]
+    result = _filter_news_quality(articles)
+    assert len(result) == 1
+    assert result[0]["title"] == "Apple Reports Record Q4 Earnings"
+
+
+def test_filter_news_quality_removes_corporate_housekeeping():
+    articles = [
+        {"title": "Company X Announces Inducement Grant Under Nasdaq Listing Rule 5635"},
+        {"title": "Nokia Oyj: Repurchase of Own Shares on 15.1.2025"},
+        {"title": "Nokia Oyj: Omien osakkeiden hankkiminen 15.1.2025"},
+        {"title": "FDA Approves Breakthrough Cancer Drug"},  # real news — keep
+    ]
+    result = _filter_news_quality(articles)
+    assert len(result) == 1
+    assert result[0]["title"] == "FDA Approves Breakthrough Cancer Drug"
+
+
+def test_filter_news_quality_keeps_real_news():
+    articles = [
+        {"title": "Hindenburg Research Releases Short Report on Carvana"},
+        {"title": "Apple Reports Record Q4 Earnings, Stock Surges 5%"},
+        {"title": "FDA Approves Pfizer's New COVID Booster for Fall 2025"},
+        {"title": "Tesla Deliveries Miss Expectations, Shares Drop 8%"},
+        {"title": "Fed Holds Rates Steady, Signals Cuts Coming in March"},
+    ]
+    result = _filter_news_quality(articles)
+    assert len(result) == 5
+
+
+def test_filter_news_quality_case_insensitive():
+    articles = [
+        {"title": "SECURITIES FRAUD class action FILED"},
+        {"title": "deadline ALERT for loss RECOVERY"},
+        {"title": "Leading Law Firm Encourages Acme Investors"},
+    ]
+    result = _filter_news_quality(articles)
+    assert len(result) == 0
+
+
+def test_filter_news_quality_empty():
+    assert _filter_news_quality([]) == []
+
+
+# ---------------------------------------------------------------------------
+# _build_performance_summary — repeat losers
+# ---------------------------------------------------------------------------
+
+def test_performance_summary_repeat_losers():
+    """Tickers with 2+ losses and 0 wins should appear in Repeat losers."""
+    trades = [
+        {"underlying": "NVDA", "pnl": -5000, "entry_date": "2025-01-02", "timestamp": "2025-01-04"},
+        {"underlying": "NVDA", "pnl": -6000, "entry_date": "2025-01-06", "timestamp": "2025-01-08"},
+        {"underlying": "NVDA", "pnl": -4000, "entry_date": "2025-01-10", "timestamp": "2025-01-13"},
+        {"underlying": "AAPL", "pnl": 2000, "entry_date": "2025-01-03", "timestamp": "2025-01-05"},
+    ]
+    result = _build_performance_summary(trades, 87_000, 100_000)
+    assert "Repeat losers:" in result
+    assert "NVDA: 3 trades, 0 wins" in result
+    assert "avg hold:" in result
+    assert "avg loss:" in result
+    # AAPL should NOT appear in repeat losers (it has a win)
+    assert "AAPL" not in result.split("Repeat losers:")[1]
+
+
+def test_performance_summary_no_repeat_losers():
+    """No Repeat losers section when all tickers have at least 1 win."""
+    trades = [
+        {"underlying": "NVDA", "pnl": 500, "timestamp": "2025-01-05"},
+        {"underlying": "NVDA", "pnl": -300, "timestamp": "2025-01-08"},
+        {"underlying": "AAPL", "pnl": 200, "timestamp": "2025-01-06"},
+        {"underlying": "AAPL", "pnl": -100, "timestamp": "2025-01-09"},
+    ]
+    result = _build_performance_summary(trades, 100_300, 100_000)
+    assert "Repeat losers:" not in result
+
+
+def test_performance_summary_repeat_losers_hold_days():
+    """Avg hold days should be computed from entry_date and timestamp."""
+    trades = [
+        {"underlying": "META", "pnl": -1000, "entry_date": "2025-01-02", "timestamp": "2025-01-04"},  # 2 days
+        {"underlying": "META", "pnl": -2000, "entry_date": "2025-01-06", "timestamp": "2025-01-10"},  # 4 days
+    ]
+    result = _build_performance_summary(trades, 97_000, 100_000)
+    assert "Repeat losers:" in result
+    assert "META: 2 trades, 0 wins" in result
+    # avg hold = (2+4)/2 = 3.0 days
+    assert "avg hold: 3.0 days" in result
+
+
+# ---------------------------------------------------------------------------
+# _annotate_closed_trades — all reasons
+# ---------------------------------------------------------------------------
+
+def test_annotate_closed_trades_all_reasons(monkeypatch):
+    """Profit target and time_stop trades should also get annotations."""
+    import ai_trader.backtest as bt_mod
+
+    bars = [
+        {"o": 100, "h": 102, "l": 99, "c": 100, "v": 100},
+        {"o": 101, "h": 110, "l": 100, "c": 108, "v": 100},
+    ]
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", lambda *a, **k: bars)
+
+    trades = [
+        {
+            "timestamp": "2025-01-11",
+            "entry_date": "2025-01-10",
+            "underlying": "AAPL",
+            "option_type": "call",
+            "pnl": 500,
+            "reason": "profit_target",
+        },
+        {
+            "timestamp": "2025-01-11",
+            "entry_date": "2025-01-10",
+            "underlying": "TSLA",
+            "option_type": "put",
+            "pnl": -100,
+            "reason": "time_stop",
+        },
+    ]
+    result = _annotate_closed_trades(trades, "fake", PolygonCache())
+    assert len(result) == 2
+    assert "context" in result[0]
+    assert "bullish" in result[0]["context"]
+    assert "context" in result[1]
+    assert "bearish" in result[1]["context"]
