@@ -348,6 +348,7 @@ class SimTrade:
     exit_reason: str
     conviction: float
     polygon_ticker: str = ""
+    reasoning: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +387,7 @@ class BacktestResult:
     profit_factor: float | None = None
     avg_conviction: float = 0.0
     days_tested: int = 0
+    decision_log: list[dict] = field(default_factory=list)
 
 
 def _trading_days(start: date, end: date) -> list[date]:
@@ -951,6 +953,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     exit_reason=exit_reason,
                     conviction=pos.conviction,
                     polygon_ticker=pos.polygon_ticker,
+                    reasoning=pos.reasoning,
                 )
                 result.trades.append(sim_trade)
                 closed_trades.append({
@@ -1027,11 +1030,29 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 journal.apply_updates(analysis.thesis_updates)
                 log(f"  Journal: {len(analysis.thesis_updates)} updates, {len(journal.active_entries())} active")
 
-            # 7. Execute new trades
+            # 7. Execute new trades (track executed vs skipped for decision log)
+            trade_results: list[dict] = []
             for decision in analysis.trades:
+                trade_record = {
+                    "underlying": decision.underlying,
+                    "action": decision.action,
+                    "conviction": decision.conviction,
+                    "risk_pct": decision.risk_pct,
+                    "reasoning": decision.reasoning,
+                    "status": "skipped",
+                    "skip_reason": "",
+                    "contract": "",
+                    "qty": 0,
+                    "premium": 0.0,
+                }
+
                 if decision.action == "close_position":
+                    trade_record["skip_reason"] = "close_position (not supported in backtest)"
+                    trade_results.append(trade_record)
                     continue
                 if len(positions) >= bt_config.max_positions:
+                    trade_record["skip_reason"] = "max positions reached"
+                    trade_results.append(trade_record)
                     break
 
                 option_type = "call" if decision.action == "buy_call" else "put"
@@ -1041,9 +1062,13 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 bar = fetch_historical_daily_bar(polygon_key, underlying, trade_date)
                 if bar is None:
                     log(f"  SKIP {underlying}: no price data")
+                    trade_record["skip_reason"] = "no price data"
+                    trade_results.append(trade_record)
                     continue
                 spot = float(bar.get("close") or bar.get("c") or 0)
                 if spot <= 0:
+                    trade_record["skip_reason"] = "invalid spot price"
+                    trade_results.append(trade_record)
                     continue
 
                 # Find a real option contract via Polygon
@@ -1056,6 +1081,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 )
                 if contract is None:
                     log(f"  SKIP {underlying}: no matching option contracts found")
+                    trade_record["skip_reason"] = "no contract found"
+                    trade_results.append(trade_record)
                     continue
 
                 polygon_ticker = contract.get("ticker", "")
@@ -1063,6 +1090,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 expiry_str = contract.get("expiration_date", "")
                 if not polygon_ticker or strike <= 0 or not expiry_str:
                     log(f"  SKIP {underlying}: invalid contract data")
+                    trade_record["skip_reason"] = "invalid contract data"
+                    trade_results.append(trade_record)
                     continue
                 expiry = date.fromisoformat(expiry_str)
 
@@ -1072,17 +1101,23 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 )
                 if entry_bar is None:
                     log(f"  SKIP {polygon_ticker}: no option price data on {trade_date}")
+                    trade_record["skip_reason"] = "no option price data"
+                    trade_results.append(trade_record)
                     continue
 
                 # Skip zero-volume contracts
                 volume = entry_bar.get("v", 0)
                 if volume <= 0:
                     log(f"  SKIP {polygon_ticker}: zero volume")
+                    trade_record["skip_reason"] = "zero volume"
+                    trade_results.append(trade_record)
                     continue
 
                 premium = _option_bar_price(entry_bar)
                 if premium < 0.01:
                     log(f"  SKIP {polygon_ticker}: premium too low (${premium:.4f})")
+                    trade_record["skip_reason"] = "premium too low"
+                    trade_results.append(trade_record)
                     continue
 
                 # Pre-fetch all future bars for this contract through expiry
@@ -1116,11 +1151,40 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         polygon_ticker=polygon_ticker,
                     )
                 )
+                trade_record["status"] = "executed"
+                trade_record["contract"] = polygon_ticker
+                trade_record["qty"] = qty
+                trade_record["premium"] = premium
+                trade_results.append(trade_record)
                 log(
                     f"  OPEN {polygon_ticker} "
                     f"premium=${premium:.2f} qty={qty} cost=${total_cost:,.2f} "
                     f"vol={volume} conviction={decision.conviction:.2f}"
                 )
+
+            # Build decision log entry
+            thesis_updates_serialized = [
+                {
+                    "id": tu.id,
+                    "underlying": tu.underlying,
+                    "direction": tu.direction,
+                    "thesis": tu.thesis,
+                    "conviction": tu.conviction,
+                    "status": tu.status,
+                    "new_observation": tu.new_observation,
+                }
+                for tu in analysis.thesis_updates
+            ]
+            result.decision_log.append({
+                "date": trade_date.isoformat(),
+                "market_analysis": analysis.analysis,
+                "thesis_updates": thesis_updates_serialized,
+                "trades_proposed": trade_results,
+                "trades_executed": sum(1 for t in trade_results if t["status"] == "executed"),
+                "trades_skipped": sum(1 for t in trade_results if t["status"] == "skipped"),
+                "equity": equity,
+                "open_positions": len(positions),
+            })
 
         # Track daily equity
         day_return = equity - day_start_equity
@@ -1168,6 +1232,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 exit_reason="backtest_end",
                 conviction=pos.conviction,
                 polygon_ticker=pos.polygon_ticker,
+                reasoning=pos.reasoning,
             )
         )
 
@@ -1241,6 +1306,7 @@ def print_backtest_result(r: BacktestResult) -> None:
                 f"entry=${t.entry_premium:.2f} exit=${t.exit_premium:.2f} | "
                 f"qty={t.qty} pnl=${t.pnl:+,.2f} | "
                 f"{t.exit_reason} (conv={t.conviction:.2f})"
+                + (f" | {t.reasoning[:80]}" if t.reasoning else "")
             )
 
     print("=" * 60)
@@ -1277,13 +1343,99 @@ def save_backtest_result(r: BacktestResult, path: Path) -> None:
                 "exit_reason": t.exit_reason,
                 "conviction": t.conviction,
                 "polygon_ticker": t.polygon_ticker,
+                "reasoning": t.reasoning,
             }
             for t in r.trades
         ],
+        "decision_log": r.decision_log,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
     log(f"results saved to {path}")
+
+
+def save_debug_log(r: BacktestResult, path: Path) -> None:
+    """Write a human-readable markdown debug log of the backtest."""
+    lines: list[str] = []
+
+    # Header
+    win_loss = f"{r.wins}W/{r.losses}L" if r.total_trades else "0 trades"
+    lines.append("# Backtest Debug Log")
+    lines.append(
+        f"Period: {r.days_tested} trading days | "
+        f"Final: ${r.final_equity:,.0f} ({r.total_return_pct:+.1%}) | {win_loss}"
+    )
+    lines.append("")
+
+    for entry in r.decision_log:
+        lines.append("---")
+        lines.append("")
+        lines.append(f"## {entry['date']}")
+        lines.append("")
+
+        # Market analysis
+        analysis_text = entry.get("market_analysis", "")
+        if analysis_text:
+            lines.append(f"**Market Analysis:** {analysis_text}")
+            lines.append("")
+
+        # Thesis updates
+        thesis_updates = entry.get("thesis_updates", [])
+        if thesis_updates:
+            lines.append("**Thesis Updates:**")
+            for tu in thesis_updates:
+                tid = tu.get("id") or "new"
+                status = tu.get("status", "")
+                tag = "NEW" if tid == "new" or not tu.get("id") else "UPDATE"
+                lines.append(
+                    f"- [{tag}] {tid}: {tu.get('underlying', '?')} "
+                    f"{tu.get('direction', '?')} — {tu.get('thesis', '')} "
+                    f"(conviction: {tu.get('conviction', 0)}, {status})"
+                )
+            lines.append("")
+
+        # Trades
+        trades_proposed = entry.get("trades_proposed", [])
+        if trades_proposed:
+            lines.append("**Trades:**")
+            for tr in trades_proposed:
+                action = tr.get("action", "?").upper().replace("_", " ")
+                underlying = tr.get("underlying", "?")
+                conv = tr.get("conviction", 0)
+                risk = tr.get("risk_pct", 0)
+                reasoning = tr.get("reasoning", "")
+                reasoning_short = reasoning[:100] if reasoning else ""
+                lines.append(
+                    f"- {action} {underlying} | conviction={conv:.2f} "
+                    f"risk={risk:.0%} | \"{reasoning_short}\""
+                )
+                status = tr.get("status", "skipped")
+                if status == "executed":
+                    contract = tr.get("contract", "")
+                    qty = tr.get("qty", 0)
+                    premium = tr.get("premium", 0)
+                    lines.append(
+                        f"  → Executed: {contract} qty={qty} premium=${premium:.2f}"
+                    )
+                else:
+                    skip_reason = tr.get("skip_reason", "unknown")
+                    lines.append(f"  → SKIPPED: {skip_reason}")
+        else:
+            lines.append("**Trades:** None")
+        lines.append("")
+
+        # Equity / positions
+        eq = entry.get("equity", 0)
+        pos_count = entry.get("open_positions", 0)
+        lines.append(f"**Equity:** ${eq:,.0f} | Positions: {pos_count}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+    log(f"debug log saved to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1337,7 +1489,9 @@ def run() -> None:
     print_backtest_result(result)
 
     if args.output:
-        save_backtest_result(result, Path(args.output))
+        output_path = Path(args.output)
+        save_backtest_result(result, output_path)
+        save_debug_log(result, Path(f"{output_path}.debug.md"))
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from ai_trader.backtest import (
     _select_real_contract,
     _trading_days,
     print_backtest_result,
+    save_debug_log,
 )
 
 
@@ -968,3 +969,138 @@ def test_annotate_closed_trades_all_reasons(monkeypatch):
     assert "bullish" in result[0]["context"]
     assert "context" in result[1]
     assert "bearish" in result[1]["context"]
+
+
+# ---------------------------------------------------------------------------
+# SimTrade reasoning
+# ---------------------------------------------------------------------------
+
+def test_sim_trade_reasoning():
+    """reasoning field is preserved on SimTrade."""
+    trade = SimTrade(
+        entry_date=date(2025, 1, 2),
+        exit_date=date(2025, 1, 10),
+        underlying="AAPL",
+        option_type="call",
+        strike=150.0,
+        entry_premium=5.0,
+        exit_premium=7.5,
+        qty=2,
+        pnl=500.0,
+        exit_reason="profit_target",
+        conviction=0.85,
+        polygon_ticker="O:AAPL250117C00150000",
+        reasoning="Strong earnings beat expected",
+    )
+    assert trade.reasoning == "Strong earnings beat expected"
+
+
+def test_sim_trade_reasoning_default():
+    """reasoning defaults to empty string for backwards compat."""
+    trade = SimTrade(
+        entry_date=date(2025, 1, 2),
+        exit_date=date(2025, 1, 10),
+        underlying="AAPL",
+        option_type="call",
+        strike=150.0,
+        entry_premium=5.0,
+        exit_premium=7.5,
+        qty=2,
+        pnl=500.0,
+        exit_reason="profit_target",
+        conviction=0.85,
+    )
+    assert trade.reasoning == ""
+
+
+# ---------------------------------------------------------------------------
+# BacktestResult decision_log
+# ---------------------------------------------------------------------------
+
+def test_backtest_result_decision_log():
+    """decision_log field exists and serializes."""
+    r = BacktestResult()
+    assert r.decision_log == []
+
+    entry = {
+        "date": "2025-01-10",
+        "market_analysis": "Broad selloff continues",
+        "thesis_updates": [
+            {"id": "thesis-1", "underlying": "NVDA", "direction": "bullish",
+             "status": "developing", "thesis": "AI capex", "conviction": 0.6,
+             "new_observation": "earnings beat"}
+        ],
+        "trades_proposed": [
+            {"underlying": "AAPL", "action": "buy_call", "conviction": 0.75,
+             "risk_pct": 0.10, "reasoning": "test", "status": "executed",
+             "skip_reason": "", "contract": "O:AAPL250117C00150000",
+             "qty": 2, "premium": 5.0}
+        ],
+        "trades_executed": 1,
+        "trades_skipped": 0,
+        "equity": 95000.0,
+        "open_positions": 2,
+    }
+    r.decision_log.append(entry)
+    assert len(r.decision_log) == 1
+    assert r.decision_log[0]["date"] == "2025-01-10"
+    assert r.decision_log[0]["trades_executed"] == 1
+
+    # Verify it's JSON-serializable
+    import json
+    serialized = json.dumps(r.decision_log)
+    assert "Broad selloff continues" in serialized
+
+
+# ---------------------------------------------------------------------------
+# save_debug_log
+# ---------------------------------------------------------------------------
+
+def test_save_debug_log(tmp_path):
+    """save_debug_log writes a readable markdown file."""
+    r = BacktestResult(
+        initial_equity=100_000,
+        final_equity=95_000,
+        total_return_pct=-0.05,
+        total_trades=1,
+        wins=0,
+        losses=1,
+        days_tested=5,
+        decision_log=[
+            {
+                "date": "2025-01-10",
+                "market_analysis": "Market is flat.",
+                "thesis_updates": [
+                    {"id": None, "underlying": "NVDA", "direction": "bullish",
+                     "thesis": "AI hype", "conviction": 0.6, "status": "developing",
+                     "new_observation": "new chip launch"}
+                ],
+                "trades_proposed": [
+                    {"underlying": "NVDA", "action": "buy_call", "conviction": 0.8,
+                     "risk_pct": 0.15, "reasoning": "AI narrative strong",
+                     "status": "executed", "skip_reason": "",
+                     "contract": "O:NVDA250117C00144000", "qty": 10, "premium": 3.49},
+                    {"underlying": "AAPL", "action": "buy_put", "conviction": 0.5,
+                     "risk_pct": 0.05, "reasoning": "weak guidance",
+                     "status": "skipped", "skip_reason": "no contract found",
+                     "contract": "", "qty": 0, "premium": 0.0},
+                ],
+                "trades_executed": 1,
+                "trades_skipped": 1,
+                "equity": 95000.0,
+                "open_positions": 1,
+            }
+        ],
+    )
+    out_path = tmp_path / "test.debug.md"
+    save_debug_log(r, out_path)
+    assert out_path.exists()
+    content = out_path.read_text()
+    assert "# Backtest Debug Log" in content
+    assert "2025-01-10" in content
+    assert "Market is flat." in content
+    assert "NVDA" in content
+    assert "Executed" in content
+    assert "SKIPPED" in content
+    assert "no contract found" in content
+    assert "$95,000" in content
