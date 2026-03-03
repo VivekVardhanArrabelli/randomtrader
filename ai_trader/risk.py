@@ -84,6 +84,80 @@ class PositionRiskState:
     reason: str
 
 
+@dataclass(frozen=True)
+class PositionRiskAlert:
+    alert_type: str       # "stop_loss", "profit_target", "time_stop"
+    message: str
+    severity: str         # "critical" or "warning"
+
+
+def assess_position_risk(
+    entry_premium: float,
+    current_premium: float,
+    dte: int,
+) -> PositionRiskState | PositionRiskAlert | None:
+    """Assess position risk, splitting hard stops from soft alerts.
+
+    Returns:
+      - PositionRiskState(should_close=True) for catastrophic loss (>= -85%).
+        These are auto-closed immediately — no LLM override.
+      - PositionRiskAlert for DTE-scaled stop losses, profit targets, and
+        time stops. These are shown to the LLM as alerts so it can decide.
+      - None if no action needed.
+    """
+    if entry_premium <= 0:
+        return None
+
+    pnl_pct = (current_premium - entry_premium) / entry_premium
+
+    # Hard stop: catastrophic loss — auto-close, no override
+    if pnl_pct <= -config.CATASTROPHIC_STOP_PCT:
+        return PositionRiskState(
+            True,
+            f"catastrophic stop ({pnl_pct:.1%} loss, limit {config.CATASTROPHIC_STOP_PCT:.0%})",
+        )
+
+    # Soft alert: profit target
+    if pnl_pct >= config.PROFIT_TARGET_PCT:
+        return PositionRiskAlert(
+            alert_type="profit_target",
+            message=f"PROFIT TARGET: +{pnl_pct:.1%} gain (target {config.PROFIT_TARGET_PCT:.0%}). Consider taking profits.",
+            severity="warning",
+        )
+
+    # Soft alert: DTE-scaled stop loss
+    sl = stop_loss_for_dte(dte)
+    if pnl_pct <= -sl:
+        return PositionRiskAlert(
+            alert_type="stop_loss",
+            message=f"STOP LOSS: {pnl_pct:.1%} loss (limit {sl:.0%} for {dte} DTE). Consider closing.",
+            severity="critical",
+        )
+
+    # Soft alert: time stop
+    if dte <= config.TIME_STOP_DTE:
+        return PositionRiskAlert(
+            alert_type="time_stop",
+            message=f"TIME STOP: only {dte} DTE remaining. Close unless strong conviction.",
+            severity="critical",
+        )
+
+    return None
+
+
+def stop_loss_for_dte(dte: int) -> float:
+    """Return the stop-loss threshold scaled by days to expiration.
+
+    Wider stops for longer-dated positions (more time to recover),
+    tighter stops for short-dated positions (theta is aggressive).
+    """
+    if dte <= config.STOP_LOSS_SHORT_DTE_THRESHOLD:
+        return config.STOP_LOSS_PCT
+    if dte >= config.STOP_LOSS_LONG_DTE_THRESHOLD:
+        return config.STOP_LOSS_PCT_LONG_DTE
+    return config.STOP_LOSS_PCT_MID_DTE
+
+
 def evaluate_position_risk(
     entry_premium: float,
     current_premium: float,
@@ -99,9 +173,10 @@ def evaluate_position_risk(
     if pnl_pct >= config.PROFIT_TARGET_PCT:
         return PositionRiskState(True, f"profit target hit ({pnl_pct:.1%})")
 
-    # Stop loss
-    if pnl_pct <= -config.STOP_LOSS_PCT:
-        return PositionRiskState(True, f"stop loss hit ({pnl_pct:.1%})")
+    # Stop loss — scaled by DTE
+    sl = stop_loss_for_dte(dte)
+    if pnl_pct <= -sl:
+        return PositionRiskState(True, f"stop loss hit ({pnl_pct:.1%}, limit {sl:.0%} for {dte} DTE)")
 
     # Time-based exit
     if dte <= config.TIME_STOP_DTE:

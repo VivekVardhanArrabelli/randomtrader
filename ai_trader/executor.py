@@ -113,16 +113,21 @@ def _execute_open(
         )
 
     # Cap contracts by decision's risk_pct
+    # Better pricing: bid at spread_fraction above mid instead of at ask
+    limit_price = min(
+        round(contract.mid + (contract.ask - contract.mid) * config.OPEN_ORDER_SPREAD_FRACTION, 2),
+        contract.ask,
+    )
     max_by_risk = int(
-        (portfolio.account.equity * decision.risk_pct) / (contract.ask * 100)
+        (portfolio.account.equity * decision.risk_pct) / (limit_price * 100)
     )
     qty = min(risk.max_contracts, max(1, max_by_risk))
-    total_premium = qty * contract.ask * 100
+    total_premium = qty * limit_price * 100
 
     log(
         f"executing: BUY {qty}x {contract.symbol} "
-        f"@ ${contract.ask:.2f} (${total_premium:.2f} total) "
-        f"conviction={decision.conviction:.2f}"
+        f"@ ${limit_price:.2f} (mid=${contract.mid:.2f} ask=${contract.ask:.2f}) "
+        f"(${total_premium:.2f} total) conviction={decision.conviction:.2f}"
     )
 
     # Submit order
@@ -133,7 +138,7 @@ def _execute_open(
             side="buy",
             order_type="limit",
             time_in_force="day",
-            limit_price=contract.ask,
+            limit_price=limit_price,
         )
     except Exception as exc:
         log(f"order submission error: {exc}")
@@ -198,28 +203,85 @@ def _execute_close(
             False, target, None, 0, 0.0, "position not found"
         )
 
+    # Get fresh quote for mid-price limit order
+    try:
+        quote_data = alpaca.get_option_latest_quotes([position.symbol])
+        quotes = quote_data.get("quotes", quote_data) if isinstance(quote_data, dict) else {}
+        quote = quotes.get(position.symbol, {})
+        bid = float(quote.get("bp") or quote.get("bid_price") or 0.0)
+        ask = float(quote.get("ap") or quote.get("ask_price") or 0.0)
+        mid_price = round((bid + ask) / 2, 2) if bid > 0 and ask > 0 else 0.0
+    except Exception:
+        mid_price = 0.0
+
     log(
         f"closing position: SELL {position.qty}x {position.symbol} "
-        f"current=${position.current_price:.2f}"
+        f"current=${position.current_price:.2f} mid=${mid_price:.2f}"
     )
 
-    try:
-        order = alpaca.submit_order(
-            symbol=position.symbol,
-            qty=position.qty,
-            side="sell",
-            order_type="market",
-            time_in_force="day",
-        )
-    except Exception as exc:
-        log(f"close order error: {exc}")
-        return ExecutionResult(
-            False, position.symbol, None, 0, 0.0, f"close error: {exc}"
-        )
+    # Try limit at mid first, fallback to market after timeout
+    if mid_price > 0:
+        try:
+            order = alpaca.submit_order(
+                symbol=position.symbol,
+                qty=position.qty,
+                side="sell",
+                order_type="limit",
+                time_in_force="day",
+                limit_price=mid_price,
+            )
+        except Exception as exc:
+            log(f"close limit order error: {exc}")
+            return ExecutionResult(
+                False, position.symbol, None, 0, 0.0, f"close error: {exc}"
+            )
 
-    order_id = order.get("id", "")
-    filled_order = _await_fill(alpaca, order_id, timeout_seconds=30)
-    fill_status = filled_order.get("status", "unknown")
+        order_id = order.get("id", "")
+        filled_order = _await_fill(alpaca, order_id, timeout_seconds=config.CLOSE_LIMIT_TIMEOUT_SECONDS)
+        fill_status = filled_order.get("status", "unknown")
+
+        if fill_status != "filled":
+            # Cancel unfilled limit and resubmit as market
+            log(f"limit close not filled after {config.CLOSE_LIMIT_TIMEOUT_SECONDS}s, falling back to market")
+            try:
+                alpaca.cancel_order(order_id)
+            except Exception:
+                pass
+            try:
+                order = alpaca.submit_order(
+                    symbol=position.symbol,
+                    qty=position.qty,
+                    side="sell",
+                    order_type="market",
+                    time_in_force="day",
+                )
+            except Exception as exc:
+                log(f"close market fallback error: {exc}")
+                return ExecutionResult(
+                    False, position.symbol, None, 0, 0.0, f"close error: {exc}"
+                )
+            order_id = order.get("id", "")
+            filled_order = _await_fill(alpaca, order_id, timeout_seconds=30)
+            fill_status = filled_order.get("status", "unknown")
+    else:
+        # No mid price available — go straight to market
+        try:
+            order = alpaca.submit_order(
+                symbol=position.symbol,
+                qty=position.qty,
+                side="sell",
+                order_type="market",
+                time_in_force="day",
+            )
+        except Exception as exc:
+            log(f"close order error: {exc}")
+            return ExecutionResult(
+                False, position.symbol, None, 0, 0.0, f"close error: {exc}"
+            )
+
+        order_id = order.get("id", "")
+        filled_order = _await_fill(alpaca, order_id, timeout_seconds=30)
+        fill_status = filled_order.get("status", "unknown")
 
     if fill_status == "filled":
         exit_price = float(filled_order.get("filled_avg_price") or position.current_price)

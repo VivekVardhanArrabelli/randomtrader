@@ -7,10 +7,12 @@ from datetime import date
 
 from . import config
 from .alpaca_client import AlpacaClient
+from .options import approx_delta
+from .risk import stop_loss_for_dte
 from .utils import AccountSnapshot, log, now_eastern
 
 
-@dataclass(frozen=True)
+@dataclass
 class OptionPosition:
     symbol: str              # OCC option symbol
     underlying: str
@@ -23,6 +25,8 @@ class OptionPosition:
     market_value: float
     unrealized_pl: float
     cost_basis: float
+    underlying_spot: float = 0.0    # current underlying price
+    risk_alert: str = ""            # risk alert message for LLM
 
     @property
     def pnl_pct(self) -> float:
@@ -45,23 +49,42 @@ class OptionPosition:
             daily_decay = self.current_price / self.dte
             total_daily = daily_decay * abs(self.qty) * 100
             decay_info = f" decay≈${total_daily:.0f}/day"
+
+        # Underlying spot + moneyness
+        spot_info = ""
+        if self.underlying_spot > 0:
+            pct = abs(self.strike - self.underlying_spot) / self.underlying_spot * 100
+            if self.option_type == "call":
+                itm = self.strike < self.underlying_spot
+            else:
+                itm = self.strike > self.underlying_spot
+            label = "ITM" if itm else "OTM"
+            atm = pct < 0.5
+            moneyness_str = "ATM" if atm else f"{pct:.1f}% {label}"
+            d = approx_delta(self.strike, self.underlying_spot, max(self.dte, 1), self.option_type)
+            spot_info = f" underlying=${self.underlying_spot:.2f} ({moneyness_str}) delta~{d:.2f}"
+
         # Exit-trigger proximity flags
         flags: list[str] = []
         if self.cost_basis > 0 and self.current_price > 0:
             if self.pnl_pct >= config.PROFIT_TARGET_PCT * 0.8:
                 flags.append(f"approaching profit target of {config.PROFIT_TARGET_PCT:.0%}")
-            if self.pnl_pct <= -config.STOP_LOSS_PCT * 0.8:
-                flags.append(f"approaching stop loss of {config.STOP_LOSS_PCT:.0%}")
+            sl = stop_loss_for_dte(self.dte)
+            if self.pnl_pct <= -sl * 0.8:
+                flags.append(f"approaching stop loss of {sl:.0%} ({self.dte} DTE)")
         if self.dte != 999 and self.dte <= config.TIME_STOP_DTE + 1:
             flags.append(f"approaching time stop ({config.TIME_STOP_DTE} DTE)")
         flag_str = f" [{'; '.join(flags)}]" if flags else ""
+
+        # Risk alert
+        alert_str = f"\n    ** RISK ALERT: {self.risk_alert}" if self.risk_alert else ""
 
         return (
             f"{self.underlying} {direction} ${self.strike:.2f} exp={self.expiration} "
             f"qty={self.qty} entry=${self.avg_entry_price:.2f} "
             f"current=${self.current_price:.2f} "
             f"P&L=${self.unrealized_pl:.2f} ({self.pnl_pct:.1%}) "
-            f"DTE={self.dte}{decay_info}{flag_str}"
+            f"DTE={self.dte}{spot_info}{decay_info}{flag_str}{alert_str}"
         )
 
 

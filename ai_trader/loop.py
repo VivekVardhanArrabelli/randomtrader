@@ -25,12 +25,12 @@ from . import config
 from .alpaca_client import AlpacaClient
 from .brain import TradingBrain
 from .db import AIDecisionRecord, AITradeLogger, format_trade_history
-from .executor import check_and_close_risk_exits, execute_trade
+from .executor import _execute_close, execute_trade
 from .journal import ThesisJournal
-from .news import fetch_news, format_news_for_llm
+from .news import fetch_news, fetch_targeted_news, format_news_for_llm
 from .options import fetch_option_chain, format_chain_for_llm
 from .portfolio import get_portfolio_state
-from .risk import evaluate_trade_risk
+from .risk import PositionRiskAlert, PositionRiskState, assess_position_risk, evaluate_trade_risk
 from .utils import EASTERN_TZ, is_market_open, log, now_eastern
 
 
@@ -131,6 +131,43 @@ def _get_market_context(alpaca: AlpacaClient) -> str:
             f" trend={t['trend']}"
         )
 
+    # Sector ETFs (5-day view)
+    sector_etfs = ["XLK", "XLE", "XLF", "XLV", "XLI"]
+    sector_lines = []
+    for sym in sector_etfs:
+        try:
+            bars = alpaca.get_bars(sym, timeframe="1Day", start=start, limit=15)
+        except Exception:
+            bars = []
+        t = _compute_bar_trends(bars)
+        if t:
+            sector_lines.append(
+                f"  {sym}: ${t['price']:.2f}"
+                f" today({t['intraday_chg']:+.1f}%)"
+                f" 5d({t['five_d_chg']:+.1f}%)"
+                f" trend={t['trend']}"
+            )
+    if sector_lines:
+        lines.append("\nSector ETFs (5-day view):")
+        lines.extend(sector_lines)
+
+    # Volatility (VIXY as VIX proxy)
+    try:
+        vixy_bars = alpaca.get_bars("VIXY", timeframe="1Day", start=start, limit=15)
+        vt = _compute_bar_trends(vixy_bars)
+        if vt:
+            level = "elevated" if vt["price"] > 30 else "high" if vt["price"] > 25 else "moderate" if vt["price"] > 20 else "low"
+            lines.append(
+                f"\nVolatility (VIXY): ${vt['price']:.2f}"
+                f" today({vt['intraday_chg']:+.1f}%)"
+                f" 5d({vt['five_d_chg']:+.1f}%)"
+                f" 10d({vt['ten_d_chg']:+.1f}%)"
+                f" level={level}"
+                f" — options premiums are {'expensive' if level in ('elevated', 'high') else 'normal'}"
+            )
+    except Exception:
+        pass
+
     # Top movers
     try:
         movers = alpaca.get_movers(top=10)
@@ -188,7 +225,7 @@ def _get_options_context(
             all_lines.append(f"\n{sym} (${price:.2f}):")
         chain = fetch_option_chain(alpaca, sym, price)
         if chain:
-            all_lines.append(format_chain_for_llm(chain, max_contracts=8))
+            all_lines.append(format_chain_for_llm(chain, max_contracts=20, underlying_price=price))
 
     return "\n".join(all_lines) if all_lines else ""
 
@@ -242,15 +279,72 @@ def run_cycle(
     # 1. Get portfolio state
     portfolio = get_portfolio_state(alpaca)
 
-    # 2. Check existing positions for risk exits
-    risk_exits = check_and_close_risk_exits(alpaca, portfolio, logger)
-    for result in risk_exits:
-        if result.success:
-            log(f"risk exit executed: {result.symbol} - {result.message}")
+    # 2. Enrich positions with underlying spot prices and run risk assessment
+    if portfolio.option_positions:
+        # Batch-fetch underlying spot prices
+        underlyings = list({p.underlying for p in portfolio.option_positions})
+        try:
+            snap_data = alpaca.get_snapshots(underlyings)
+        except Exception:
+            snap_data = {}
+        for pos in portfolio.option_positions:
+            snap = snap_data.get(pos.underlying, {})
+            trade = snap.get("latestTrade") or snap.get("latest_trade") or {}
+            spot = float(trade.get("p") or trade.get("price") or 0.0)
+            if spot <= 0:
+                bar = snap.get("dailyBar") or snap.get("daily_bar") or {}
+                spot = float(bar.get("c") or bar.get("close") or 0.0)
+            pos.underlying_spot = spot
 
-    # Refresh portfolio after any exits
-    if risk_exits:
-        portfolio = get_portfolio_state(alpaca)
+        # Run risk assessment on each position
+        catastrophic_exits = False
+        for pos in list(portfolio.option_positions):
+            result = assess_position_risk(
+                entry_premium=pos.avg_entry_price,
+                current_premium=pos.current_price,
+                dte=pos.dte,
+            )
+            if isinstance(result, PositionRiskState) and result.should_close:
+                # Catastrophic stop — auto-close immediately
+                log(f"catastrophic stop for {pos.symbol}: {result.reason}")
+                from .brain import TradeDecision
+                decision = TradeDecision(
+                    action="close_position",
+                    underlying=pos.underlying,
+                    strike_preference="",
+                    expiry_preference="",
+                    conviction=1.0,
+                    risk_pct=0.0,
+                    reasoning=f"auto-exit: {result.reason}",
+                    target_symbol=pos.symbol,
+                )
+                close_result = _execute_close(alpaca, decision, portfolio, logger, "catastrophic risk exit")
+                if close_result.success:
+                    log(f"catastrophic exit executed: {pos.symbol}")
+                    catastrophic_exits = True
+            elif isinstance(result, PositionRiskAlert):
+                # Soft alert — attach to position for LLM to see
+                pos.risk_alert = result.message
+                log(f"risk alert for {pos.symbol}: {result.message}")
+
+        # Refresh portfolio after any catastrophic exits
+        if catastrophic_exits:
+            portfolio = get_portfolio_state(alpaca)
+            # Re-enrich the refreshed positions
+            try:
+                snap_data = alpaca.get_snapshots(
+                    list({p.underlying for p in portfolio.option_positions})
+                )
+            except Exception:
+                snap_data = {}
+            for pos in portfolio.option_positions:
+                snap = snap_data.get(pos.underlying, {})
+                trade = snap.get("latestTrade") or snap.get("latest_trade") or {}
+                spot = float(trade.get("p") or trade.get("price") or 0.0)
+                if spot <= 0:
+                    bar = snap.get("dailyBar") or snap.get("daily_bar") or {}
+                    spot = float(bar.get("c") or bar.get("close") or 0.0)
+                pos.underlying_spot = spot
 
     # 3. Load trade history for context
     recent_trades = logger.get_recent_trades(limit=15)
@@ -260,9 +354,16 @@ def run_cycle(
     # 4. Get thesis journal context
     journal_context = journal.to_context_str()
 
-    # 5. Fetch news (extended lookback for multi-day context)
-    news_items = fetch_news(alpaca, lookback_hours=config.NEWS_LOOKBACK_HOURS)
-    news_context = format_news_for_llm(news_items)
+    # 5. Fetch news — targeted for tickers the model cares about
+    # Focus symbols = open positions + active theses
+    focus_symbols: list[str] = [p.underlying for p in portfolio.option_positions]
+    focus_symbols += [e.underlying for e in journal.active_entries()]
+    focus_symbols = list(dict.fromkeys(focus_symbols))  # dedupe preserving order
+
+    news_items = fetch_targeted_news(
+        alpaca, focus_symbols, lookback_hours=config.NEWS_LOOKBACK_HOURS,
+    )
+    news_context = format_news_for_llm(news_items, focus_symbols=focus_symbols)
 
     # Extract symbols mentioned in news
     news_symbols: list[str] = []

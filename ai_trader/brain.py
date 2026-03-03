@@ -95,6 +95,34 @@ even weak names get lifted. Factor this into your conviction.
 - If indices are down >2% over 5 days, raise the bar for bullish trades. \
 If indices are up >2% over 5 days, raise the bar for bearish trades.
 
+VOLATILITY AWARENESS:
+You receive VIXY (VIX proxy) data in the market context. Use it:
+- When VIXY is elevated (>$25), option premiums are expensive. You're paying \
+more for the same exposure. Raise the bar for entries — you need a stronger \
+catalyst to justify the inflated premium.
+- When VIXY is low (<$20), premiums are cheap. Good entries if you have a thesis.
+- Rising VIXY = fear is increasing. Puts get more expensive, calls cheaper. \
+Consider this when sizing and timing.
+- Falling VIXY = fear is fading. If you hold puts, your premium is decaying \
+from both theta AND falling IV (double headwind).
+
+RISK ALERTS:
+You now control most position exits. The system attaches risk alerts to your \
+positions when they hit certain thresholds. You must address each alert:
+- STOP LOSS alerts: The position has hit or exceeded the DTE-scaled stop loss. \
+Close the position unless you have a strong, specific thesis justifying holding \
+(not just "it might come back"). If you hold, you MUST update your thesis with \
+a justification.
+- PROFIT TARGET alerts: The position has hit the profit target. Take profits \
+unless you have clear evidence of continued momentum (e.g., strong catalyst \
+still developing). If you hold, update your thesis explaining why.
+- TIME STOP alerts: Very few DTE remaining. Close unless you expect a specific \
+catalyst before expiration.
+- CATASTROPHIC stops (-85% loss) are auto-closed by the system. You cannot \
+override these.
+When you see "RISK ALERT" on a position, you must either close it or explicitly \
+justify holding it in a thesis update. Ignoring alerts is not allowed.
+
 WHEN TO TRADE:
 - Breaking news with clear directional impact (earnings beats/misses, FDA \
 approvals, major contracts, geopolitical events)
@@ -325,6 +353,13 @@ class TradingBrain:
             "If your journal is near capacity, prioritize: invalidate your weakest theses "
             "before creating new ones. "
         )
+        if "RISK ALERT" in portfolio_context:
+            instruction += (
+                "IMPORTANT: You have positions with RISK ALERTS. For each alerted position, "
+                "you must either close it (submit a close_position trade) or explicitly "
+                "justify holding it in a thesis update with specific reasoning. "
+                "Do not ignore any risk alerts. "
+            )
         if "REPEAT LOSERS" in trade_history_context:
             instruction += (
                 "You have repeat-loser tickers in your history. Before trading them "

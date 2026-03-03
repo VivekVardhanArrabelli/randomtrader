@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from . import config
 from .alpaca_client import AlpacaClient
 from .utils import log, now_eastern
+
+
+def approx_delta(strike: float, spot: float, dte: int, option_type: str) -> float:
+    """Approximate option delta using a tanh-based model.
+
+    Good enough for the LLM to distinguish lottery tickets (delta~0.10)
+    from stock proxies (delta~0.90). Not for actual hedging.
+    """
+    if spot <= 0 or strike <= 0 or dte <= 0:
+        return 0.0
+    moneyness = (spot - strike) / spot  # positive = ITM for calls
+    # Scale by time: shorter DTE = steeper delta curve
+    time_scale = max(1.0, math.sqrt(dte / 30.0))
+    scaling = 4.0 / time_scale
+    call_delta = 0.5 + 0.5 * math.tanh(moneyness * scaling / 0.05)
+    call_delta = max(0.01, min(0.99, call_delta))
+    if option_type == "put":
+        return round(call_delta - 1.0, 2)
+    return round(call_delta, 2)
 
 
 @dataclass(frozen=True)
@@ -30,13 +50,28 @@ class OptionContract:
             return 1.0
         return (self.ask - self.bid) / self.ask
 
-    def to_context_str(self) -> str:
-        return (
-            f"{self.symbol} | {self.option_type.upper()} ${self.strike:.2f} "
+    def to_context_str(self, underlying_price: float = 0.0) -> str:
+        parts = [
+            f"{self.symbol} | {self.option_type.upper()} ${self.strike:.2f}",
+        ]
+        if underlying_price > 0:
+            pct = abs(self.strike - underlying_price) / underlying_price * 100
+            if self.option_type == "call":
+                itm = self.strike < underlying_price
+            else:
+                itm = self.strike > underlying_price
+            label = "ITM" if itm else "OTM"
+            atm = pct < 0.5
+            moneyness_str = "ATM" if atm else f"{pct:.1f}% {label}"
+            parts.append(f"({moneyness_str})")
+            d = approx_delta(self.strike, underlying_price, self.dte, self.option_type)
+            parts.append(f"delta~{d:.2f}")
+        parts.append(
             f"exp={self.expiration} DTE={self.dte} "
             f"bid={self.bid:.2f} ask={self.ask:.2f} mid={self.mid:.2f} "
             f"vol={self.volume} OI={self.open_interest}"
         )
+        return " ".join(parts)
 
 
 def fetch_option_chain(
@@ -196,9 +231,11 @@ def select_contract(
 
 
 def format_chain_for_llm(
-    contracts: list[OptionContract], max_contracts: int = 15
+    contracts: list[OptionContract],
+    max_contracts: int = 15,
+    underlying_price: float = 0.0,
 ) -> str:
     if not contracts:
         return "No options contracts available."
-    lines = [c.to_context_str() for c in contracts[:max_contracts]]
+    lines = [c.to_context_str(underlying_price) for c in contracts[:max_contracts]]
     return "\n".join(lines)

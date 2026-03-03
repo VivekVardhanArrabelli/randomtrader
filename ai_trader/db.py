@@ -201,6 +201,46 @@ class AITradeLogger:
             return [dict(row) for row in rows]
 
 
+def _conviction_calibration(trades: list[dict], closes: list[dict]) -> list[str]:
+    """Group closes by conviction bucket and show win rate per bucket."""
+    # Build a map from underlying -> conviction from the trades table
+    # (trades table has conviction; closes table does not)
+    underlying_conviction: dict[str, float] = {}
+    for t in trades:
+        if t.get("status") == "filled" and t.get("conviction"):
+            sym = t.get("underlying", "")
+            underlying_conviction[sym] = float(t["conviction"])
+
+    # Bucket: conviction -> list of pnl
+    buckets: dict[str, list[float]] = {}
+    for c in closes:
+        sym = c.get("underlying", "")
+        conv = underlying_conviction.get(sym)
+        if conv is None:
+            continue
+        if conv < 0.7:
+            bucket = "0.60-0.69"
+        elif conv < 0.8:
+            bucket = "0.70-0.79"
+        elif conv < 0.9:
+            bucket = "0.80-0.89"
+        else:
+            bucket = "0.90-1.00"
+        buckets.setdefault(bucket, []).append(c.get("pnl", 0))
+
+    if not buckets:
+        return []
+
+    lines = ["  Conviction calibration:"]
+    for bucket in sorted(buckets.keys()):
+        pnls = buckets[bucket]
+        w = sum(1 for p in pnls if p > 0)
+        total = len(pnls)
+        wr = w / total * 100 if total > 0 else 0
+        lines.append(f"    {bucket}: {w}/{total} wins ({wr:.0f}%)")
+    return lines
+
+
 def format_trade_history(trades: list[dict], closes: list[dict]) -> str:
     """Format recent trades + closes as context for the LLM."""
     if not trades and not closes:
@@ -227,6 +267,55 @@ def format_trade_history(trades: list[dict], closes: list[dict]) -> str:
         losses = sum(1 for c in closes if (c.get("pnl") or 0) < 0)
         net = sum(c.get("pnl", 0) for c in closes)
         lines.append(f"\n  Recent stats: {wins}W/{losses}L net=${net:+,.2f}")
+
+        # Performance by type (calls vs puts)
+        call_w, call_l, call_net = 0, 0, 0.0
+        put_w, put_l, put_net = 0, 0, 0.0
+        for c in closes:
+            sym = c.get("symbol", "")
+            pnl = c.get("pnl") or 0
+            is_call = "C" in sym[6:] if len(sym) > 6 else False
+            if is_call:
+                call_net += pnl
+                if pnl > 0:
+                    call_w += 1
+                elif pnl < 0:
+                    call_l += 1
+            else:
+                put_net += pnl
+                if pnl > 0:
+                    put_w += 1
+                elif pnl < 0:
+                    put_l += 1
+        lines.append(
+            f"  By type: Calls {call_w}W/{call_l}L net=${call_net:+,.0f}"
+            f" | Puts {put_w}W/{put_l}L net=${put_net:+,.0f}"
+        )
+
+        # Average winner vs loser
+        win_pnls = [c.get("pnl", 0) for c in closes if (c.get("pnl") or 0) > 0]
+        loss_pnls = [c.get("pnl", 0) for c in closes if (c.get("pnl") or 0) < 0]
+        avg_win = sum(win_pnls) / len(win_pnls) if win_pnls else 0
+        avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
+        ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+        lines.append(
+            f"  Avg winner: ${avg_win:+,.0f} | Avg loser: ${avg_loss:+,.0f}"
+            f" | Win/loss ratio: {ratio:.2f}"
+        )
+
+        # Best and worst trade
+        if closes:
+            best = max(closes, key=lambda c: c.get("pnl") or 0)
+            worst = min(closes, key=lambda c: c.get("pnl") or 0)
+            lines.append(
+                f"  Best trade: {best.get('underlying', '?')} ${best.get('pnl', 0):+,.0f}"
+                f" | Worst trade: {worst.get('underlying', '?')} ${worst.get('pnl', 0):+,.0f}"
+            )
+
+        # Conviction calibration
+        cal_lines = _conviction_calibration(trades, closes)
+        if cal_lines:
+            lines.extend(cal_lines)
 
         # Repeat losers: tickers with 2+ losses and 0 wins in recent closes
         ticker_stats: dict[str, dict] = {}

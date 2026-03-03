@@ -30,8 +30,19 @@ DEFAULT_STRIKE_PREFERENCE = "atm"  # itm / atm / otm
 # Position management
 # ---------------------------------------------------------------------------
 PROFIT_TARGET_PCT = 0.50           # take profit at 50 % gain on premium
-STOP_LOSS_PCT = 0.40               # stop loss at 40 % loss on premium
+STOP_LOSS_PCT = 0.40               # stop loss at 40 % loss on premium (short DTE ≤5)
+STOP_LOSS_PCT_MID_DTE = 0.55       # stop loss at 55 % loss (6-14 DTE)
+STOP_LOSS_PCT_LONG_DTE = 0.70      # stop loss at 70 % loss (15+ DTE)
+STOP_LOSS_SHORT_DTE_THRESHOLD = 5  # DTE boundary: short vs mid
+STOP_LOSS_LONG_DTE_THRESHOLD = 15  # DTE boundary: mid vs long
 TIME_STOP_DTE = 2                  # close if <= 2 DTE remaining
+CATASTROPHIC_STOP_PCT = 0.85       # auto-close at -85% loss, no LLM override
+
+# ---------------------------------------------------------------------------
+# Order pricing
+# ---------------------------------------------------------------------------
+OPEN_ORDER_SPREAD_FRACTION = 0.3   # bid 30% above mid (vs at ask)
+CLOSE_LIMIT_TIMEOUT_SECONDS = 15   # wait for limit fill before market fallback
 
 # ---------------------------------------------------------------------------
 # Scanning & loop
@@ -75,7 +86,7 @@ POLYGON_BASE_URL = "https://api.polygon.io"
 # ---------------------------------------------------------------------------
 # LLM (Claude)
 # ---------------------------------------------------------------------------
-LLM_MODEL = "claude-sonnet-4-20250514"
+LLM_MODEL = "claude-opus-4-6"
 LLM_MAX_TOKENS = 4096
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading
 

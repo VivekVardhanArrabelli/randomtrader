@@ -72,6 +72,7 @@ class ThesisJournal:
         stale_conviction: float = 0.4,
     ) -> None:
         self.entries: dict[str, ThesisEntry] = {}
+        self.pruned_theses: list[str] = []  # descriptions of recently pruned theses
         self.db_path = db_path
         self._next_id = 1
         self._max_active = max_active
@@ -161,6 +162,7 @@ class ThesisJournal:
 
     def apply_updates(self, updates: list[ThesisUpdate]) -> None:
         """Apply LLM's journal updates."""
+        self.pruned_theses = []  # reset for this cycle
         now = now_eastern()
         for u in updates:
             if u.id and u.id in self.entries:
@@ -210,6 +212,10 @@ class ThesisJournal:
         ]
         for eid in stale:
             entry = self.entries[eid]
+            self.pruned_theses.append(
+                f"Stale-pruned [{eid}] {entry.underlying} {entry.direction} "
+                f"(conv={entry.conviction:.2f}, cycles={entry.cycles_observed}): {entry.thesis}"
+            )
             entry.status = "invalidated"
             self._save_entry(entry)
             log(f"journal: auto-pruned stale [{eid}] {entry.underlying} "
@@ -225,6 +231,10 @@ class ThesisJournal:
                 active.sort(key=lambda e: (status_priority.get(e.status, 0), e.conviction))
                 to_prune = active[:len(active) - self._max_active]
                 for entry in to_prune:
+                    self.pruned_theses.append(
+                        f"Overflow-pruned [{entry.id}] {entry.underlying} {entry.direction} "
+                        f"(conv={entry.conviction:.2f}): {entry.thesis}"
+                    )
                     entry.status = "invalidated"
                     self._save_entry(entry)
                     log(f"journal: overflow-pruned [{entry.id}] {entry.underlying} "
@@ -239,29 +249,42 @@ class ThesisJournal:
 
     def to_context_str(self) -> str:
         active = self.active_entries()
-        if not active:
+        if not active and not self.pruned_theses:
             return "No active theses. You can start developing new ones based on the news."
-        active.sort(key=lambda e: e.conviction, reverse=True)
 
-        cap_note = f" [limit: {self._max_active}]" if self._max_active > 0 else ""
+        parts: list[str] = []
 
-        # Tiered display: full detail for top N, summary for the rest
-        if self._max_full_display > 0 and len(active) > self._max_full_display:
-            top = active[:self._max_full_display]
-            rest = active[self._max_full_display:]
-            header = f"Active theses ({len(active)}, showing top {len(top)} in detail):{cap_note}"
-            lines = [header]
-            for entry in top:
-                lines.append(entry.to_context_str())
-            lines.append(f"--- {len(rest)} lower-priority theses (summary only) ---")
-            for entry in rest:
-                lines.append(entry.to_summary_str())
-            return "\n\n".join(lines)
+        if active:
+            active.sort(key=lambda e: e.conviction, reverse=True)
+            cap_note = f" [limit: {self._max_active}]" if self._max_active > 0 else ""
 
-        lines = [f"Active theses ({len(active)}):{cap_note}"]
-        for entry in active:
-            lines.append(entry.to_context_str())
-        return "\n\n".join(lines)
+            # Tiered display: full detail for top N, summary for the rest
+            if self._max_full_display > 0 and len(active) > self._max_full_display:
+                top = active[:self._max_full_display]
+                rest = active[self._max_full_display:]
+                header = f"Active theses ({len(active)}, showing top {len(top)} in detail):{cap_note}"
+                lines = [header]
+                for entry in top:
+                    lines.append(entry.to_context_str())
+                lines.append(f"--- {len(rest)} lower-priority theses (summary only) ---")
+                for entry in rest:
+                    lines.append(entry.to_summary_str())
+                parts.append("\n\n".join(lines))
+            else:
+                lines = [f"Active theses ({len(active)}):{cap_note}"]
+                for entry in active:
+                    lines.append(entry.to_context_str())
+                parts.append("\n\n".join(lines))
+        else:
+            parts.append("No active theses. You can start developing new ones based on the news.")
+
+        if self.pruned_theses:
+            parts.append(
+                "\nRecently pruned theses (FYI — these were auto-removed):\n"
+                + "\n".join(f"  - {p}" for p in self.pruned_theses)
+            )
+
+        return "\n".join(parts)
 
     def set_time(self, dt: datetime) -> None:
         """Override current time (used by backtester)."""
