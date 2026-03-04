@@ -9,6 +9,17 @@ from datetime import datetime
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(__file__).parent / "logs" / "ai_trades.db"
+_PENDING_ORDER_STATUSES = (
+    "new",
+    "accepted",
+    "pending_new",
+    "accepted_for_bidding",
+    "partially_filled",
+    "pending_replace",
+    "replaced",
+    "calculated",
+    "held",
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,7 @@ class PositionCloseRecord:
     exit_premium: float
     pnl: float
     reason: str
+    order_id: str | None = None
 
 
 class AITradeLogger:
@@ -106,10 +118,17 @@ class AITradeLogger:
                     entry_premium REAL,
                     exit_premium REAL,
                     pnl REAL,
-                    reason TEXT
+                    reason TEXT,
+                    order_id TEXT
                 )
                 """
             )
+            close_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(position_closes)")
+            }
+            if "order_id" not in close_cols:
+                conn.execute("ALTER TABLE position_closes ADD COLUMN order_id TEXT")
 
     def log_trade(self, record: AITradeRecord) -> None:
         with self._connect() as conn:
@@ -151,7 +170,12 @@ class AITradeLogger:
     def log_position_close(self, record: PositionCloseRecord) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO position_closes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO position_closes (
+                    timestamp, symbol, underlying, qty, entry_premium,
+                    exit_premium, pnl, reason, order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     record.timestamp.isoformat(),
                     record.symbol,
@@ -161,8 +185,45 @@ class AITradeLogger:
                     record.exit_premium,
                     record.pnl,
                     record.reason,
+                    record.order_id,
                 ),
             )
+
+    def get_pending_trades(self, limit: int = 100) -> list[dict]:
+        placeholders = ",".join("?" for _ in _PENDING_ORDER_STATUSES)
+        query = (
+            "SELECT * FROM ai_trades "
+            "WHERE order_id IS NOT NULL AND order_id != '' "
+            f"AND lower(status) IN ({placeholders}) "
+            "ORDER BY timestamp DESC LIMIT ?"
+        )
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                query,
+                (*_PENDING_ORDER_STATUSES, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_trade_status(self, order_id: str, status: str) -> int:
+        if not order_id:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE ai_trades SET status = ? WHERE order_id = ?",
+                (status, order_id),
+            )
+            return int(cur.rowcount or 0)
+
+    def has_position_close_for_order(self, order_id: str) -> bool:
+        if not order_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM position_closes WHERE order_id = ? LIMIT 1",
+                (order_id,),
+            ).fetchone()
+            return row is not None
 
     def get_trade_count_today(self) -> int:
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -207,7 +268,8 @@ def _conviction_calibration(trades: list[dict], closes: list[dict]) -> list[str]
     # (trades table has conviction; closes table does not)
     underlying_conviction: dict[str, float] = {}
     for t in trades:
-        if t.get("status") == "filled" and t.get("conviction"):
+        action = str(t.get("action") or "")
+        if t.get("status") == "filled" and t.get("conviction") and action.startswith("buy_"):
             sym = t.get("underlying", "")
             underlying_conviction[sym] = float(t["conviction"])
 

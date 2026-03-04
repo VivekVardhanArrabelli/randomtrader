@@ -198,12 +198,30 @@ def _extract_underlying(symbol: str) -> str:
 def _extract_option_type(symbol: str, pos: dict) -> str:
     opt_type = pos.get("option_type") or pos.get("type") or ""
     if opt_type:
-        return opt_type.lower()
-    for c in symbol:
-        if c == "C":
+        normalized = str(opt_type).strip().lower()
+        if normalized in ("call", "c"):
             return "call"
-        if c == "P":
+        if normalized in ("put", "p"):
             return "put"
+
+    # OCC/condensed format: <UNDERLYING><YYMMDD><C|P><STRIKE*1000>
+    # The option type is the char immediately after the 6-digit date.
+    for i, c in enumerate(symbol):
+        if c.isdigit():
+            type_idx = i + 6
+            if type_idx < len(symbol):
+                cp = symbol[type_idx].upper()
+                if cp == "C":
+                    return "call"
+                if cp == "P":
+                    return "put"
+            break
+
+    # Fallback: scan from right for C/P followed by a numeric strike suffix.
+    for i in range(len(symbol) - 9, -1, -1):
+        cp = symbol[i].upper()
+        if cp in ("C", "P") and symbol[i + 1 :].isdigit():
+            return "call" if cp == "C" else "put"
     return "unknown"
 
 

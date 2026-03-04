@@ -25,7 +25,7 @@ from . import config
 from .alpaca_client import AlpacaClient
 from .brain import TradingBrain
 from .db import AIDecisionRecord, AITradeLogger, format_trade_history
-from .executor import _execute_close, execute_trade
+from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
 from .news import fetch_news, fetch_targeted_news, format_news_for_llm
 from .options import fetch_option_chain, format_chain_for_llm
@@ -279,6 +279,16 @@ def run_cycle(
     # 1. Get portfolio state
     portfolio = get_portfolio_state(alpaca)
 
+    # 1b. Reconcile pending orders that may have filled asynchronously.
+    status_updates, closes_backfilled = reconcile_pending_orders(alpaca, logger)
+    if status_updates or closes_backfilled:
+        log(
+            f"reconciled pending orders: status_updates={status_updates} "
+            f"close_backfills={closes_backfilled}"
+        )
+        if closes_backfilled > 0:
+            portfolio = get_portfolio_state(alpaca)
+
     # 2. Enrich positions with underlying spot prices and run risk assessment
     if portfolio.option_positions:
         # Batch-fetch underlying spot prices
@@ -319,9 +329,11 @@ def run_cycle(
                     target_symbol=pos.symbol,
                 )
                 close_result = _execute_close(alpaca, decision, portfolio, logger, "catastrophic risk exit")
-                if close_result.success:
+                if close_result.filled:
                     log(f"catastrophic exit executed: {pos.symbol}")
                     catastrophic_exits = True
+                elif close_result.success:
+                    log(f"catastrophic exit submitted (pending): {pos.symbol}")
             elif isinstance(result, PositionRiskAlert):
                 # Soft alert — attach to position for LLM to see
                 pos.risk_alert = result.message
@@ -410,10 +422,13 @@ def run_cycle(
             alpaca, decision, portfolio, logger, analysis.analysis
         )
         if result.success:
-            trades_executed += 1
-            log(f"trade executed: {result.symbol} qty={result.qty} premium=${result.premium:.2f}")
-            # Refresh portfolio for next trade in this cycle
-            portfolio = get_portfolio_state(alpaca)
+            if result.filled:
+                trades_executed += 1
+                log(f"trade filled: {result.symbol} qty={result.qty} premium=${result.premium:.2f}")
+                # Refresh portfolio for next trade in this cycle
+                portfolio = get_portfolio_state(alpaca)
+            else:
+                log(f"trade accepted (pending fill): {result.symbol} - {result.message}")
         else:
             log(f"trade failed: {result.symbol} - {result.message}")
 
