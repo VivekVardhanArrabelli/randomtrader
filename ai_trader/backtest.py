@@ -18,15 +18,16 @@ import re
 import time as time_module
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from . import config
-from .brain import TradingBrain, TradeDecision
+from .brain import MarketAnalysis, TradingBrain, TradeDecision
 from .db import format_trade_history
 from .journal import ThesisJournal
+from .risk import size_for_risk_budget
 from .utils import EASTERN_TZ, log
 
 
@@ -51,12 +52,18 @@ def _polygon_request(api_key: str, path: str, params: dict | None = None) -> dic
     return response.json()
 
 
-def fetch_historical_news(
-    api_key: str, trade_date: date, limit: int = 50,
+def fetch_historical_news_window(
+    api_key: str,
+    start_time: datetime,
+    end_time: datetime,
+    limit: int = 50,
 ) -> list[dict]:
-    """Fetch news for a given date from Polygon."""
-    start = f"{trade_date}T00:00:00Z"
-    end = f"{trade_date}T23:59:59Z"
+    """Fetch Polygon news published within a precise timestamp window."""
+    if end_time <= start_time:
+        return []
+
+    start = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         data = _polygon_request(
             api_key,
@@ -70,9 +77,18 @@ def fetch_historical_news(
             },
         )
     except Exception as exc:
-        log(f"news fetch error for {trade_date}: {exc}")
+        log(f"news fetch error for {start_time} -> {end_time}: {exc}")
         return []
     return data.get("results", [])
+
+
+def fetch_historical_news(
+    api_key: str, trade_date: date, limit: int = 50,
+) -> list[dict]:
+    """Fetch all news for a given date from Polygon."""
+    start = datetime.combine(trade_date, time(0, 0, tzinfo=EASTERN_TZ))
+    end = datetime.combine(trade_date, time(23, 59, 59, tzinfo=EASTERN_TZ))
+    return fetch_historical_news_window(api_key, start, end, limit=limit)
 
 
 def fetch_historical_daily_bar(
@@ -108,17 +124,124 @@ def fetch_historical_daily_bars_range(
     return data.get("results", [])
 
 
+def fetch_historical_intraday_bars(
+    api_key: str,
+    ticker: str,
+    trading_day: date,
+    multiplier: int = 5,
+    cache: PolygonCache | None = None,
+) -> list[dict]:
+    """Fetch regular-session intraday aggregate bars for one ticker and day."""
+    cache_key = (ticker, trading_day.isoformat(), multiplier)
+    if cache and cache_key in cache.intraday_bars:
+        return cache.intraday_bars[cache_key]
+
+    start_ms = _to_epoch_ms(_market_open_dt(trading_day))
+    end_ms = _to_epoch_ms(_market_close_dt(trading_day))
+    try:
+        data = _polygon_request(
+            api_key,
+            f"/v2/aggs/ticker/{ticker}/range/{multiplier}/minute/{start_ms}/{end_ms}",
+            params={"adjusted": "true", "sort": "asc", "limit": "5000"},
+        )
+    except Exception as exc:
+        log(f"intraday bars fetch error for {ticker} on {trading_day}: {exc}")
+        return []
+
+    results = data.get("results", [])
+    if cache is not None:
+        cache.intraday_bars[cache_key] = results
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Polygon options data
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PolygonCache:
-    """In-memory cache for Polygon option contract lookups and daily bars."""
+    """In-memory cache for Polygon lookups and aggregate bars."""
     # (underlying, type, expiry_gte, expiry_lte, strike_gte, strike_lte) -> list[contract_dict]
     contracts: dict[tuple, list[dict]] = field(default_factory=dict)
     # option_ticker -> {date_iso -> bar_dict}
     option_bars: dict[str, dict[str, dict]] = field(default_factory=dict)
+    # (ticker, date_iso, multiplier) -> list[agg_bar_dict]
+    intraday_bars: dict[tuple[str, str, int], list[dict]] = field(default_factory=dict)
+
+
+def _coerce_eastern_datetime(
+    value: date | datetime,
+    default_time: time = time(16, 0),
+) -> datetime:
+    """Normalize a date/datetime to an aware Eastern datetime."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=EASTERN_TZ)
+        return value.astimezone(EASTERN_TZ)
+
+    if default_time.tzinfo is None:
+        default_time = time(
+            default_time.hour,
+            default_time.minute,
+            default_time.second,
+            default_time.microsecond,
+            tzinfo=EASTERN_TZ,
+        )
+    return datetime.combine(value, default_time)
+
+
+def _market_open_dt(trading_day: date) -> datetime:
+    return datetime.combine(trading_day, time(9, 30, tzinfo=EASTERN_TZ))
+
+
+def _market_close_dt(trading_day: date) -> datetime:
+    return datetime.combine(trading_day, time(16, 0, tzinfo=EASTERN_TZ))
+
+
+def _to_epoch_ms(value: datetime) -> int:
+    return int(value.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _bar_timestamp_eastern(bar: dict) -> datetime | None:
+    ts_ms = bar.get("t")
+    if not ts_ms:
+        return None
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(EASTERN_TZ)
+
+
+def _latest_bar_before(bars: list[dict], cutoff: datetime) -> dict | None:
+    """Return the most recent aggregate bar that started before cutoff."""
+    for bar in reversed(bars):
+        ts = _bar_timestamp_eastern(bar)
+        if ts and ts < cutoff:
+            return bar
+    return None
+
+
+def _first_bar_at_or_after(bars: list[dict], cutoff: datetime) -> dict | None:
+    """Return the first aggregate bar that starts at or after cutoff."""
+    for bar in bars:
+        ts = _bar_timestamp_eastern(bar)
+        if ts and ts >= cutoff:
+            return bar
+    return None
+
+
+def _decision_timestamps_for_day(
+    trading_day: date,
+    interval_minutes: int,
+    start_delay_minutes: int,
+    end_buffer_minutes: int,
+) -> list[datetime]:
+    """Generate intraday decision timestamps aligned to the live scan cadence."""
+    start = _market_open_dt(trading_day) + timedelta(minutes=start_delay_minutes)
+    end = _market_close_dt(trading_day) - timedelta(minutes=end_buffer_minutes)
+    timestamps: list[datetime] = []
+    current = start
+    while current <= end:
+        timestamps.append(current)
+        current += timedelta(minutes=interval_minutes)
+    return timestamps
 
 
 def fetch_polygon_option_contracts(
@@ -248,6 +371,135 @@ def _option_bar_price(bar: dict) -> float:
     return float(close) if close else 0.0
 
 
+def _equity_bar_price(bar: dict) -> float:
+    """Extract price from an equity bar."""
+    close = bar.get("c", 0)
+    return float(close) if close else 0.0
+
+
+def _latest_intraday_bar_before(
+    api_key: str,
+    ticker: str,
+    as_of: date | datetime,
+    cache: PolygonCache | None = None,
+    multiplier: int = 5,
+) -> dict | None:
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    bars = fetch_historical_intraday_bars(
+        api_key, ticker, as_of_dt.date(), multiplier=multiplier, cache=cache,
+    )
+    return _latest_bar_before(bars, as_of_dt)
+
+
+def _first_intraday_bar_at_or_after(
+    api_key: str,
+    ticker: str,
+    as_of: date | datetime,
+    cache: PolygonCache | None = None,
+    multiplier: int = 5,
+) -> dict | None:
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    bars = fetch_historical_intraday_bars(
+        api_key, ticker, as_of_dt.date(), multiplier=multiplier, cache=cache,
+    )
+    return _first_bar_at_or_after(bars, as_of_dt)
+
+
+def _current_option_bar(
+    api_key: str,
+    option_ticker: str,
+    as_of: date | datetime,
+    cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
+) -> dict | None:
+    if isinstance(as_of, datetime):
+        return _latest_intraday_bar_before(
+            api_key, option_ticker, as_of, cache=cache, multiplier=bar_minutes,
+        )
+    return fetch_option_daily_bar(api_key, option_ticker, as_of, cache=cache)
+
+
+def _current_equity_bar(
+    api_key: str,
+    symbol: str,
+    as_of: date | datetime,
+    cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
+) -> dict | None:
+    if isinstance(as_of, datetime):
+        return _latest_intraday_bar_before(
+            api_key, symbol, as_of, cache=cache, multiplier=bar_minutes,
+        )
+    return fetch_historical_daily_bar(api_key, symbol, as_of)
+
+
+def _session_intraday_bars_before(
+    api_key: str,
+    ticker: str,
+    as_of: date | datetime,
+    cache: PolygonCache | None = None,
+    multiplier: int = 5,
+) -> list[dict]:
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    bars = fetch_historical_intraday_bars(
+        api_key, ticker, as_of_dt.date(), multiplier=multiplier, cache=cache,
+    )
+    eligible: list[dict] = []
+    for bar in bars:
+        ts = _bar_timestamp_eastern(bar)
+        if ts and ts < as_of_dt:
+            eligible.append(bar)
+    return eligible
+
+
+def _mark_to_market_equity(
+    realized_equity: float,
+    positions: list["SimPosition"],
+    as_of: date | datetime,
+    api_key: str,
+    cache: PolygonCache,
+    bar_minutes: int = 5,
+) -> tuple[float, float]:
+    """Return (account_equity, total_unrealized_pnl) at a timestamp."""
+    total_unrealized = 0.0
+    for pos in positions:
+        if not pos.polygon_ticker:
+            continue
+        bar = _current_option_bar(
+            api_key, pos.polygon_ticker, as_of, cache=cache, bar_minutes=bar_minutes,
+        )
+        premium = _option_bar_price(bar) if bar else 0.0
+        if premium <= 0 or pos.entry_premium <= 0:
+            continue
+        total_unrealized += (premium - pos.entry_premium) * pos.qty * 100
+    return realized_equity + total_unrealized, total_unrealized
+
+
+def _current_underlying_price(
+    api_key: str,
+    symbol: str,
+    as_of: date | datetime,
+    cache: PolygonCache,
+    bar_minutes: int = 5,
+) -> float:
+    bar = _current_equity_bar(api_key, symbol, as_of, cache=cache, bar_minutes=bar_minutes)
+    if bar is None:
+        return 0.0
+    return _equity_bar_price(bar)
+
+
+def _next_fill_option_bar(
+    api_key: str,
+    option_ticker: str,
+    decision_time: datetime,
+    cache: PolygonCache,
+    bar_minutes: int = 5,
+) -> dict | None:
+    return _first_intraday_bar_at_or_after(
+        api_key, option_ticker, decision_time, cache=cache, multiplier=bar_minutes,
+    )
+
+
 def _select_real_contract(
     api_key: str,
     underlying: str,
@@ -367,6 +619,11 @@ class BacktestConfig:
     default_dte: int = 14
     max_positions: int = 5
     llm_delay_seconds: float = 1.0
+    decision_interval_minutes: int = config.SCAN_INTERVAL_MINUTES
+    signal_bar_minutes: int = 5
+    news_lookback_hours: int = config.NEWS_LOOKBACK_HOURS
+    no_trade_minutes_after_open: int = config.NO_TRADE_MINUTES_AFTER_OPEN
+    no_trade_minutes_before_close: int = config.NO_TRADE_MINUTES_BEFORE_CLOSE
     use_journal: bool = True
     journal_max_active: int = 8
     journal_max_full_display: int = 5
@@ -403,6 +660,25 @@ def _trading_days(start: date, end: date) -> list[date]:
             days.append(current)
         current += timedelta(days=1)
     return days
+
+
+def _previous_trading_day(trade_date: date) -> date:
+    """Return the prior weekday for daily backtest signal generation."""
+    previous = trade_date - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+    return previous
+
+
+def _last_completed_trading_day(as_of: date | datetime) -> date:
+    """Return the most recent fully completed session available at as_of."""
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    session_day = as_of_dt.date()
+    while session_day.weekday() >= 5:
+        session_day = _previous_trading_day(session_day)
+    if as_of_dt < _market_close_dt(session_day):
+        return _previous_trading_day(session_day)
+    return session_day
 
 
 # ---------------------------------------------------------------------------
@@ -550,53 +826,79 @@ def _build_performance_summary(
 
 
 def _build_market_trend_context(
-    api_key: str, trade_date: date, lookback_days: int = 10,
+    api_key: str,
+    as_of: date | datetime,
+    lookback_days: int = 10,
+    cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
 ) -> str:
-    """Build multi-day market trend context for major indices.
-
-    Fetches lookback_days of daily bars for SPY, QQQ, IWM and computes
-    today's change, 5-day change, 10-day change, and simple trend direction.
-    """
-    start = trade_date - timedelta(days=int(lookback_days * 1.8))  # buffer for weekends/holidays
-    lines = [f"Major Indices ({lookback_days}-day view):"]
+    """Build market trend context using only information available at as_of."""
+    is_intraday = isinstance(as_of, datetime)
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    last_completed_day = _last_completed_trading_day(as_of_dt)
+    start = last_completed_day - timedelta(days=int(lookback_days * 1.8))
+    if is_intraday:
+        lines = [
+            f"Major Indices ({lookback_days}-day view) as of "
+            f"{as_of_dt.strftime('%Y-%m-%d %H:%M %Z')}:"
+        ]
+        change_label = "now"
+    else:
+        lines = [f"Major Indices ({lookback_days}-day view):"]
+        change_label = "today"
 
     for idx_sym in ["SPY", "QQQ", "IWM"]:
-        bars = fetch_historical_daily_bars_range(api_key, idx_sym, start, trade_date)
+        bars = fetch_historical_daily_bars_range(api_key, idx_sym, start, last_completed_day)
         time_module.sleep(0.25)
         if not bars:
             continue
 
-        # bars are sorted ascending by date; last bar is today (or most recent)
-        today_bar = bars[-1]
-        today_close = float(today_bar.get("c", 0))
-        today_open = float(today_bar.get("o", 0))
-        if today_close <= 0:
+        current_price = float(bars[-1].get("c", 0))
+        intraday_chg = 0.0
+
+        if isinstance(as_of, datetime):
+            intraday_bars = _session_intraday_bars_before(
+                api_key, idx_sym, as_of_dt, cache=cache, multiplier=bar_minutes,
+            )
+            if intraday_bars:
+                first_bar = intraday_bars[0]
+                latest_bar = intraday_bars[-1]
+                current_price = _equity_bar_price(latest_bar)
+                session_open = float(first_bar.get("o", 0))
+                intraday_chg = (
+                    (current_price - session_open) / session_open * 100
+                    if session_open > 0 and current_price > 0 else 0.0
+                )
+        else:
+            today_bar = bars[-1]
+            today_open = float(today_bar.get("o", 0))
+            intraday_chg = (
+                (current_price - today_open) / today_open * 100
+                if today_open > 0 and current_price > 0 else 0.0
+            )
+
+        if current_price <= 0:
             continue
 
-        intraday_chg = ((today_close - today_open) / today_open * 100) if today_open > 0 else 0
-
-        # 5-day change: compare today's close to close 5 bars ago
         five_d_chg = 0.0
         if len(bars) >= 6:
             ref = float(bars[-6].get("c", 0))
             if ref > 0:
-                five_d_chg = (today_close - ref) / ref * 100
+                five_d_chg = (current_price - ref) / ref * 100
 
-        # 10-day change: compare today's close to close 10 bars ago
         ten_d_chg = 0.0
         if len(bars) >= 11:
             ref = float(bars[-11].get("c", 0))
             if ref > 0:
-                ten_d_chg = (today_close - ref) / ref * 100
+                ten_d_chg = (current_price - ref) / ref * 100
 
-        # Trend: above or below 10-day average close
         recent_bars = bars[-lookback_days:] if len(bars) >= lookback_days else bars
         avg_close = sum(float(b.get("c", 0)) for b in recent_bars) / len(recent_bars)
-        trend = "up" if today_close >= avg_close else "down"
+        trend = "up" if current_price >= avg_close else "down"
 
         lines.append(
-            f"  {idx_sym}: ${today_close:.2f}"
-            f" today({intraday_chg:+.2f}%)"
+            f"  {idx_sym}: ${current_price:.2f}"
+            f" {change_label}({intraday_chg:+.2f}%)"
             f" 5d({five_d_chg:+.1f}%)"
             f" 10d({ten_d_chg:+.1f}%)"
             f" trend={trend}"
@@ -606,51 +908,89 @@ def _build_market_trend_context(
 
 
 def _build_ticker_price_context(
-    api_key: str, ticker: str, trade_date: date, lookback_days: int = 10,
+    api_key: str,
+    ticker: str,
+    as_of: date | datetime,
+    lookback_days: int = 10,
+    cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
 ) -> tuple[str | None, float]:
-    """Build price trend context for a single ticker.
+    """Build price trend context for a single ticker as of a timestamp.
 
     Returns (context_string, spot_price).  context_string looks like:
       spot=$140.00 today(-1.5%) 5d(+8.2%) 10d(+12.1%) hi/lo=$145/$125
     Returns (None, 0.0) if no data available.
     """
-    start = trade_date - timedelta(days=int(lookback_days * 1.8))
-    bars = fetch_historical_daily_bars_range(api_key, ticker, start, trade_date)
+    is_intraday = isinstance(as_of, datetime)
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    last_completed_day = _last_completed_trading_day(as_of_dt)
+    start = last_completed_day - timedelta(days=int(lookback_days * 1.8))
+    bars = fetch_historical_daily_bars_range(api_key, ticker, start, last_completed_day)
     if not bars:
         return None, 0.0
 
-    today_bar = bars[-1]
-    today_close = float(today_bar.get("c", 0))
-    today_open = float(today_bar.get("o", 0))
-    if today_close <= 0:
-        return None, 0.0
+    current_price = float(bars[-1].get("c", 0))
+    intraday_chg = 0.0
+    session_high = current_price
+    session_low = current_price
 
-    intraday_chg = ((today_close - today_open) / today_open * 100) if today_open > 0 else 0
+    if isinstance(as_of, datetime):
+        intraday_bars = _session_intraday_bars_before(
+            api_key, ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
+        )
+        if intraday_bars:
+            latest_bar = intraday_bars[-1]
+            current_price = _equity_bar_price(latest_bar)
+            session_open = float(intraday_bars[0].get("o", 0))
+            intraday_chg = (
+                (current_price - session_open) / session_open * 100
+                if session_open > 0 and current_price > 0 else 0.0
+            )
+            session_high = max(float(b.get("h", 0)) for b in intraday_bars)
+            lows = [float(b.get("l", 0)) for b in intraday_bars if float(b.get("l", 0)) > 0]
+            session_low = min(lows) if lows else current_price
+    else:
+        today_bar = bars[-1]
+        today_open = float(today_bar.get("o", 0))
+        intraday_chg = (
+            (current_price - today_open) / today_open * 100
+            if today_open > 0 and current_price > 0 else 0.0
+        )
+        session_high = float(today_bar.get("h", current_price) or current_price)
+        session_low = float(today_bar.get("l", current_price) or current_price)
+
+    if current_price <= 0:
+        return None, 0.0
 
     five_d_chg = 0.0
     if len(bars) >= 6:
         ref = float(bars[-6].get("c", 0))
         if ref > 0:
-            five_d_chg = (today_close - ref) / ref * 100
+            five_d_chg = (current_price - ref) / ref * 100
 
     ten_d_chg = 0.0
     if len(bars) >= 11:
         ref = float(bars[-11].get("c", 0))
         if ref > 0:
-            ten_d_chg = (today_close - ref) / ref * 100
+            ten_d_chg = (current_price - ref) / ref * 100
 
     recent_bars = bars[-lookback_days:] if len(bars) >= lookback_days else bars
     recent_high = max(float(b.get("h", 0)) for b in recent_bars)
     recent_low = min(float(b.get("l", float("inf"))) for b in recent_bars)
+    if not is_intraday:
+        session_high = recent_high
+        session_low = recent_low
 
     ctx = (
-        f"spot=${today_close:.2f}"
-        f" today({intraday_chg:+.1f}%)"
+        f"spot=${current_price:.2f}"
+        f" {'now' if is_intraday else 'today'}({intraday_chg:+.1f}%)"
         f" 5d({five_d_chg:+.1f}%)"
         f" 10d({ten_d_chg:+.1f}%)"
-        f" hi/lo=${recent_high:.0f}/${recent_low:.0f}"
+        f" {'session' if is_intraday else 'hi/lo'}=${session_low:.0f}/${session_high:.0f}"
     )
-    return ctx, today_close
+    if is_intraday:
+        ctx += f" 10d_hi/lo=${recent_high:.0f}/${recent_low:.0f}"
+    return ctx, current_price
 
 
 def _annotate_closed_trades(
@@ -676,8 +1016,14 @@ def _annotate_closed_trades(
 
         if underlying and entry_date_str and exit_date_str:
             try:
-                entry_dt = date.fromisoformat(entry_date_str) if isinstance(entry_date_str, str) else entry_date_str
-                exit_dt = date.fromisoformat(exit_date_str) if isinstance(exit_date_str, str) else exit_date_str
+                entry_dt = (
+                    date.fromisoformat(str(entry_date_str)[:10])
+                    if isinstance(entry_date_str, str) else entry_date_str
+                )
+                exit_dt = (
+                    date.fromisoformat(str(exit_date_str)[:10])
+                    if isinstance(exit_date_str, str) else exit_date_str
+                )
             except (ValueError, TypeError):
                 annotated.append(trade)
                 continue
@@ -733,22 +1079,47 @@ def _extract_top_news_tickers(
     return [t for t, _ in counts.most_common(max_tickers)]
 
 
+def _build_focus_tickers(
+    news: list[dict],
+    positions: list[SimPosition],
+    journal: ThesisJournal | None,
+    max_tickers: int = config.WATCHLIST_SIZE,
+) -> list[str]:
+    """Build a compact focus list from live theses, open risk, and fresh news."""
+    tickers: list[str] = []
+    for pos in positions:
+        if pos.underlying:
+            tickers.append(pos.underlying.upper())
+    if journal:
+        for entry in journal.active_entries():
+            if entry.underlying:
+                tickers.append(entry.underlying.upper())
+    tickers.extend(_extract_top_news_tickers(news, max_tickers=max_tickers))
+    return list(dict.fromkeys(tickers))[:max_tickers]
+
+
 def _build_options_context(
     api_key: str,
     tickers: list[str],
-    trade_date: date,
+    as_of: date | datetime,
     cache: PolygonCache,
     default_dte: int = 14,
+    bar_minutes: int = 5,
 ) -> str:
     """Build a real options context string for the most-discussed tickers.
 
     For each ticker: fetch spot price, find ATM call+put contracts,
-    get today's bar for premium & volume.
+    and show the latest premium available before as_of.
     """
     if not tickers:
         return "(Backtest mode: real Polygon options data used for pricing)"
 
-    lines: list[str] = ["Available options for today's most-discussed tickers:"]
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    trade_date = as_of_dt.date()
+    lines: list[str] = [
+        "Available options for the current focus tickers "
+        f"(as of {as_of_dt.strftime('%H:%M %Z')}):"
+    ]
     found_any = False
 
     expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
@@ -756,13 +1127,16 @@ def _build_options_context(
 
     for ticker in tickers:
         # Fetch spot price + trend context (single range query, no extra call)
-        trend_ctx, spot = _build_ticker_price_context(api_key, ticker, trade_date)
+        trend_ctx, spot = _build_ticker_price_context(
+            api_key, ticker, as_of_dt, cache=cache, bar_minutes=bar_minutes,
+        )
         if spot <= 0:
-            # Fallback: try single-day bar
-            bar = fetch_historical_daily_bar(api_key, ticker, trade_date)
+            bar = _current_equity_bar(
+                api_key, ticker, as_of_dt, cache=cache, bar_minutes=bar_minutes,
+            )
             if bar is None:
                 continue
-            spot = float(bar.get("close") or bar.get("c") or 0)
+            spot = _equity_bar_price(bar)
             if spot <= 0:
                 continue
 
@@ -789,20 +1163,31 @@ def _build_options_context(
             if not opt_ticker:
                 continue
 
-            opt_bar = fetch_option_daily_bar(api_key, opt_ticker, trade_date, cache=cache)
-            premium = _option_bar_price(opt_bar) if opt_bar else 0
-            vol = opt_bar.get("v", 0) if opt_bar else 0
+            session_bars = _session_intraday_bars_before(
+                api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
+            )
+            if session_bars:
+                opt_bar = session_bars[-1]
+                premium = _option_bar_price(opt_bar)
+                vol = sum(int(b.get("v") or 0) for b in session_bars)
+                lows = [float(b.get("l", 0)) for b in session_bars if float(b.get("l", 0)) > 0]
+                highs = [float(b.get("h", 0)) for b in session_bars if float(b.get("h", 0)) > 0]
+                session_range = (
+                    f" session_range=${min(lows):.2f}-${max(highs):.2f}"
+                    if lows and highs else ""
+                )
+            else:
+                opt_bar = fetch_option_daily_bar(api_key, opt_ticker, trade_date, cache=cache)
+                premium = _option_bar_price(opt_bar) if opt_bar else 0
+                vol = int(opt_bar.get("v", 0)) if opt_bar else 0
+                session_range = ""
 
             if premium > 0:
-                day_range = ""
-                if opt_bar:
-                    bar_hi = opt_bar.get("h")
-                    bar_lo = opt_bar.get("l")
-                    if bar_hi and bar_lo:
-                        day_range = f" day_range=${bar_lo:.2f}-${bar_hi:.2f}"
+                bar_time = _bar_timestamp_eastern(opt_bar) if opt_bar else None
+                bar_label = f" asof={bar_time.strftime('%H:%M')}" if bar_time else ""
                 lines.append(
                     f"    {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
-                    f" premium=${premium:.2f} vol={vol}{day_range}"
+                    f" premium=${premium:.2f} vol={vol}{session_range}{bar_label}"
                 )
                 found_any = True
 
@@ -819,27 +1204,30 @@ def _build_enriched_portfolio_context(
     equity: float,
     initial_equity: float,
     positions: list[SimPosition],
-    trade_date: date,
+    trade_date: date | datetime,
     api_key: str,
     cache: PolygonCache,
     profit_target_pct: float,
     stop_loss_pct: float,
     time_stop_dte: int,
+    bar_minutes: int = 5,
 ) -> str:
     """Build mark-to-market portfolio context with unrealized P&L.
 
-    Uses option bars that are almost always already cached from
-    the exit-check loop earlier in the same day.
+    Uses the latest option bar available before as_of.
     """
+    as_of_dt = _coerce_eastern_datetime(trade_date)
+    trade_day = as_of_dt.date()
     ret_pct = (equity - initial_equity) / initial_equity * 100 if initial_equity > 0 else 0
     lines = [
         f"Account Equity: ${equity:,.2f} (starting: ${initial_equity:,.2f}, return: {ret_pct:+.1f}%)",
+        f"As of: {as_of_dt.strftime('%Y-%m-%d %H:%M %Z')}",
         f"Open Positions: {len(positions)}",
     ]
 
     total_unrealized = 0.0
     for pos in positions:
-        dte = (pos.expiry_date - trade_date).days
+        dte = (pos.expiry_date - trade_day).days
         line = (
             f"  {pos.polygon_ticker or pos.underlying} {pos.option_type} "
             f"${pos.strike:.2f} exp={pos.expiry_date} DTE={dte}"
@@ -849,7 +1237,9 @@ def _build_enriched_portfolio_context(
         # Try to get current price (usually cached from exit check)
         current_premium = 0.0
         if pos.polygon_ticker:
-            opt_bar = fetch_option_daily_bar(api_key, pos.polygon_ticker, trade_date, cache=cache)
+            opt_bar = _current_option_bar(
+                api_key, pos.polygon_ticker, trade_date, cache=cache, bar_minutes=bar_minutes,
+            )
             if opt_bar:
                 current_premium = _option_bar_price(opt_bar)
 
@@ -918,124 +1308,160 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
     log(f"backtest: {bt_config.start_date} to {bt_config.end_date} ({len(trading_days)} days)")
     log(f"initial equity: ${equity:,.2f}")
-
+    prior_day_equity = bt_config.initial_equity
     for day_idx, trade_date in enumerate(trading_days):
-        day_start_equity = equity
-        log(f"\n=== {trade_date} (day {day_idx + 1}/{len(trading_days)}) equity=${equity:,.2f} ===")
-
-        # 1. Check existing positions for exits
-        remaining: list[SimPosition] = []
-        for pos in positions:
-            dte = (pos.expiry_date - trade_date).days
-
-            # Get current option price from cache/Polygon
-            if not pos.polygon_ticker:
-                remaining.append(pos)
-                continue
-
-            option_bar = fetch_option_daily_bar(
-                polygon_key, pos.polygon_ticker, trade_date, cache=cache,
-            )
-            if option_bar is None:
-                # No bar for this day (holiday, illiquid) — keep position
-                remaining.append(pos)
-                continue
-
-            current_premium = _option_bar_price(option_bar)
-            if current_premium <= 0:
-                remaining.append(pos)
-                continue
-
-            pnl_pct = (
-                (current_premium - pos.entry_premium) / pos.entry_premium
-                if pos.entry_premium > 0 else 0
-            )
-
-            exit_reason = None
-            if pnl_pct >= bt_config.profit_target_pct:
-                exit_reason = "profit_target"
-            elif pnl_pct <= -bt_config.stop_loss_pct:
-                exit_reason = "stop_loss"
-            elif dte <= bt_config.time_stop_dte:
-                exit_reason = "time_stop"
-            elif trade_date >= pos.expiry_date:
-                exit_reason = "expiry"
-
-            if exit_reason:
-                trade_pnl = (current_premium - pos.entry_premium) * pos.qty * 100
-                equity += trade_pnl
-                sim_trade = SimTrade(
-                    entry_date=pos.entry_date,
-                    exit_date=trade_date,
-                    underlying=pos.underlying,
-                    option_type=pos.option_type,
-                    strike=pos.strike,
-                    entry_premium=pos.entry_premium,
-                    exit_premium=current_premium,
-                    qty=pos.qty,
-                    pnl=trade_pnl,
-                    exit_reason=exit_reason,
-                    conviction=pos.conviction,
-                    polygon_ticker=pos.polygon_ticker,
-                    reasoning=pos.reasoning,
-                )
-                result.trades.append(sim_trade)
-                closed_trades.append({
-                    "timestamp": trade_date.isoformat(),
-                    "entry_date": pos.entry_date.isoformat(),
-                    "underlying": pos.underlying,
-                    "option_type": pos.option_type,
-                    "entry_premium": pos.entry_premium,
-                    "exit_premium": current_premium,
-                    "pnl": trade_pnl,
-                    "reason": exit_reason,
-                    "polygon_ticker": pos.polygon_ticker,
-                })
-                log(
-                    f"  EXIT {pos.polygon_ticker} "
-                    f"reason={exit_reason} pnl=${trade_pnl:+,.2f}"
-                )
-            else:
-                remaining.append(pos)
-
-        positions = remaining
-
-        # 2. Fetch and filter news
-        news_raw = fetch_historical_news(polygon_key, trade_date)
-        news = _filter_news_quality(news_raw)
-        log(f"  news: {len(news_raw)} raw → {len(news)} after quality filter")
-        news_context = _format_news_for_backtest(news)
-
-        # 3. Build market context with multi-day trend
-        market_context = _build_market_trend_context(polygon_key, trade_date)
-
-        # 4. Portfolio context (enriched with mark-to-market)
-        portfolio_context = _build_enriched_portfolio_context(
-            equity, bt_config.initial_equity, positions, trade_date,
-            polygon_key, cache,
-            bt_config.profit_target_pct, bt_config.stop_loss_pct,
-            bt_config.time_stop_dte,
+        log(
+            f"\n=== {trade_date} (day {day_idx + 1}/{len(trading_days)}) "
+            f"realized_equity=${equity:,.2f} ==="
+        )
+        decision_times = _decision_timestamps_for_day(
+            trade_date,
+            interval_minutes=bt_config.decision_interval_minutes,
+            start_delay_minutes=bt_config.no_trade_minutes_after_open,
+            end_buffer_minutes=bt_config.no_trade_minutes_before_close,
         )
 
-        # 5. Build journal and trade history context
-        journal_context = journal.to_context_str() if journal else ""
-        # Annotate closed trades with underlying price context (stop_loss trades)
-        annotated_trades = _annotate_closed_trades(closed_trades, polygon_key, cache)
-        trade_history_context = format_trade_history([], annotated_trades[-10:]) if journal else ""
+        for decision_time in decision_times:
+            remaining: list[SimPosition] = []
+            for pos in positions:
+                dte = (pos.expiry_date - decision_time.date()).days
+                if not pos.polygon_ticker:
+                    remaining.append(pos)
+                    continue
 
-        # 5b. Append running performance summary
-        perf_summary = _build_performance_summary(closed_trades, equity, bt_config.initial_equity)
-        if perf_summary:
-            trade_history_context += perf_summary
+                option_bar = _current_option_bar(
+                    polygon_key,
+                    pos.polygon_ticker,
+                    decision_time,
+                    cache=cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                )
+                if option_bar is None:
+                    remaining.append(pos)
+                    continue
 
-        # 5c. Build real options context from top news tickers
-        top_tickers = _extract_top_news_tickers(news)
-        options_context = _build_options_context(
-            polygon_key, top_tickers, trade_date, cache, bt_config.default_dte,
-        )
+                current_premium = _option_bar_price(option_bar)
+                if current_premium <= 0:
+                    remaining.append(pos)
+                    continue
 
-        # 6. Ask LLM (only if we have room for more positions)
-        if len(positions) < bt_config.max_positions:
+                pnl_pct = (
+                    (current_premium - pos.entry_premium) / pos.entry_premium
+                    if pos.entry_premium > 0 else 0
+                )
+                exit_reason = None
+                if pnl_pct >= bt_config.profit_target_pct:
+                    exit_reason = "profit_target"
+                elif pnl_pct <= -bt_config.stop_loss_pct:
+                    exit_reason = "stop_loss"
+                elif dte <= bt_config.time_stop_dte:
+                    exit_reason = "time_stop"
+                elif decision_time.date() >= pos.expiry_date:
+                    exit_reason = "expiry"
+
+                if exit_reason:
+                    trade_pnl = (current_premium - pos.entry_premium) * pos.qty * 100
+                    equity += trade_pnl
+                    result.trades.append(
+                        SimTrade(
+                            entry_date=pos.entry_date,
+                            exit_date=decision_time.date(),
+                            underlying=pos.underlying,
+                            option_type=pos.option_type,
+                            strike=pos.strike,
+                            entry_premium=pos.entry_premium,
+                            exit_premium=current_premium,
+                            qty=pos.qty,
+                            pnl=trade_pnl,
+                            exit_reason=exit_reason,
+                            conviction=pos.conviction,
+                            polygon_ticker=pos.polygon_ticker,
+                            reasoning=pos.reasoning,
+                        )
+                    )
+                    closed_trades.append({
+                        "timestamp": decision_time.isoformat(),
+                        "entry_date": pos.entry_date.isoformat(),
+                        "underlying": pos.underlying,
+                        "option_type": pos.option_type,
+                        "entry_premium": pos.entry_premium,
+                        "exit_premium": current_premium,
+                        "pnl": trade_pnl,
+                        "reason": exit_reason,
+                        "polygon_ticker": pos.polygon_ticker,
+                    })
+                    log(
+                        f"  {decision_time.strftime('%H:%M')} AUTO EXIT {pos.polygon_ticker} "
+                        f"reason={exit_reason} pnl=${trade_pnl:+,.2f}"
+                    )
+                else:
+                    remaining.append(pos)
+            positions = remaining
+
+            account_equity, _ = _mark_to_market_equity(
+                equity,
+                positions,
+                decision_time,
+                polygon_key,
+                cache,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+
+            news_window_start = decision_time - timedelta(hours=bt_config.news_lookback_hours)
+            news_raw = fetch_historical_news_window(
+                polygon_key,
+                news_window_start,
+                decision_time,
+                limit=50,
+            )
+            news = _filter_news_quality(news_raw)
+            log(
+                f"  {decision_time.strftime('%H:%M')}: "
+                f"news {len(news_raw)} raw → {len(news)}"
+            )
+            news_context = _format_news_for_backtest(news)
+
+            market_context = _build_market_trend_context(
+                polygon_key,
+                decision_time,
+                cache=cache,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+            portfolio_context = _build_enriched_portfolio_context(
+                account_equity,
+                bt_config.initial_equity,
+                positions,
+                decision_time,
+                polygon_key,
+                cache,
+                bt_config.profit_target_pct,
+                bt_config.stop_loss_pct,
+                bt_config.time_stop_dte,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+
+            journal_context = journal.to_context_str() if journal else ""
+            annotated_trades = _annotate_closed_trades(closed_trades, polygon_key, cache)
+            trade_history_context = format_trade_history([], annotated_trades[-10:]) if journal else ""
+            perf_summary = _build_performance_summary(
+                closed_trades,
+                account_equity,
+                bt_config.initial_equity,
+            )
+            if perf_summary:
+                trade_history_context += perf_summary
+
+            focus_tickers = _build_focus_tickers(news, positions, journal)
+            options_context = _build_options_context(
+                polygon_key,
+                focus_tickers,
+                decision_time,
+                cache,
+                bt_config.default_dte,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+
+            trade_results: list[dict] = []
             if bt_config.llm_delay_seconds > 0:
                 time_module.sleep(bt_config.llm_delay_seconds)
 
@@ -1047,15 +1473,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 journal_context=journal_context,
                 trade_history_context=trade_history_context,
             )
-            log(f"  LLM: {analysis.analysis}")
+            log(f"  {decision_time.strftime('%H:%M')} LLM: {analysis.analysis}")
 
-            # Apply thesis journal updates
             if journal and analysis.thesis_updates:
                 journal.apply_updates(analysis.thesis_updates)
-                log(f"  Journal: {len(analysis.thesis_updates)} updates, {len(journal.active_entries())} active")
+                log(
+                    f"  Journal: {len(analysis.thesis_updates)} updates, "
+                    f"{len(journal.active_entries())} active"
+                )
 
-            # 7. Execute new trades (track executed vs skipped for decision log)
-            trade_results: list[dict] = []
             for decision in analysis.trades:
                 trade_record = {
                     "underlying": decision.underlying,
@@ -1071,68 +1497,59 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 }
 
                 if decision.action == "close_position":
-                    # Find matching position
                     target = decision.target_symbol
                     matched_pos = None
                     if target:
-                        matched_pos = next(
-                            (p for p in positions if p.polygon_ticker == target), None
-                        )
+                        matched_pos = next((p for p in positions if p.polygon_ticker == target), None)
                     if matched_pos is None:
-                        # Fallback: match by underlying
                         matched_pos = next(
-                            (p for p in positions
-                             if p.underlying.upper() == decision.underlying.upper()),
+                            (p for p in positions if p.underlying.upper() == decision.underlying.upper()),
                             None,
                         )
-
                     if matched_pos is None:
                         trade_record["skip_reason"] = "no matching position"
                         trade_results.append(trade_record)
-                        log(f"  SKIP close {decision.underlying}: no matching position")
                         continue
 
-                    # Get current option premium
-                    option_bar = fetch_option_daily_bar(
-                        polygon_key, matched_pos.polygon_ticker, trade_date, cache=cache
+                    exit_bar = _next_fill_option_bar(
+                        polygon_key,
+                        matched_pos.polygon_ticker,
+                        decision_time,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
                     )
-                    if option_bar is None:
-                        trade_record["skip_reason"] = "no option price data for close"
+                    if exit_bar is None:
+                        trade_record["skip_reason"] = "no fill bar after decision time"
                         trade_results.append(trade_record)
-                        log(f"  SKIP close {matched_pos.polygon_ticker}: no price data")
                         continue
 
-                    exit_premium = _option_bar_price(option_bar)
+                    exit_premium = _option_bar_price(exit_bar)
                     if exit_premium <= 0:
-                        trade_record["skip_reason"] = "invalid exit price for close"
+                        trade_record["skip_reason"] = "invalid exit price"
                         trade_results.append(trade_record)
                         continue
 
-                    # Calculate P&L and update equity
                     trade_pnl = (exit_premium - matched_pos.entry_premium) * matched_pos.qty * 100
                     equity += trade_pnl
-
-                    # Create SimTrade record
-                    sim_trade = SimTrade(
-                        entry_date=matched_pos.entry_date,
-                        exit_date=trade_date,
-                        underlying=matched_pos.underlying,
-                        option_type=matched_pos.option_type,
-                        strike=matched_pos.strike,
-                        entry_premium=matched_pos.entry_premium,
-                        exit_premium=exit_premium,
-                        qty=matched_pos.qty,
-                        pnl=trade_pnl,
-                        exit_reason="manual_close",
-                        conviction=matched_pos.conviction,
-                        polygon_ticker=matched_pos.polygon_ticker,
-                        reasoning=matched_pos.reasoning,
+                    result.trades.append(
+                        SimTrade(
+                            entry_date=matched_pos.entry_date,
+                            exit_date=decision_time.date(),
+                            underlying=matched_pos.underlying,
+                            option_type=matched_pos.option_type,
+                            strike=matched_pos.strike,
+                            entry_premium=matched_pos.entry_premium,
+                            exit_premium=exit_premium,
+                            qty=matched_pos.qty,
+                            pnl=trade_pnl,
+                            exit_reason="manual_close",
+                            conviction=matched_pos.conviction,
+                            polygon_ticker=matched_pos.polygon_ticker,
+                            reasoning=matched_pos.reasoning,
+                        )
                     )
-                    result.trades.append(sim_trade)
-
-                    # Append to closed_trades for portfolio context
                     closed_trades.append({
-                        "timestamp": trade_date.isoformat(),
+                        "timestamp": decision_time.isoformat(),
                         "entry_date": matched_pos.entry_date.isoformat(),
                         "underlying": matched_pos.underlying,
                         "option_type": matched_pos.option_type,
@@ -1142,52 +1559,59 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         "reason": "manual_close",
                         "polygon_ticker": matched_pos.polygon_ticker,
                     })
-
-                    # Remove position and update trade_record
                     positions.remove(matched_pos)
-
                     trade_record["status"] = "executed"
                     trade_record["contract"] = matched_pos.polygon_ticker
                     trade_record["qty"] = matched_pos.qty
                     trade_record["premium"] = exit_premium
                     trade_record["pnl"] = trade_pnl
                     trade_results.append(trade_record)
-                    log(
-                        f"  CLOSE {matched_pos.polygon_ticker} "
-                        f"exit=${exit_premium:.2f} pnl=${trade_pnl:+,.2f}"
+                    account_equity, _ = _mark_to_market_equity(
+                        equity,
+                        positions,
+                        decision_time,
+                        polygon_key,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
                     )
                     continue
+
+                if decision.action not in ("buy_call", "buy_put"):
+                    trade_record["skip_reason"] = f"unsupported action in backtest: {decision.action}"
+                    trade_results.append(trade_record)
+                    continue
+
                 if len(positions) >= bt_config.max_positions:
                     trade_record["skip_reason"] = "max positions reached"
                     trade_results.append(trade_record)
-                    break
+                    continue
 
                 option_type = "call" if decision.action == "buy_call" else "put"
                 underlying = decision.underlying
-
-                # Get underlying price
-                bar = fetch_historical_daily_bar(polygon_key, underlying, trade_date)
-                if bar is None:
-                    log(f"  SKIP {underlying}: no price data")
-                    trade_record["skip_reason"] = "no price data"
-                    trade_results.append(trade_record)
-                    continue
-                spot = float(bar.get("close") or bar.get("c") or 0)
+                spot = _current_underlying_price(
+                    polygon_key,
+                    underlying,
+                    decision_time,
+                    cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                )
                 if spot <= 0:
-                    trade_record["skip_reason"] = "invalid spot price"
+                    trade_record["skip_reason"] = "no price data before decision time"
                     trade_results.append(trade_record)
                     continue
 
-                # Find a real option contract via Polygon
                 contract = _select_real_contract(
-                    polygon_key, underlying, option_type, spot, trade_date,
+                    polygon_key,
+                    underlying,
+                    option_type,
+                    spot,
+                    trade_date,
                     decision.strike_preference or "atm",
                     decision.expiry_preference or "next_week",
                     bt_config.default_dte,
                     cache=cache,
                 )
                 if contract is None:
-                    log(f"  SKIP {underlying}: no matching option contracts found")
                     trade_record["skip_reason"] = "no contract found"
                     trade_results.append(trade_record)
                     continue
@@ -1196,53 +1620,43 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 strike = float(contract.get("strike_price", 0))
                 expiry_str = contract.get("expiration_date", "")
                 if not polygon_ticker or strike <= 0 or not expiry_str:
-                    log(f"  SKIP {underlying}: invalid contract data")
                     trade_record["skip_reason"] = "invalid contract data"
                     trade_results.append(trade_record)
                     continue
                 expiry = date.fromisoformat(expiry_str)
 
-                # Get entry-day price from Polygon
-                entry_bar = fetch_option_daily_bar(
-                    polygon_key, polygon_ticker, trade_date, cache=cache,
+                entry_bar = _next_fill_option_bar(
+                    polygon_key,
+                    polygon_ticker,
+                    decision_time,
+                    cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
                 )
                 if entry_bar is None:
-                    log(f"  SKIP {polygon_ticker}: no option price data on {trade_date}")
-                    trade_record["skip_reason"] = "no option price data"
+                    trade_record["skip_reason"] = "no fill bar after decision time"
                     trade_results.append(trade_record)
                     continue
 
-                # Skip zero-volume contracts
-                volume = entry_bar.get("v", 0)
+                volume = int(entry_bar.get("v", 0) or 0)
                 if volume <= 0:
-                    log(f"  SKIP {polygon_ticker}: zero volume")
                     trade_record["skip_reason"] = "zero volume"
                     trade_results.append(trade_record)
                     continue
 
                 premium = _option_bar_price(entry_bar)
                 if premium < 0.01:
-                    log(f"  SKIP {polygon_ticker}: premium too low (${premium:.4f})")
                     trade_record["skip_reason"] = "premium too low"
                     trade_results.append(trade_record)
                     continue
 
-                # Pre-fetch all future bars for this contract through expiry
-                fetch_option_daily_bars_range(
-                    polygon_key, polygon_ticker,
-                    trade_date + timedelta(days=1), expiry,
-                    cache=cache,
-                )
-
-                # Position sizing (40% max rule)
-                max_cost = equity * min(decision.risk_pct, bt_config.max_risk_per_trade)
+                requested_risk_pct = min(max(decision.risk_pct, 0.0), bt_config.max_risk_per_trade)
+                max_cost = account_equity * requested_risk_pct
                 cost_per_contract = premium * 100
-                qty = max(1, int(max_cost / cost_per_contract))
-                total_cost = qty * cost_per_contract
-
-                if total_cost > equity * bt_config.max_risk_per_trade:
-                    qty = max(1, int((equity * bt_config.max_risk_per_trade) / cost_per_contract))
-                    total_cost = qty * cost_per_contract
+                qty = size_for_risk_budget(max_cost, cost_per_contract)
+                if qty <= 0:
+                    trade_record["skip_reason"] = "risk budget too small for 1 contract"
+                    trade_results.append(trade_record)
+                    continue
 
                 positions.append(
                     SimPosition(
@@ -1263,13 +1677,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 trade_record["qty"] = qty
                 trade_record["premium"] = premium
                 trade_results.append(trade_record)
-                log(
-                    f"  OPEN {polygon_ticker} "
-                    f"premium=${premium:.2f} qty={qty} cost=${total_cost:,.2f} "
-                    f"vol={volume} conviction={decision.conviction:.2f}"
+                account_equity, _ = _mark_to_market_equity(
+                    equity,
+                    positions,
+                    decision_time,
+                    polygon_key,
+                    cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
                 )
 
-            # Build decision log entry
             thesis_updates_serialized = [
                 {
                     "id": tu.id,
@@ -1282,46 +1698,73 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 }
                 for tu in analysis.thesis_updates
             ]
+            marked_equity, _ = _mark_to_market_equity(
+                equity,
+                positions,
+                decision_time,
+                polygon_key,
+                cache,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
             result.decision_log.append({
                 "date": trade_date.isoformat(),
+                "decision_time": decision_time.isoformat(),
+                "news_window_start": news_window_start.isoformat(),
                 "market_analysis": analysis.analysis,
                 "thesis_updates": thesis_updates_serialized,
                 "trades_proposed": trade_results,
                 "trades_executed": sum(1 for t in trade_results if t["status"] == "executed"),
                 "trades_skipped": sum(1 for t in trade_results if t["status"] == "skipped"),
-                "equity": equity,
+                "equity": marked_equity,
                 "open_positions": len(positions),
             })
 
-        # Track daily equity
-        day_return = equity - day_start_equity
+        day_close_equity, _ = _mark_to_market_equity(
+            equity,
+            positions,
+            _market_close_dt(trade_date),
+            polygon_key,
+            cache,
+            bar_minutes=bt_config.signal_bar_minutes,
+        )
+        day_return = day_close_equity - prior_day_equity
+        prior_day_equity = day_close_equity
         daily_returns.append(day_return)
-        result.equity_curve.append((trade_date.isoformat(), equity))
+        result.equity_curve.append((trade_date.isoformat(), day_close_equity))
 
-        if equity > peak_equity:
-            peak_equity = equity
-        dd = peak_equity - equity
+        if day_close_equity > peak_equity:
+            peak_equity = day_close_equity
+        dd = peak_equity - day_close_equity
         if dd > max_dd:
             max_dd = dd
 
-        # Rate limit for Polygon
-        time_module.sleep(0.5)
+        time_module.sleep(0.25)
 
     # Close any remaining positions at last day
     last_date = trading_days[-1] if trading_days else bt_config.end_date
     for pos in positions:
         exit_premium = 0.0
         if pos.polygon_ticker:
-            # Try last_date, then look back up to 3 days
-            for lookback in range(4):
-                check_date = last_date - timedelta(days=lookback)
-                option_bar = fetch_option_daily_bar(
-                    polygon_key, pos.polygon_ticker, check_date, cache=cache,
-                )
-                if option_bar is not None:
-                    exit_premium = _option_bar_price(option_bar)
-                    if exit_premium > 0:
-                        break
+            close_time = _market_close_dt(last_date)
+            option_bar = _current_option_bar(
+                polygon_key,
+                pos.polygon_ticker,
+                close_time,
+                cache=cache,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+            if option_bar is not None:
+                exit_premium = _option_bar_price(option_bar)
+            if exit_premium <= 0:
+                for lookback in range(1, 4):
+                    check_date = last_date - timedelta(days=lookback)
+                    option_bar = fetch_option_daily_bar(
+                        polygon_key, pos.polygon_ticker, check_date, cache=cache,
+                    )
+                    if option_bar is not None:
+                        exit_premium = _option_bar_price(option_bar)
+                        if exit_premium > 0:
+                            break
 
         trade_pnl = (exit_premium - pos.entry_premium) * pos.qty * 100
         equity += trade_pnl
@@ -1477,7 +1920,8 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
     for entry in r.decision_log:
         lines.append("---")
         lines.append("")
-        lines.append(f"## {entry['date']}")
+        heading = entry.get("decision_time") or entry["date"]
+        lines.append(f"## {heading}")
         lines.append("")
 
         # Market analysis
@@ -1581,6 +2025,18 @@ def run() -> None:
         help="Seconds between LLM calls (cost control). Default: 1.0",
     )
     parser.add_argument(
+        "--decision-interval", type=int, default=config.SCAN_INTERVAL_MINUTES,
+        help="Minutes between simulated decision points (default: live scan interval)",
+    )
+    parser.add_argument(
+        "--bar-minutes", type=int, default=5,
+        help="Intraday bar size for state/fills (default: 5)",
+    )
+    parser.add_argument(
+        "--news-lookback-hours", type=int, default=config.NEWS_LOOKBACK_HOURS,
+        help="Hours of news to include before each simulated decision time",
+    )
+    parser.add_argument(
         "--no-journal", action="store_true",
         help="Disable thesis journal and trade history (stateless mode)",
     )
@@ -1604,6 +2060,9 @@ def run() -> None:
         end_date=date.fromisoformat(args.end),
         initial_equity=args.equity,
         llm_delay_seconds=args.delay,
+        decision_interval_minutes=args.decision_interval,
+        signal_bar_minutes=args.bar_minutes,
+        news_lookback_hours=args.news_lookback_hours,
         use_journal=not args.no_journal,
         journal_max_active=args.journal_max_active,
         journal_max_full_display=args.journal_max_display,

@@ -1,6 +1,11 @@
 """Tests for the AI trader risk management module."""
 
-from ai_trader.risk import evaluate_trade_risk, evaluate_position_risk
+from ai_trader.risk import (
+    evaluate_position_risk,
+    evaluate_stock_trade_risk,
+    evaluate_trade_risk,
+    size_for_risk_budget,
+)
 
 
 def test_trade_risk_approved():
@@ -84,7 +89,7 @@ def test_position_risk_stop_loss():
     result = evaluate_position_risk(
         entry_premium=5.00,
         current_premium=2.50,  # -50%, below 40% stop
-        dte=30,
+        dte=5,
     )
     assert result.should_close
     assert "stop" in result.reason
@@ -108,3 +113,38 @@ def test_position_risk_hold():
     )
     assert not result.should_close
     assert result.reason == "hold"
+
+
+def test_stock_trade_risk_approved():
+    result = evaluate_stock_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=10_000,
+        open_positions=1,
+        share_price=200.0,
+        day_pl=0.0,
+    )
+    assert result.approved
+    assert result.max_shares > 0
+    assert result.max_notional <= 100_000 * 0.40 + 0.01
+
+
+def test_stock_trade_risk_expensive_share():
+    result = evaluate_stock_trade_risk(
+        equity=10_000,
+        cash=1_000,
+        current_exposure=0,
+        open_positions=0,
+        share_price=1_500.0,
+        day_pl=0.0,
+    )
+    assert not result.approved
+    assert "expensive" in result.reason
+
+
+def test_size_for_risk_budget_returns_zero_when_unit_is_too_expensive():
+    assert size_for_risk_budget(400.0, 500.0) == 0
+
+
+def test_size_for_risk_budget_floors_to_whole_units():
+    assert size_for_risk_budget(1_250.0, 500.0) == 2

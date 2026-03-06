@@ -1,6 +1,6 @@
 """Tests for the AI trader backtest module."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from ai_trader.backtest import (
     BacktestConfig,
@@ -8,6 +8,10 @@ from ai_trader.backtest import (
     PolygonCache,
     SimPosition,
     SimTrade,
+    _decision_timestamps_for_day,
+    _first_bar_at_or_after,
+    _last_completed_trading_day,
+    _latest_bar_before,
     _annotate_closed_trades,
     _build_enriched_portfolio_context,
     _build_market_trend_context,
@@ -16,11 +20,13 @@ from ai_trader.backtest import (
     _extract_top_news_tickers,
     _filter_news_quality,
     _option_bar_price,
+    _previous_trading_day,
     _select_real_contract,
     _trading_days,
     print_backtest_result,
     save_debug_log,
 )
+from ai_trader.utils import EASTERN_TZ
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +45,39 @@ def test_trading_days():
 def test_trading_days_single():
     days = _trading_days(date(2025, 1, 6), date(2025, 1, 6))
     assert len(days) == 1
+
+
+def test_previous_trading_day_skips_weekend():
+    assert _previous_trading_day(date(2025, 1, 6)) == date(2025, 1, 3)  # Monday -> Friday
+    assert _previous_trading_day(date(2025, 1, 7)) == date(2025, 1, 6)  # Tuesday -> Monday
+
+
+def test_last_completed_trading_day_intraday_uses_prior_session():
+    as_of = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+    assert _last_completed_trading_day(as_of) == date(2025, 1, 3)
+
+
+def test_decision_timestamps_for_day_match_scan_cadence():
+    times = _decision_timestamps_for_day(
+        date(2025, 1, 6),
+        interval_minutes=15,
+        start_delay_minutes=5,
+        end_buffer_minutes=15,
+    )
+    assert times[0].strftime("%H:%M") == "09:35"
+    assert times[1].strftime("%H:%M") == "09:50"
+    assert times[-1].strftime("%H:%M") == "15:35"
+
+
+def test_latest_bar_before_and_first_bar_after_cutoff():
+    bars = [
+        {"t": int(datetime(2025, 1, 6, 14, 30, tzinfo=EASTERN_TZ).timestamp() * 1000), "c": 100.0},
+        {"t": int(datetime(2025, 1, 6, 14, 35, tzinfo=EASTERN_TZ).timestamp() * 1000), "c": 101.0},
+        {"t": int(datetime(2025, 1, 6, 14, 40, tzinfo=EASTERN_TZ).timestamp() * 1000), "c": 102.0},
+    ]
+    cutoff = datetime(2025, 1, 6, 14, 35, tzinfo=EASTERN_TZ)
+    assert _latest_bar_before(bars, cutoff)["c"] == 100.0
+    assert _first_bar_at_or_after(bars, cutoff)["c"] == 101.0
 
 
 # ---------------------------------------------------------------------------

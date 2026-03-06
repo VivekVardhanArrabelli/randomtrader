@@ -21,6 +21,21 @@ class RiskCheck:
     max_premium: float
 
 
+@dataclass(frozen=True)
+class StockRiskCheck:
+    approved: bool
+    reason: str
+    max_shares: int
+    max_notional: float
+
+
+def size_for_risk_budget(risk_budget: float, unit_cost: float) -> int:
+    """Return the largest whole-number position that fits within a hard budget."""
+    if risk_budget <= 0 or unit_cost <= 0:
+        return 0
+    return max(int(risk_budget / unit_cost), 0)
+
+
 def evaluate_trade_risk(
     equity: float,
     cash: float,
@@ -76,6 +91,54 @@ def evaluate_trade_risk(
         f"({actual_premium / equity * 100:.1f}% of equity)"
     )
     return RiskCheck(True, "approved", max_contracts, actual_premium)
+
+
+def evaluate_stock_trade_risk(
+    equity: float,
+    cash: float,
+    current_exposure: float,
+    open_positions: int,
+    share_price: float,
+    day_pl: float,
+) -> StockRiskCheck:
+    """Check whether a proposed stock trade passes the same hard risk rails."""
+
+    if equity > 0 and day_pl <= -(equity * config.DAILY_LOSS_LIMIT):
+        return StockRiskCheck(False, "daily loss limit reached", 0, 0.0)
+
+    if open_positions >= config.MAX_OPEN_POSITIONS:
+        return StockRiskCheck(False, "max open positions reached", 0, 0.0)
+
+    max_exposure = equity * config.MAX_TOTAL_EXPOSURE
+    remaining_exposure = max_exposure - current_exposure
+    if remaining_exposure <= 0:
+        return StockRiskCheck(False, "max total exposure reached", 0, 0.0)
+
+    max_notional = equity * config.MAX_RISK_PER_TRADE
+    max_notional = min(max_notional, remaining_exposure, cash)
+
+    if max_notional <= 0:
+        return StockRiskCheck(False, "insufficient buying power", 0, 0.0)
+
+    if share_price <= 0:
+        return StockRiskCheck(False, "invalid stock price", 0, 0.0)
+
+    max_shares = int(max_notional / share_price)
+    if max_shares <= 0:
+        return StockRiskCheck(
+            False,
+            f"stock too expensive (${share_price:.2f}/share vs ${max_notional:.2f} budget)",
+            0,
+            0.0,
+        )
+
+    actual_notional = max_shares * share_price
+    log(
+        f"stock risk check PASS: max_shares={max_shares} "
+        f"notional=${actual_notional:.2f} "
+        f"({actual_notional / equity * 100:.1f}% of equity)"
+    )
+    return StockRiskCheck(True, "approved", max_shares, actual_notional)
 
 
 @dataclass(frozen=True)
