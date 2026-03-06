@@ -59,6 +59,197 @@ class NewsItem:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class NewsEvent:
+    headline: str
+    summary: str
+    source_count: int
+    article_count: int
+    symbols: list[str]
+    event_type: str
+    freshness: str
+    first_seen: datetime
+    last_seen: datetime
+    supporting_sources: list[str]
+    supporting_headlines: list[str]
+    age_minutes: int = 0
+
+    def to_context_str(self) -> str:
+        symbols_str = ", ".join(self.symbols) if self.symbols else "general"
+        lines = [
+            (
+                f"[{self.freshness.upper()} | {self.event_type} | "
+                f"{self.source_count} sources | {self.age_minutes}m ago] {symbols_str}"
+            ),
+            f"  Event: {self.headline}",
+        ]
+        if self.summary:
+            lines.append(f"  Summary: {self.summary}")
+        if self.supporting_sources:
+            lines.append(f"  Sources: {', '.join(self.supporting_sources[:4])}")
+        if self.article_count > 1:
+            extras = self.supporting_headlines[1:3]
+            if extras:
+                lines.append(f"  Related headlines: {' | '.join(extras)}")
+        return "\n".join(lines)
+
+
+_TITLE_PREFIX_RE = re.compile(
+    r"^(update\s*\d*:|breaking:|watch:|live:|exclusive:|analysis:)\s*",
+    re.IGNORECASE,
+)
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]")
+_STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "into", "of",
+    "on", "or", "the", "to", "with", "after", "before", "amid", "over", "under",
+}
+_EVENT_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("earnings", ("earnings", "revenue", "eps", "guidance", "quarter", "q1", "q2", "q3", "q4")),
+    ("guidance", ("guidance", "outlook", "forecast", "raises", "cuts", "sees")),
+    ("merger", ("acquire", "acquisition", "merge", "merger", "takeover", "buyout")),
+    ("fda", ("fda", "phase 3", "trial", "approval", "clinical", "drug")),
+    ("partnership", ("partnership", "partner", "deal", "contract", "agreement", "collaboration")),
+    ("product", ("launch", "product", "chip", "platform", "release", "model")),
+    ("analyst", ("upgrades", "downgrade", "price target", "analyst", "rating")),
+    ("management", ("ceo", "cfo", "chairman", "executive", "board", "resigns")),
+    ("financing", ("offering", "debt", "financing", "convertible", "share sale", "repurchase")),
+    ("legal", ("lawsuit", "court", "settlement", "probe", "investigation", "regulator")),
+    ("macro", ("fed", "inflation", "payrolls", "cpi", "ppi", "jobs", "treasury", "tariff")),
+]
+_EVENT_WEIGHTS = {
+    "earnings": 3.0,
+    "guidance": 3.0,
+    "merger": 3.0,
+    "fda": 3.0,
+    "partnership": 2.2,
+    "product": 2.0,
+    "macro": 2.0,
+    "management": 1.5,
+    "financing": 1.5,
+    "legal": 1.2,
+    "analyst": 1.0,
+    "general": 1.0,
+}
+_FRESHNESS_WEIGHTS = {
+    "breaking": 3.0,
+    "fresh": 2.0,
+    "developing": 1.2,
+    "stale": 0.5,
+}
+
+
+def _normalize_headline(text: str) -> str:
+    lowered = _TITLE_PREFIX_RE.sub("", text.strip().lower())
+    lowered = _NON_ALNUM_RE.sub(" ", lowered)
+    return " ".join(lowered.split())
+
+
+def _headline_signature(text: str) -> str:
+    normalized = _normalize_headline(text)
+    tokens = [tok for tok in normalized.split() if tok not in _STOPWORDS]
+    if not tokens:
+        return normalized[:80]
+    return " ".join(tokens[:8])
+
+
+def _classify_event_type(headline: str, summary: str) -> str:
+    haystack = f"{headline} {summary}".lower()
+    for event_type, keywords in _EVENT_PATTERNS:
+        if any(keyword in haystack for keyword in keywords):
+            return event_type
+    return "general"
+
+
+def _freshness_label(last_seen: datetime, reference_time: datetime | None = None) -> str:
+    reference = reference_time or now_eastern()
+    age_hours = max((reference - last_seen.astimezone(reference.tzinfo)).total_seconds() / 3600, 0.0)
+    if age_hours <= 0.5:
+        return "breaking"
+    if age_hours <= 3:
+        return "fresh"
+    if age_hours <= 12:
+        return "developing"
+    return "stale"
+
+
+def build_news_events(
+    items: list[NewsItem],
+    reference_time: datetime | None = None,
+    max_events: int = 18,
+) -> list[NewsEvent]:
+    """Aggregate raw articles into deduped event packets for the model."""
+    if not items:
+        return []
+
+    groups: dict[tuple[tuple[str, ...], str], list[NewsItem]] = {}
+    for item in items:
+        symbols = tuple(sorted({s.upper() for s in item.symbols if s}))
+        key = (symbols, _headline_signature(item.headline))
+        groups.setdefault(key, []).append(item)
+
+    events: list[NewsEvent] = []
+    for grouped_items in groups.values():
+        grouped_items.sort(key=lambda item: item.published_at, reverse=True)
+        latest = grouped_items[0]
+        first_seen = min(item.published_at for item in grouped_items)
+        last_seen = max(item.published_at for item in grouped_items)
+        reference = reference_time or now_eastern()
+        age_minutes = max(int((reference - last_seen.astimezone(reference.tzinfo)).total_seconds() / 60), 0)
+        supporting_sources = list(dict.fromkeys(item.source for item in grouped_items if item.source))
+        event = NewsEvent(
+            headline=latest.headline,
+            summary=latest.summary[:500],
+            source_count=len(supporting_sources),
+            article_count=len(grouped_items),
+            symbols=list(dict.fromkeys(sym.upper() for item in grouped_items for sym in item.symbols if sym)),
+            event_type=_classify_event_type(latest.headline, latest.summary),
+            freshness=_freshness_label(last_seen, reference_time),
+            first_seen=first_seen,
+            last_seen=last_seen,
+            supporting_sources=supporting_sources,
+            supporting_headlines=[item.headline for item in grouped_items],
+            age_minutes=age_minutes,
+        )
+        events.append(event)
+
+    events.sort(
+        key=lambda event: (
+            event.last_seen,
+            event.source_count,
+            event.article_count,
+        ),
+        reverse=True,
+    )
+    return events[:max_events]
+
+
+def rank_symbols_from_events(
+    events: list[NewsEvent],
+    focus_symbols: list[str] | None = None,
+    max_symbols: int = 20,
+) -> list[str]:
+    """Rank symbols by corroborated, fresh event flow plus existing focus."""
+    scores: dict[str, float] = {}
+    focus_set = {sym.upper() for sym in (focus_symbols or [])}
+    for event in events:
+        event_weight = _EVENT_WEIGHTS.get(event.event_type, 1.0)
+        freshness_weight = _FRESHNESS_WEIGHTS.get(event.freshness, 1.0)
+        corroboration = 1.0 + 0.35 * max(event.source_count - 1, 0)
+        article_boost = 1.0 + 0.15 * max(event.article_count - 1, 0)
+        for symbol in event.symbols:
+            if not symbol:
+                continue
+            focus_boost = 1.25 if symbol in focus_set else 1.0
+            scores[symbol] = scores.get(symbol, 0.0) + event_weight * freshness_weight * corroboration * article_boost * focus_boost
+
+    for symbol in focus_set:
+        scores.setdefault(symbol, 0.0)
+        scores[symbol] += 0.75
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [symbol for symbol, _ in ranked[:max_symbols]]
+
+
 def _parse_articles(raw: list[dict], seen: set[str]) -> list[NewsItem]:
     """Parse raw Alpaca articles into NewsItems, filtering junk and dupes."""
     items: list[NewsItem] = []
@@ -165,34 +356,64 @@ def format_news_for_llm(
     if not items:
         return "No recent news available."
 
-    if not focus_symbols:
-        # No split — just show everything
-        lines = []
-        for item in items[:max_items]:
-            lines.append(item.to_context_str())
-        return "\n\n".join(lines)
+    reference_time = max(item.published_at for item in items)
+    events = build_news_events(items, reference_time=reference_time)
+    focus_set = {s.upper() for s in (focus_symbols or [])}
+    ranked_symbols = rank_symbols_from_events(events, focus_symbols=focus_symbols, max_symbols=8)
 
-    focus_set = {s.upper() for s in focus_symbols}
-    targeted: list[NewsItem] = []
-    general: list[NewsItem] = []
-    for item in items:
-        if any(s.upper() in focus_set for s in item.symbols):
-            targeted.append(item)
-        else:
-            general.append(item)
+    def _split_items(news_items: list[NewsItem]) -> tuple[list[NewsItem], list[NewsItem]]:
+        targeted: list[NewsItem] = []
+        general: list[NewsItem] = []
+        for item in news_items:
+            if focus_set and any(s.upper() in focus_set for s in item.symbols):
+                targeted.append(item)
+            elif not focus_set and item.symbols:
+                targeted.append(item)
+            else:
+                general.append(item)
+        return targeted, general
+
+    def _split_events(news_events: list[NewsEvent]) -> tuple[list[NewsEvent], list[NewsEvent]]:
+        targeted: list[NewsEvent] = []
+        general: list[NewsEvent] = []
+        for event in news_events:
+            if focus_set and any(s.upper() in focus_set for s in event.symbols):
+                targeted.append(event)
+            elif not focus_set and event.symbols:
+                targeted.append(event)
+            else:
+                general.append(event)
+        return targeted, general
+
+    targeted_items, general_items = _split_items(items[:max_items])
+    targeted_events, general_events = _split_events(events)
 
     sections: list[str] = []
+    if ranked_symbols:
+        sections.append(f"--- Suggested focus symbols ---\n{', '.join(ranked_symbols)}")
 
-    # Targeted: up to 15 articles about tickers the model is watching
-    if targeted:
-        sections.append("--- News for your active tickers ---")
-        for item in targeted[:15]:
+    if targeted_events:
+        sections.append("--- Structured event map for your active / high-priority tickers ---")
+        for event in targeted_events[:8]:
+            sections.append(event.to_context_str())
+
+    if targeted_items:
+        sections.append("--- Raw headlines for those tickers ---")
+        for item in targeted_items[:12]:
             sections.append(item.to_context_str())
 
-    # General: up to 25 articles for new thesis discovery
-    if general:
-        sections.append("\n--- Broader market news (scan for new opportunities) ---")
-        for item in general[:25]:
+    if general_events:
+        sections.append("--- Structured broader market event map ---")
+        for event in general_events[:6]:
+            sections.append(event.to_context_str())
+
+    if general_items:
+        sections.append("--- Raw broader market headlines ---")
+        for item in general_items[:12]:
+            sections.append(item.to_context_str())
+
+    if not sections:
+        for item in items[:max_items]:
             sections.append(item.to_context_str())
 
     return "\n\n".join(sections) if sections else "No recent news available."

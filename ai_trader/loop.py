@@ -27,7 +27,7 @@ from .brain import TradingBrain
 from .db import AIDecisionRecord, AITradeLogger, format_trade_history
 from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
-from .news import fetch_news, fetch_targeted_news, format_news_for_llm
+from .news import build_news_events, fetch_news, fetch_targeted_news, format_news_for_llm, rank_symbols_from_events
 from .options import fetch_option_chain, format_chain_for_llm
 from .portfolio import get_portfolio_state
 from .risk import PositionRiskAlert, PositionRiskState, assess_position_risk, evaluate_trade_risk
@@ -377,11 +377,10 @@ def run_cycle(
     )
     news_context = format_news_for_llm(news_items, focus_symbols=focus_symbols)
 
-    # Extract symbols mentioned in news
-    news_symbols: list[str] = []
-    for item in news_items:
-        news_symbols.extend(item.symbols)
-    news_symbols = list(dict.fromkeys(news_symbols))  # dedupe preserving order
+    news_events = build_news_events(news_items, reference_time=now_eastern())
+    news_symbols = rank_symbols_from_events(
+        news_events, focus_symbols=focus_symbols, max_symbols=config.WATCHLIST_SIZE,
+    )
 
     # 6. Get market context
     market_context = _get_market_context(alpaca)

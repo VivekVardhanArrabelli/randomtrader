@@ -27,8 +27,9 @@ from . import config
 from .brain import MarketAnalysis, TradingBrain, TradeDecision
 from .db import format_trade_history
 from .journal import ThesisJournal
+from .news import NewsItem, format_news_for_llm
 from .risk import size_for_risk_budget
-from .utils import EASTERN_TZ, log
+from .utils import EASTERN_TZ, log, now_eastern
 
 
 # ---------------------------------------------------------------------------
@@ -715,21 +716,29 @@ def _filter_news_quality(articles: list[dict]) -> list[dict]:
     return [a for a in articles if not _JUNK_RE.search(a.get("title", ""))]
 
 
-def _format_news_for_backtest(articles: list[dict]) -> str:
-    lines = []
-    for a in articles[:30]:
-        title = a.get("title", "")
-        desc = a.get("description", "")[:300]
-        tickers = ", ".join(a.get("tickers", []))
-        source = a.get("publisher", {}).get("name", "")
-        ts = a.get("published_utc", "")[:16]
-        lines.append(f"[{ts}] ({source}) {title}")
-        if tickers:
-            lines.append(f"  Tickers: {tickers}")
-        if desc:
-            lines.append(f"  {desc}")
-        lines.append("")
-    return "\n".join(lines) if lines else "No news available."
+def _format_news_for_backtest(
+    articles: list[dict],
+    focus_symbols: list[str] | None = None,
+    reference_time: datetime | None = None,
+) -> str:
+    items: list[NewsItem] = []
+    for article in articles:
+        published_raw = article.get("published_utc", "")
+        try:
+            published_at = datetime.fromisoformat(str(published_raw).replace("Z", "+00:00")).astimezone(EASTERN_TZ)
+        except ValueError:
+            published_at = reference_time or now_eastern()
+        items.append(
+            NewsItem(
+                headline=article.get("title", ""),
+                summary=(article.get("description") or "")[:1000],
+                source=article.get("publisher", {}).get("name", "") or "unknown",
+                symbols=[str(t).upper() for t in article.get("tickers", []) if t],
+                published_at=published_at,
+                url=article.get("article_url") or "",
+            )
+        )
+    return format_news_for_llm(items, focus_symbols=focus_symbols)
 
 
 def _build_performance_summary(
@@ -1419,7 +1428,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 f"  {decision_time.strftime('%H:%M')}: "
                 f"news {len(news_raw)} raw → {len(news)}"
             )
-            news_context = _format_news_for_backtest(news)
+            context_focus_symbols = [p.underlying for p in positions]
+            if journal:
+                context_focus_symbols.extend(entry.underlying for entry in journal.active_entries())
+            news_context = _format_news_for_backtest(
+                news,
+                focus_symbols=list(dict.fromkeys(context_focus_symbols)),
+                reference_time=decision_time,
+            )
 
             market_context = _build_market_trend_context(
                 polygon_key,
