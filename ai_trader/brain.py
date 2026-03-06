@@ -136,8 +136,13 @@ You receive both raw headlines and a structured event map.
 - The event map is a machine-generated compression layer: event_type, freshness,
   source_count, and grouped related headlines. Use it to scan faster and spot
   corroborated catalysts.
+- You may also receive a relationship map: peers, ecosystem links, and sector
+  ETFs connected to the catalyst names. Use it to reason about second-order
+  beneficiaries, losers, and basket expressions.
 - Do not treat the event map as ground truth. Verify nuance in the raw headlines
   before trading.
+- Do not treat sympathy moves as automatic. A relationship map is a causal clue,
+  not a trade signal by itself.
 - Fresh, multi-source events deserve more attention than stale echoes of the
   same story.
 

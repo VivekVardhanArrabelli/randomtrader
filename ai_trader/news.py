@@ -94,6 +94,25 @@ class NewsEvent:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class SymbolRelationship:
+    symbol: str
+    sector: str
+    peers: list[str]
+    ecosystem: list[str]
+    sector_etfs: list[str]
+
+    def to_context_str(self) -> str:
+        parts = [f"{self.symbol}: sector={self.sector}"]
+        if self.peers:
+            parts.append(f"peers={', '.join(self.peers[:4])}")
+        if self.ecosystem:
+            parts.append(f"ecosystem={', '.join(self.ecosystem[:4])}")
+        if self.sector_etfs:
+            parts.append(f"etfs={', '.join(self.sector_etfs[:3])}")
+        return " | ".join(parts)
+
+
 _TITLE_PREFIX_RE = re.compile(
     r"^(update\s*\d*:|breaking:|watch:|live:|exclusive:|analysis:)\s*",
     re.IGNORECASE,
@@ -135,6 +154,43 @@ _FRESHNESS_WEIGHTS = {
     "fresh": 2.0,
     "developing": 1.2,
     "stale": 0.5,
+}
+_RELATIONSHIP_WEIGHTS = {
+    "peers": 0.45,
+    "ecosystem": 0.35,
+    "sector_etfs": 0.25,
+}
+
+_RELATIONSHIP_MAP: dict[str, SymbolRelationship] = {
+    "AAPL": SymbolRelationship("AAPL", "consumer_tech", ["MSFT", "GOOGL", "META", "AMZN"], ["QCOM", "AVGO", "TSM"], ["XLK", "QQQ"]),
+    "MSFT": SymbolRelationship("MSFT", "software_cloud", ["GOOGL", "AMZN", "META", "ORCL"], ["NVDA", "AMD", "AVGO"], ["XLK", "QQQ"]),
+    "GOOGL": SymbolRelationship("GOOGL", "internet_ad", ["META", "AMZN", "MSFT"], ["NVDA", "TSM"], ["XLC", "QQQ"]),
+    "META": SymbolRelationship("META", "internet_ad", ["GOOGL", "SNAP", "PINS"], ["NVDA", "TSM"], ["XLC", "QQQ"]),
+    "AMZN": SymbolRelationship("AMZN", "consumer_cloud", ["MSFT", "WMT", "COST"], ["NVDA", "AMD", "AVGO"], ["XLY", "QQQ"]),
+    "NVDA": SymbolRelationship("NVDA", "semis_ai", ["AMD", "AVGO", "MRVL", "MU"], ["TSM", "ASML", "SMCI"], ["SMH", "SOXX", "XLK"]),
+    "AMD": SymbolRelationship("AMD", "semis_ai", ["NVDA", "AVGO", "INTC", "MRVL"], ["TSM", "ASML", "SMCI"], ["SMH", "SOXX", "XLK"]),
+    "AVGO": SymbolRelationship("AVGO", "semis_networking", ["NVDA", "AMD", "MRVL", "QCOM"], ["AAPL", "GOOGL", "META"], ["SMH", "SOXX", "XLK"]),
+    "MRVL": SymbolRelationship("MRVL", "semis_networking", ["AVGO", "AMD", "NVDA"], ["AMZN", "MSFT"], ["SMH", "SOXX", "XLK"]),
+    "QCOM": SymbolRelationship("QCOM", "wireless_semis", ["AVGO", "AMD", "NXPI"], ["AAPL", "SAMSUNG"], ["SOXX", "XLK"]),
+    "TSM": SymbolRelationship("TSM", "foundry_semis", ["ASML", "INTC"], ["NVDA", "AMD", "AAPL", "QCOM"], ["SMH", "SOXX"]),
+    "ASML": SymbolRelationship("ASML", "semi_equipment", ["LRCX", "AMAT", "KLAC"], ["TSM", "NVDA", "AMD"], ["SMH", "SOXX"]),
+    "SMCI": SymbolRelationship("SMCI", "ai_servers", ["DELL", "HPE"], ["NVDA", "AMD"], ["SMH", "SOXX"]),
+    "TSLA": SymbolRelationship("TSLA", "ev_auto", ["RIVN", "GM", "F"], ["NVDA", "ON", "ALB"], ["XLY", "CARZ"]),
+    "RIVN": SymbolRelationship("RIVN", "ev_auto", ["TSLA", "LCID"], ["AMZN"], ["XLY", "CARZ"]),
+    "GM": SymbolRelationship("GM", "auto", ["F", "TSLA"], ["ON", "ALB"], ["XLY", "CARZ"]),
+    "F": SymbolRelationship("F", "auto", ["GM", "TSLA"], ["ON", "ALB"], ["XLY", "CARZ"]),
+    "JPM": SymbolRelationship("JPM", "banks", ["BAC", "C", "GS", "MS"], ["KRE"], ["XLF"]),
+    "BAC": SymbolRelationship("BAC", "banks", ["JPM", "C", "WFC"], ["KRE"], ["XLF"]),
+    "GS": SymbolRelationship("GS", "brokers", ["MS", "JPM"], ["KRE"], ["XLF"]),
+    "MS": SymbolRelationship("MS", "brokers", ["GS", "JPM"], ["KRE"], ["XLF"]),
+    "XOM": SymbolRelationship("XOM", "energy", ["CVX", "COP", "SLB"], ["OXY"], ["XLE"]),
+    "CVX": SymbolRelationship("CVX", "energy", ["XOM", "COP", "SLB"], ["OXY"], ["XLE"]),
+    "COP": SymbolRelationship("COP", "energy", ["XOM", "CVX", "OXY"], ["SLB"], ["XLE"]),
+    "OXY": SymbolRelationship("OXY", "energy", ["COP", "XOM", "CVX"], ["SLB"], ["XLE"]),
+    "LLY": SymbolRelationship("LLY", "pharma_obesity", ["NVO", "PFE", "MRK"], ["ABBV"], ["XLV", "IBB"]),
+    "NVO": SymbolRelationship("NVO", "pharma_obesity", ["LLY"], ["ABBV"], ["XLV", "IBB"]),
+    "PFE": SymbolRelationship("PFE", "pharma", ["MRK", "LLY", "BMY"], ["ABBV"], ["XLV", "IBB"]),
+    "MRK": SymbolRelationship("MRK", "pharma", ["PFE", "LLY", "BMY"], ["ABBV"], ["XLV", "IBB"]),
 }
 
 
@@ -223,31 +279,164 @@ def build_news_events(
     return events[:max_events]
 
 
+def _event_signal_strength(event: NewsEvent) -> float:
+    event_weight = _EVENT_WEIGHTS.get(event.event_type, 1.0)
+    freshness_weight = _FRESHNESS_WEIGHTS.get(event.freshness, 1.0)
+    corroboration = 1.0 + 0.35 * max(event.source_count - 1, 0)
+    article_boost = 1.0 + 0.15 * max(event.article_count - 1, 0)
+    return event_weight * freshness_weight * corroboration * article_boost
+
+
+def _symbol_scores_from_events(
+    events: list[NewsEvent],
+    focus_symbols: list[str] | None = None,
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    focus_set = {sym.upper() for sym in (focus_symbols or [])}
+    for event in events:
+        signal_strength = _event_signal_strength(event)
+        for symbol in event.symbols:
+            if not symbol:
+                continue
+            focus_boost = 1.25 if symbol in focus_set else 1.0
+            scores[symbol] = scores.get(symbol, 0.0) + signal_strength * focus_boost
+
+    for symbol in focus_set:
+        scores.setdefault(symbol, 0.0)
+        scores[symbol] += 0.75
+    return scores
+
+
 def rank_symbols_from_events(
     events: list[NewsEvent],
     focus_symbols: list[str] | None = None,
     max_symbols: int = 20,
 ) -> list[str]:
     """Rank symbols by corroborated, fresh event flow plus existing focus."""
-    scores: dict[str, float] = {}
-    focus_set = {sym.upper() for sym in (focus_symbols or [])}
-    for event in events:
-        event_weight = _EVENT_WEIGHTS.get(event.event_type, 1.0)
-        freshness_weight = _FRESHNESS_WEIGHTS.get(event.freshness, 1.0)
-        corroboration = 1.0 + 0.35 * max(event.source_count - 1, 0)
-        article_boost = 1.0 + 0.15 * max(event.article_count - 1, 0)
-        for symbol in event.symbols:
-            if not symbol:
-                continue
-            focus_boost = 1.25 if symbol in focus_set else 1.0
-            scores[symbol] = scores.get(symbol, 0.0) + event_weight * freshness_weight * corroboration * article_boost * focus_boost
-
-    for symbol in focus_set:
-        scores.setdefault(symbol, 0.0)
-        scores[symbol] += 0.75
-
+    scores = _symbol_scores_from_events(events, focus_symbols=focus_symbols)
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return [symbol for symbol, _ in ranked[:max_symbols]]
+
+
+def merge_news_items(
+    *groups: list[NewsItem],
+    max_items: int | None = None,
+) -> list[NewsItem]:
+    """Merge cross-query news fetches while keeping distinct sources."""
+    merged = sorted(
+        [item for group in groups for item in group],
+        key=lambda item: item.published_at,
+        reverse=True,
+    )
+    deduped: list[NewsItem] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in merged:
+        key = (
+            item.url or "",
+            item.source.lower(),
+            _normalize_headline(item.headline),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if max_items is not None and len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def expand_symbols_with_relationships(
+    symbols: list[str],
+    events: list[NewsEvent] | None = None,
+    max_symbols: int = 20,
+    max_related_per_symbol: int = 2,
+) -> list[str]:
+    """Expand direct catalyst symbols into peers, ecosystems, and sector ETFs."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+    direct_symbols = [symbol.upper() for symbol in symbols if symbol]
+    direct_set = set(direct_symbols)
+
+    for symbol in direct_symbols:
+        if symbol not in seen:
+            expanded.append(symbol)
+            seen.add(symbol)
+
+    signal_scores: dict[str, float] = {}
+    if events:
+        signal_scores.update(_symbol_scores_from_events(events))
+
+    fallback_score = float(len(direct_symbols) or 1)
+    related_scores: dict[str, float] = {}
+    for index, symbol in enumerate(direct_symbols):
+        relationship = _RELATIONSHIP_MAP.get(symbol)
+        if relationship is None:
+            continue
+        base_score = signal_scores.get(symbol, max(fallback_score - index, 1.0))
+        groups = (
+            ("peers", relationship.peers[:max_related_per_symbol]),
+            ("ecosystem", relationship.ecosystem[:max_related_per_symbol]),
+            ("sector_etfs", relationship.sector_etfs[:1]),
+        )
+        for group_name, candidates in groups:
+            weight = _RELATIONSHIP_WEIGHTS[group_name]
+            for offset, related in enumerate(candidates):
+                related_symbol = related.upper()
+                if not related_symbol or related_symbol in direct_set or related_symbol in seen:
+                    continue
+                proximity_discount = 1.0 - 0.08 * offset
+                related_scores[related_symbol] = related_scores.get(related_symbol, 0.0) + base_score * weight * proximity_discount
+
+    ranked_related = sorted(related_scores.items(), key=lambda item: item[1], reverse=True)
+    for symbol, _ in ranked_related:
+        if symbol in seen:
+            continue
+        expanded.append(symbol)
+        seen.add(symbol)
+        if len(expanded) >= max_symbols:
+            break
+
+    return expanded[:max_symbols]
+
+
+def build_relationship_briefs(
+    symbols: list[str],
+    events: list[NewsEvent] | None = None,
+    max_symbols: int = 6,
+) -> list[str]:
+    """Build concise spillover paths so the model can trace second-order ideas."""
+    representative_events: dict[str, NewsEvent] = {}
+    for event in sorted(events or [], key=lambda item: item.last_seen, reverse=True):
+        for symbol in event.symbols:
+            representative_events.setdefault(symbol.upper(), event)
+
+    briefs: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        normalized = symbol.upper()
+        if normalized in seen:
+            continue
+        relationship = _RELATIONSHIP_MAP.get(normalized)
+        if relationship is None:
+            continue
+        parts: list[str] = []
+        event = representative_events.get(normalized)
+        if event is not None:
+            parts.append(
+                f"catalyst={event.event_type}/{event.freshness}/{event.source_count} src"
+            )
+        parts.append(f"sector={relationship.sector}")
+        if relationship.peers:
+            parts.append(f"peers={', '.join(relationship.peers[:4])}")
+        if relationship.ecosystem:
+            parts.append(f"ecosystem={', '.join(relationship.ecosystem[:4])}")
+        if relationship.sector_etfs:
+            parts.append(f"etfs={', '.join(relationship.sector_etfs[:3])}")
+        briefs.append(f"{normalized}: {' | '.join(parts)}")
+        seen.add(normalized)
+        if len(briefs) >= max_symbols:
+            break
+    return briefs
 
 
 def _parse_articles(raw: list[dict], seen: set[str]) -> list[NewsItem]:
@@ -352,14 +541,22 @@ def format_news_for_llm(
     items: list[NewsItem],
     max_items: int = 40,
     focus_symbols: list[str] | None = None,
+    reference_time: datetime | None = None,
 ) -> str:
     if not items:
         return "No recent news available."
 
-    reference_time = max(item.published_at for item in items)
-    events = build_news_events(items, reference_time=reference_time)
+    effective_reference_time = reference_time or max(item.published_at for item in items)
+    events = build_news_events(items, reference_time=effective_reference_time)
     focus_set = {s.upper() for s in (focus_symbols or [])}
-    ranked_symbols = rank_symbols_from_events(events, focus_symbols=focus_symbols, max_symbols=8)
+    direct_symbols = rank_symbols_from_events(events, focus_symbols=focus_symbols, max_symbols=8)
+    expanded_symbols = expand_symbols_with_relationships(
+        direct_symbols,
+        events=events,
+        max_symbols=12,
+    )
+    related_symbols = [symbol for symbol in expanded_symbols if symbol not in set(direct_symbols)]
+    relationship_briefs = build_relationship_briefs(direct_symbols, events=events, max_symbols=6)
 
     def _split_items(news_items: list[NewsItem]) -> tuple[list[NewsItem], list[NewsItem]]:
         targeted: list[NewsItem] = []
@@ -389,8 +586,21 @@ def format_news_for_llm(
     targeted_events, general_events = _split_events(events)
 
     sections: list[str] = []
-    if ranked_symbols:
-        sections.append(f"--- Suggested focus symbols ---\n{', '.join(ranked_symbols)}")
+    if direct_symbols or related_symbols:
+        suggested_lines: list[str] = []
+        if direct_symbols:
+            suggested_lines.append(f"Direct catalysts: {', '.join(direct_symbols)}")
+        if related_symbols:
+            suggested_lines.append(
+                f"Related spillover watchlist: {', '.join(related_symbols[:6])}"
+            )
+        sections.append(
+            "--- Suggested focus symbols ---\n" + "\n".join(suggested_lines)
+        )
+
+    if relationship_briefs:
+        sections.append("--- Relationship map for second-order ideas ---")
+        sections.extend(relationship_briefs)
 
     if targeted_events:
         sections.append("--- Structured event map for your active / high-priority tickers ---")

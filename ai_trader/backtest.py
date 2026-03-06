@@ -738,7 +738,11 @@ def _format_news_for_backtest(
                 url=article.get("article_url") or "",
             )
         )
-    return format_news_for_llm(items, focus_symbols=focus_symbols)
+    return format_news_for_llm(
+        items,
+        focus_symbols=focus_symbols,
+        reference_time=reference_time,
+    )
 
 
 def _build_performance_summary(

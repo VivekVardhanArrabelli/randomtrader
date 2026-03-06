@@ -27,7 +27,15 @@ from .brain import TradingBrain
 from .db import AIDecisionRecord, AITradeLogger, format_trade_history
 from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
-from .news import build_news_events, fetch_news, fetch_targeted_news, format_news_for_llm, rank_symbols_from_events
+from .news import (
+    build_news_events,
+    expand_symbols_with_relationships,
+    fetch_news,
+    fetch_targeted_news,
+    format_news_for_llm,
+    merge_news_items,
+    rank_symbols_from_events,
+)
 from .options import fetch_option_chain, format_chain_for_llm
 from .portfolio import get_portfolio_state
 from .risk import PositionRiskAlert, PositionRiskState, assess_position_risk, evaluate_trade_risk
@@ -372,14 +380,46 @@ def run_cycle(
     focus_symbols += [e.underlying for e in journal.active_entries()]
     focus_symbols = list(dict.fromkeys(focus_symbols))  # dedupe preserving order
 
+    cycle_time = now_eastern()
     news_items = fetch_targeted_news(
         alpaca, focus_symbols, lookback_hours=config.NEWS_LOOKBACK_HOURS,
     )
-    news_context = format_news_for_llm(news_items, focus_symbols=focus_symbols)
-
-    news_events = build_news_events(news_items, reference_time=now_eastern())
+    news_events = build_news_events(news_items, reference_time=cycle_time)
     news_symbols = rank_symbols_from_events(
         news_events, focus_symbols=focus_symbols, max_symbols=config.WATCHLIST_SIZE,
+    )
+    expanded_news_symbols = expand_symbols_with_relationships(
+        news_symbols,
+        events=news_events,
+        max_symbols=config.WATCHLIST_SIZE,
+    )
+    extra_news_symbols = [
+        symbol
+        for symbol in expanded_news_symbols
+        if symbol not in set(news_symbols) and symbol not in set(focus_symbols)
+    ][:6]
+    if extra_news_symbols:
+        related_news_items = fetch_news(
+            alpaca,
+            symbols=extra_news_symbols,
+            lookback_hours=config.NEWS_LOOKBACK_HOURS,
+        )
+        news_items = merge_news_items(news_items, related_news_items, max_items=70)
+        news_events = build_news_events(news_items, reference_time=cycle_time)
+        news_symbols = rank_symbols_from_events(
+            news_events,
+            focus_symbols=focus_symbols,
+            max_symbols=config.WATCHLIST_SIZE,
+        )
+        expanded_news_symbols = expand_symbols_with_relationships(
+            news_symbols,
+            events=news_events,
+            max_symbols=config.WATCHLIST_SIZE,
+        )
+    news_context = format_news_for_llm(
+        news_items,
+        focus_symbols=focus_symbols,
+        reference_time=cycle_time,
     )
 
     # 6. Get market context
@@ -388,7 +428,7 @@ def run_cycle(
     # 7. Build watchlist and get options context
     # Also include symbols from active theses
     thesis_symbols = [e.underlying for e in journal.active_entries()]
-    all_watch_symbols = thesis_symbols + news_symbols
+    all_watch_symbols = thesis_symbols + expanded_news_symbols
     watchlist = _build_watchlist(alpaca, all_watch_symbols)
     options_context = _get_options_context(alpaca, watchlist)
 
