@@ -86,8 +86,9 @@ ALPACA_RATE_LIMIT_MAX_RETRIES = 3
 POLYGON_BASE_URL = "https://api.polygon.io"
 
 # ---------------------------------------------------------------------------
-# LLM (Claude)
+# LLM
 # ---------------------------------------------------------------------------
+LLM_PROVIDER = ""                 # infer from model unless overridden
 LLM_MODEL = "claude-opus-4-6"
 LLM_MAX_TOKENS = 4096
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading

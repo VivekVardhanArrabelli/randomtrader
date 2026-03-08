@@ -5,7 +5,8 @@ uses real Polygon options market data for pricing, and tracks P&L.
 
 Run:  python -m ai_trader.backtest --start 2025-01-02 --end 2025-01-31
 
-Requires: ANTHROPIC_API_KEY, POLYGON_API_KEY (paid tier for options data)
+Requires: provider API key (for the configured LLM) and POLYGON_API_KEY
+(paid tier for options data)
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from .candidates import (
 )
 from .db import format_trade_history
 from .journal import ThesisJournal
+from .llm import api_key_env_name, infer_provider, resolve_api_key
 from .news import (
     NewsItem,
     build_news_events,
@@ -1538,14 +1540,22 @@ def _build_enriched_portfolio_context(
 def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     """Run the full backtest using real Polygon options data."""
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    llm_provider = infer_provider(
+        model=config.LLM_MODEL,
+        provider=os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER,
+    )
+    llm_api_key = resolve_api_key(llm_provider)
     polygon_key = os.environ.get("POLYGON_API_KEY")
-    if not anthropic_key:
-        raise ValueError("ANTHROPIC_API_KEY required for backtesting")
+    if not llm_api_key:
+        raise ValueError(f"{api_key_env_name(llm_provider)} required for backtesting")
     if not polygon_key:
         raise ValueError("POLYGON_API_KEY required for backtesting")
 
-    brain = TradingBrain(api_key=anthropic_key)
+    brain = TradingBrain(
+        api_key=llm_api_key,
+        provider=llm_provider,
+        model=config.LLM_MODEL,
+    )
     journal = ThesisJournal(
         max_active=bt_config.journal_max_active,
         max_full_display=bt_config.journal_max_full_display,
@@ -1754,7 +1764,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             if bt_config.llm_delay_seconds > 0:
                 time_module.sleep(bt_config.llm_delay_seconds)
 
-            analysis = brain.analyze(
+            run_result = brain.run(
                 portfolio_context=portfolio_context,
                 candidate_context=candidate_context,
                 news_context=news_context,
@@ -1763,6 +1773,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 journal_context=journal_context,
                 trade_history_context=trade_history_context,
             )
+            analysis = run_result.analysis
             log(f"  {decision_time.strftime('%H:%M')} LLM: {analysis.analysis}")
 
             if journal and analysis.thesis_updates:
@@ -2004,6 +2015,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 "date": trade_date.isoformat(),
                 "decision_time": decision_time.isoformat(),
                 "news_window_start": news_window_start.isoformat(),
+                "llm_provider": run_result.packet.provider,
+                "llm_model": run_result.packet.model,
                 "market_analysis": analysis.analysis,
                 "thesis_updates": thesis_updates_serialized,
                 "trades_proposed": trade_results,

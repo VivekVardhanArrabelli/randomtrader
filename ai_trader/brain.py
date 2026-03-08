@@ -1,17 +1,15 @@
-"""LLM trading brain - Claude analyzes markets and makes trade decisions.
+"""LLM trading brain - provider-agnostic market analysis and trade decisions.
 
 Now with thesis journal (memory across cycles) and trade history awareness.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-
-import anthropic
 
 from . import config
 from .journal import ThesisUpdate, parse_thesis_updates
+from .llm import LLMAdapter, LLMCompletion, LLMDecisionPacket, create_adapter, infer_provider
 from .utils import log
 
 
@@ -36,6 +34,13 @@ class MarketAnalysis:
     analysis: str
     trades: list[TradeDecision]
     thesis_updates: list[ThesisUpdate]
+
+
+@dataclass(frozen=True)
+class AnalysisRun:
+    packet: LLMDecisionPacket
+    completion: LLMCompletion
+    analysis: MarketAnalysis
 
 
 SYSTEM_PROMPT = """\
@@ -413,8 +418,25 @@ def _parse_range(
 
 
 class TradingBrain:
-    def __init__(self, api_key: str) -> None:
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        adapter: LLMAdapter | None = None,
+    ) -> None:
+        self.model = model or config.LLM_MODEL
+        self.provider = (
+            adapter.provider
+            if adapter is not None
+            else infer_provider(model=self.model, provider=provider)
+        )
+        self.adapter = adapter or create_adapter(
+            provider=self.provider,
+            model=self.model,
+            api_key=api_key,
+        )
 
     def analyze(
         self,
@@ -426,29 +448,102 @@ class TradingBrain:
         journal_context: str = "",
         trade_history_context: str = "",
     ) -> MarketAnalysis:
-        """Send all context to Claude and get trading decisions."""
+        """Send all context to the configured LLM and get trading decisions."""
 
+        return self.run(
+            portfolio_context=portfolio_context,
+            candidate_context=candidate_context,
+            news_context=news_context,
+            market_context=market_context,
+            options_context=options_context,
+            journal_context=journal_context,
+            trade_history_context=trade_history_context,
+        ).analysis
+
+    def run(
+        self,
+        *,
+        portfolio_context: str,
+        candidate_context: str,
+        news_context: str,
+        market_context: str,
+        options_context: str = "",
+        journal_context: str = "",
+        trade_history_context: str = "",
+    ) -> AnalysisRun:
+        """Build an exact request packet, execute it, and parse the result."""
+
+        packet = self.build_packet(
+            portfolio_context, candidate_context, news_context, market_context,
+            options_context, journal_context, trade_history_context,
+        )
+        return self.run_packet(packet)
+
+    def build_packet(
+        self,
+        portfolio_context: str,
+        candidate_context: str,
+        news_context: str,
+        market_context: str,
+        options_context: str = "",
+        journal_context: str = "",
+        trade_history_context: str = "",
+    ) -> LLMDecisionPacket:
         user_message = self._build_prompt(
             portfolio_context, candidate_context, news_context, market_context,
             options_context, journal_context, trade_history_context,
         )
+        return LLMDecisionPacket(
+            provider=self.provider,
+            model=self.model,
+            system_prompt=SYSTEM_PROMPT,
+            user_message=user_message,
+            tool=TRADE_TOOL,
+            max_tokens=config.LLM_MAX_TOKENS,
+            temperature=config.LLM_TEMPERATURE,
+            contexts={
+                "portfolio_context": portfolio_context,
+                "candidate_context": candidate_context,
+                "news_context": news_context,
+                "market_context": market_context,
+                "options_context": options_context,
+                "journal_context": journal_context,
+                "trade_history_context": trade_history_context,
+            },
+        )
+
+    def run_packet(self, packet: LLMDecisionPacket) -> AnalysisRun:
+        request_packet = packet.with_target(provider=self.provider, model=self.model)
 
         log("sending market data to LLM for analysis...")
         try:
-            response = self.client.messages.create(
-                model=config.LLM_MODEL,
-                max_tokens=config.LLM_MAX_TOKENS,
-                temperature=config.LLM_TEMPERATURE,
-                system=SYSTEM_PROMPT,
-                tools=[TRADE_TOOL],
-                tool_choice={"type": "tool", "name": "submit_trade_decisions"},
-                messages=[{"role": "user", "content": user_message}],
+            completion = self.adapter.complete_structured(
+                model=request_packet.model,
+                max_tokens=request_packet.max_tokens,
+                temperature=request_packet.temperature,
+                system_prompt=request_packet.system_prompt,
+                user_message=request_packet.user_message,
+                tool=request_packet.tool,
             )
         except Exception as exc:
             log(f"LLM API error: {exc}")
-            return MarketAnalysis(analysis=f"LLM error: {exc}", trades=[], thesis_updates=[])
+            analysis = MarketAnalysis(analysis=f"LLM error: {exc}", trades=[], thesis_updates=[])
+            return AnalysisRun(
+                packet=request_packet,
+                completion=LLMCompletion(
+                    provider=self.provider,
+                    model=self.model,
+                    text_blocks=[str(exc)],
+                    raw_response={"error": str(exc)},
+                ),
+                analysis=analysis,
+            )
 
-        return self._parse_response(response)
+        return AnalysisRun(
+            packet=request_packet,
+            completion=completion,
+            analysis=self._parse_response(completion),
+        )
 
     def _build_prompt(
         self,
@@ -503,11 +598,11 @@ class TradingBrain:
         sections.extend(["", instruction])
         return "\n".join(sections)
 
-    def _parse_response(self, response) -> MarketAnalysis:
+    def _parse_response(self, response: LLMCompletion) -> MarketAnalysis:
         """Extract structured trade decisions and journal updates."""
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "submit_trade_decisions":
-                data = block.input
+        for tool_call in response.tool_calls:
+            if tool_call.name == "submit_trade_decisions":
+                data = tool_call.input
                 analysis = data.get("market_analysis", "")
 
                 # Parse thesis updates
@@ -578,9 +673,6 @@ class TradingBrain:
                 )
 
         # Fallback: no tool use in response
-        text_parts = [
-            block.text for block in response.content if hasattr(block, "text")
-        ]
-        analysis = " ".join(text_parts) if text_parts else "No analysis returned."
+        analysis = " ".join(response.text_blocks) if response.text_blocks else "No analysis returned."
         log("LLM returned no structured trades")
         return MarketAnalysis(analysis=analysis, trades=[], thesis_updates=[])

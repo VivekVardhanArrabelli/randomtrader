@@ -32,6 +32,7 @@ from .candidates import (
 from .db import AIDecisionRecord, AITradeLogger, format_trade_history
 from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
+from .llm import api_key_env_name, infer_provider, resolve_api_key
 from .news import (
     build_news_events,
     classify_catalyst_reaction,
@@ -603,7 +604,7 @@ def run_cycle(
 
     # 8. Send to LLM brain
     portfolio_context = portfolio.to_context_str()
-    analysis = brain.analyze(
+    run_result = brain.run(
         portfolio_context=portfolio_context,
         candidate_context=candidate_context,
         news_context=news_context,
@@ -612,8 +613,58 @@ def run_cycle(
         journal_context=journal_context,
         trade_history_context=trade_history_context,
     )
+    analysis = run_result.analysis
 
     log(f"LLM analysis: {analysis.analysis[:200]}")
+
+    decisions_json = json.dumps(
+        {
+            "market_analysis": analysis.analysis,
+            "thesis_updates": [
+                {
+                    "id": update.id,
+                    "underlying": update.underlying,
+                    "direction": update.direction,
+                    "thesis": update.thesis,
+                    "conviction": update.conviction,
+                    "status": update.status,
+                    "new_observation": update.new_observation,
+                }
+                for update in analysis.thesis_updates
+            ],
+            "trades": [
+                {
+                    "action": d.action,
+                    "underlying": d.underlying,
+                    "strike_preference": d.strike_preference,
+                    "expiry_preference": d.expiry_preference,
+                    "conviction": d.conviction,
+                    "risk_pct": d.risk_pct,
+                    "reasoning": d.reasoning,
+                    "target_symbol": d.target_symbol,
+                    "contract_symbol": d.contract_symbol,
+                    "target_delta_range": d.target_delta_range,
+                    "target_dte_range": d.target_dte_range,
+                    "max_spread_pct": d.max_spread_pct,
+                }
+                for d in analysis.trades
+            ],
+        }
+    )
+    decision_id = logger.log_decision(
+        AIDecisionRecord(
+            timestamp=now_eastern(),
+            market_analysis=analysis.analysis,
+            news_summary=news_context[:1000],
+            portfolio_state=portfolio_context[:1000],
+            decisions_json=decisions_json,
+            trades_executed=0,
+            llm_provider=run_result.packet.provider,
+            llm_model=run_result.packet.model,
+            packet_json=json.dumps(run_result.packet.to_payload()),
+            response_json=json.dumps(run_result.completion.to_payload()),
+        )
+    )
 
     # 9. Apply thesis journal updates
     if analysis.thesis_updates:
@@ -641,29 +692,8 @@ def run_cycle(
         else:
             log(f"trade failed: {result.symbol} - {result.message}")
 
-    # 11. Log the full decision cycle
-    decisions_json = json.dumps(
-        [
-            {
-                "action": d.action,
-                "underlying": d.underlying,
-                "conviction": d.conviction,
-                "risk_pct": d.risk_pct,
-                "reasoning": d.reasoning,
-            }
-            for d in analysis.trades
-        ]
-    )
-    logger.log_decision(
-        AIDecisionRecord(
-            timestamp=now_eastern(),
-            market_analysis=analysis.analysis,
-            news_summary=news_context[:1000],
-            portfolio_state=portfolio_context[:1000],
-            decisions_json=decisions_json,
-            trades_executed=trades_executed,
-        )
-    )
+    # 11. Update the logged cycle with realized execution count.
+    logger.update_decision_trade_count(decision_id, trades_executed)
 
     return trades_executed
 
@@ -678,9 +708,13 @@ def run() -> None:
     load_dotenv(env_path, override=True)
 
     # Validate required env vars
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not anthropic_key:
-        log("ERROR: ANTHROPIC_API_KEY not set. Add it to ai_trader/.env")
+    llm_provider = infer_provider(
+        model=config.LLM_MODEL,
+        provider=os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER,
+    )
+    llm_api_key = resolve_api_key(llm_provider)
+    if not llm_api_key:
+        log(f"ERROR: {api_key_env_name(llm_provider)} not set. Add it to ai_trader/.env")
         return
 
     alpaca_key = os.environ.get("ALPACA_API_KEY")
@@ -690,7 +724,11 @@ def run() -> None:
         return
 
     alpaca = AlpacaClient.from_env()
-    brain = TradingBrain(api_key=anthropic_key)
+    brain = TradingBrain(
+        api_key=llm_api_key,
+        provider=llm_provider,
+        model=config.LLM_MODEL,
+    )
     logger = AITradeLogger()
 
     # Initialize thesis journal (persisted to SQLite)
@@ -721,7 +759,7 @@ def run() -> None:
     log(f"  Paper trading: {config.PAPER_TRADING}")
     log(f"  Max risk per trade: {config.MAX_RISK_PER_TRADE:.0%}")
     log(f"  Scan interval: {config.SCAN_INTERVAL_MINUTES} min")
-    log(f"  LLM model: {config.LLM_MODEL}")
+    log(f"  LLM provider/model: {llm_provider}/{config.LLM_MODEL}")
     log(f"  Active theses: {active_theses}")
     log("=" * 60)
 

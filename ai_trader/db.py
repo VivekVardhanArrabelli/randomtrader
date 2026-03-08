@@ -49,6 +49,10 @@ class AIDecisionRecord:
     portfolio_state: str
     decisions_json: str      # full JSON of LLM decisions
     trades_executed: int
+    llm_provider: str = ""
+    llm_model: str = ""
+    packet_json: str = ""
+    response_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,7 +108,11 @@ class AITradeLogger:
                     news_summary TEXT,
                     portfolio_state TEXT,
                     decisions_json TEXT,
-                    trades_executed INTEGER
+                    trades_executed INTEGER,
+                    llm_provider TEXT,
+                    llm_model TEXT,
+                    packet_json TEXT,
+                    response_json TEXT
                 )
                 """
             )
@@ -130,6 +138,19 @@ class AITradeLogger:
             if "order_id" not in close_cols:
                 conn.execute("ALTER TABLE position_closes ADD COLUMN order_id TEXT")
 
+            decision_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ai_decisions)")
+            }
+            if "llm_provider" not in decision_cols:
+                conn.execute("ALTER TABLE ai_decisions ADD COLUMN llm_provider TEXT")
+            if "llm_model" not in decision_cols:
+                conn.execute("ALTER TABLE ai_decisions ADD COLUMN llm_model TEXT")
+            if "packet_json" not in decision_cols:
+                conn.execute("ALTER TABLE ai_decisions ADD COLUMN packet_json TEXT")
+            if "response_json" not in decision_cols:
+                conn.execute("ALTER TABLE ai_decisions ADD COLUMN response_json TEXT")
+
     def log_trade(self, record: AITradeRecord) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -153,10 +174,23 @@ class AITradeLogger:
                 ),
             )
 
-    def log_decision(self, record: AIDecisionRecord) -> None:
+    def log_decision(self, record: AIDecisionRecord) -> int:
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO ai_decisions VALUES (?, ?, ?, ?, ?, ?)",
+            cur = conn.execute(
+                """
+                INSERT INTO ai_decisions (
+                    timestamp,
+                    market_analysis,
+                    news_summary,
+                    portfolio_state,
+                    decisions_json,
+                    trades_executed,
+                    llm_provider,
+                    llm_model,
+                    packet_json,
+                    response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     record.timestamp.isoformat(),
                     record.market_analysis,
@@ -164,8 +198,23 @@ class AITradeLogger:
                     record.portfolio_state,
                     record.decisions_json,
                     record.trades_executed,
+                    record.llm_provider,
+                    record.llm_model,
+                    record.packet_json,
+                    record.response_json,
                 ),
             )
+            return int(cur.lastrowid or 0)
+
+    def update_decision_trade_count(self, decision_id: int, trades_executed: int) -> int:
+        if decision_id <= 0:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE ai_decisions SET trades_executed = ? WHERE rowid = ?",
+                (trades_executed, decision_id),
+            )
+            return int(cur.rowcount or 0)
 
     def log_position_close(self, record: PositionCloseRecord) -> None:
         with self._connect() as conn:
@@ -257,6 +306,15 @@ class AITradeLogger:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM position_closes ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_recent_decisions(self, limit: int = 20) -> list[dict]:
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT rowid AS decision_id, * FROM ai_decisions ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
