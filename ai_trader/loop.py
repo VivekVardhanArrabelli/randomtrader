@@ -24,6 +24,11 @@ from dotenv import load_dotenv
 from . import config
 from .alpaca_client import AlpacaClient
 from .brain import TradingBrain
+from .candidates import (
+    build_candidate_ideas,
+    format_candidate_table,
+    select_candidate_finalists,
+)
 from .db import AIDecisionRecord, AITradeLogger, format_trade_history
 from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
@@ -34,8 +39,10 @@ from .news import (
     fetch_news,
     fetch_targeted_news,
     format_news_for_llm,
+    map_best_events_by_symbol,
     merge_news_items,
     rank_symbols_from_events,
+    score_news_event,
 )
 from .options import fetch_option_chain, format_chain_for_llm
 from .portfolio import get_portfolio_state
@@ -188,8 +195,12 @@ def _get_market_context(alpaca: AlpacaClient) -> str:
     return "\n".join(lines)
 
 
-def _get_ticker_trend(alpaca: AlpacaClient, symbol: str) -> str | None:
-    metrics = _get_ticker_trend_metrics(alpaca, symbol)
+def _get_ticker_trend(
+    alpaca: AlpacaClient,
+    symbol: str,
+    metrics_cache: dict[str, dict | None] | None = None,
+) -> str | None:
+    metrics = _get_ticker_trend_metrics(alpaca, symbol, metrics_cache=metrics_cache)
     if not metrics:
         return None
 
@@ -202,33 +213,55 @@ def _get_ticker_trend(alpaca: AlpacaClient, symbol: str) -> str | None:
     )
 
 
-def _get_ticker_trend_metrics(alpaca: AlpacaClient, symbol: str) -> dict | None:
+def _get_ticker_trend_metrics(
+    alpaca: AlpacaClient,
+    symbol: str,
+    metrics_cache: dict[str, dict | None] | None = None,
+) -> dict | None:
     """Return daily trend metrics for a single ticker."""
+    normalized = symbol.upper()
+    if metrics_cache is not None and normalized in metrics_cache:
+        return metrics_cache[normalized]
     today = now_eastern().date()
     start = (today - timedelta(days=18)).isoformat()
     try:
-        bars = alpaca.get_bars(symbol, timeframe="1Day", start=start, limit=15)
+        bars = alpaca.get_bars(normalized, timeframe="1Day", start=start, limit=15)
     except Exception:
+        if metrics_cache is not None:
+            metrics_cache[normalized] = None
         return None
 
     t = _compute_bar_trends(bars)
     if not t:
+        if metrics_cache is not None:
+            metrics_cache[normalized] = None
         return None
+    if metrics_cache is not None:
+        metrics_cache[normalized] = t
     return t
 
 
 def _build_catalyst_reaction_context(
     alpaca: AlpacaClient,
     news_events: list,
+    focus_symbols: list[str] | None = None,
+    metrics_cache: dict[str, dict | None] | None = None,
     max_events: int = 5,
 ) -> str:
     lines = ["Catalyst Reaction Snapshot:"]
     seen: set[str] = set()
+    focus_set = {symbol.upper() for symbol in (focus_symbols or [])}
     for event in news_events:
         symbol = next((sym.upper() for sym in event.symbols if sym), "")
         if not symbol or symbol in seen:
             continue
-        metrics = _get_ticker_trend_metrics(alpaca, symbol)
+        if focus_set and symbol not in focus_set:
+            continue
+        metrics = _get_ticker_trend_metrics(
+            alpaca,
+            symbol,
+            metrics_cache=metrics_cache,
+        )
         if not metrics:
             continue
         reaction = classify_catalyst_reaction(
@@ -251,19 +284,21 @@ def _build_catalyst_reaction_context(
 
 
 def _get_options_context(
-    alpaca: AlpacaClient, watchlist: list[str]
+    alpaca: AlpacaClient,
+    watchlist: list[str],
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> str:
     """Fetch options chains for watchlist symbols to give LLM context."""
     if not watchlist:
         return ""
 
     all_lines = []
-    for sym in watchlist[:5]:  # Limit to top 5 to manage context size
+    for sym in watchlist[: config.CANDIDATE_FINALISTS]:
         price = _get_price(alpaca, sym)
         if price <= 0:
             continue
         # Add per-ticker trend context
-        trend = _get_ticker_trend(alpaca, sym)
+        trend = _get_ticker_trend(alpaca, sym, metrics_cache=metrics_cache)
         if trend:
             all_lines.append(f"\n{sym} ({trend}):")
         else:
@@ -273,6 +308,83 @@ def _get_options_context(
             all_lines.append(format_chain_for_llm(chain, max_contracts=20, underlying_price=price))
 
     return "\n".join(all_lines) if all_lines else ""
+
+
+def _build_candidate_context(
+    alpaca: AlpacaClient,
+    news_events: list,
+    position_symbols: list[str],
+    thesis_symbols: list[str],
+    direct_symbols: list[str],
+    spillover_symbols: list[str],
+    metrics_cache: dict[str, dict | None] | None = None,
+) -> tuple[str, list[str]]:
+    source_tags_by_symbol: dict[str, set[str]] = {}
+
+    def _tag_symbols(symbols: list[str], tag: str) -> None:
+        for symbol in symbols:
+            normalized = symbol.upper()
+            if not normalized:
+                continue
+            source_tags_by_symbol.setdefault(normalized, set()).add(tag)
+
+    _tag_symbols(position_symbols, "position")
+    _tag_symbols(thesis_symbols, "thesis")
+    _tag_symbols(direct_symbols, "direct")
+    spillover_only = [
+        symbol for symbol in spillover_symbols
+        if symbol.upper() not in {s.upper() for s in direct_symbols}
+    ]
+    _tag_symbols(spillover_only, "spillover")
+    try:
+        movers = alpaca.get_movers(top=10)
+    except Exception:
+        movers = []
+    _tag_symbols([str(symbol).upper() for symbol in movers], "mover")
+    _tag_symbols(["SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV"], "macro")
+
+    best_events = map_best_events_by_symbol(news_events)
+    event_scores = {
+        symbol: score_news_event(event)
+        for symbol, event in best_events.items()
+    }
+    metrics_by_symbol: dict[str, dict] = {}
+    for symbol in list(source_tags_by_symbol):
+        metrics = _get_ticker_trend_metrics(
+            alpaca,
+            symbol,
+            metrics_cache=metrics_cache,
+        )
+        if not metrics:
+            continue
+        event = best_events.get(symbol)
+        reaction = ""
+        if event is not None:
+            reaction = classify_catalyst_reaction(
+                event.age_minutes,
+                metrics["intraday_chg"],
+                metrics["five_d_chg"],
+            )
+        metrics_by_symbol[symbol] = {
+            **metrics,
+            "reaction": reaction,
+        }
+
+    candidates = build_candidate_ideas(
+        source_tags_by_symbol,
+        metrics_by_symbol,
+        best_events,
+        event_scores,
+    )
+    candidate_context = format_candidate_table(
+        candidates,
+        max_rows=config.CANDIDATE_TABLE_SIZE,
+    )
+    finalists = select_candidate_finalists(
+        candidates,
+        max_symbols=config.CANDIDATE_FINALISTS,
+    )
+    return candidate_context, finalists
 
 
 def _get_price(alpaca: AlpacaClient, symbol: str) -> float:
@@ -413,11 +525,12 @@ def run_cycle(
 
     # 5. Fetch news — targeted for tickers the model cares about
     # Focus symbols = open positions + active theses
-    focus_symbols: list[str] = [p.underlying for p in portfolio.option_positions]
-    focus_symbols += [e.underlying for e in journal.active_entries()]
-    focus_symbols = list(dict.fromkeys(focus_symbols))  # dedupe preserving order
+    position_symbols: list[str] = [p.underlying for p in portfolio.option_positions]
+    thesis_symbols = [e.underlying for e in journal.active_entries()]
+    focus_symbols = list(dict.fromkeys(position_symbols + thesis_symbols))
 
     cycle_time = now_eastern()
+    metrics_cache: dict[str, dict | None] = {}
     news_items = fetch_targeted_news(
         alpaca, focus_symbols, lookback_hours=config.NEWS_LOOKBACK_HOURS,
     )
@@ -453,29 +566,46 @@ def run_cycle(
             events=news_events,
             max_symbols=config.WATCHLIST_SIZE,
         )
+    candidate_context, finalists = _build_candidate_context(
+        alpaca,
+        news_events,
+        position_symbols=position_symbols,
+        thesis_symbols=thesis_symbols,
+        direct_symbols=news_symbols,
+        spillover_symbols=expanded_news_symbols,
+        metrics_cache=metrics_cache,
+    )
+    deep_focus_symbols = list(dict.fromkeys(focus_symbols + finalists))
     news_context = format_news_for_llm(
         news_items,
-        focus_symbols=focus_symbols,
+        focus_symbols=deep_focus_symbols,
         reference_time=cycle_time,
     )
-    catalyst_reaction_context = _build_catalyst_reaction_context(alpaca, news_events)
+    catalyst_reaction_context = _build_catalyst_reaction_context(
+        alpaca,
+        news_events,
+        focus_symbols=deep_focus_symbols,
+        metrics_cache=metrics_cache,
+    )
     if catalyst_reaction_context:
         news_context = f"{catalyst_reaction_context}\n\n{news_context}"
 
     # 6. Get market context
     market_context = _get_market_context(alpaca)
 
-    # 7. Build watchlist and get options context
-    # Also include symbols from active theses
-    thesis_symbols = [e.underlying for e in journal.active_entries()]
-    all_watch_symbols = thesis_symbols + expanded_news_symbols
-    watchlist = _build_watchlist(alpaca, all_watch_symbols)
-    options_context = _get_options_context(alpaca, watchlist)
+    # 7. Get deep-dive options context only for finalists
+    finalist_watchlist = finalists or focus_symbols
+    options_context = _get_options_context(
+        alpaca,
+        finalist_watchlist,
+        metrics_cache=metrics_cache,
+    )
 
     # 8. Send to LLM brain
     portfolio_context = portfolio.to_context_str()
     analysis = brain.analyze(
         portfolio_context=portfolio_context,
+        candidate_context=candidate_context,
         news_context=news_context,
         market_context=market_context,
         options_context=options_context,

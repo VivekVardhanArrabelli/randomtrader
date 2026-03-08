@@ -139,6 +139,12 @@ approvals, major contracts, geopolitical events)
 not obviously already priced in. Multi-cycle buildup is for ambiguous or \
 slower-developing setups, not a blanket rule.
 
+CANDIDATE TRIAGE:
+You may receive a candidate table before the detailed packets.
+- Treat it as a broad scan across a larger universe.
+- Use it to decide which names deserve the deepest attention.
+- Detailed raw news and option chains are usually only shown for the finalists.
+
 NEWS INTERPRETATION:
 You receive both raw headlines and a structured event map.
 - The event map is a machine-generated compression layer: event_type, freshness,
@@ -413,6 +419,7 @@ class TradingBrain:
     def analyze(
         self,
         portfolio_context: str,
+        candidate_context: str,
         news_context: str,
         market_context: str,
         options_context: str = "",
@@ -422,7 +429,7 @@ class TradingBrain:
         """Send all context to Claude and get trading decisions."""
 
         user_message = self._build_prompt(
-            portfolio_context, news_context, market_context,
+            portfolio_context, candidate_context, news_context, market_context,
             options_context, journal_context, trade_history_context,
         )
 
@@ -446,6 +453,7 @@ class TradingBrain:
     def _build_prompt(
         self,
         portfolio_context: str,
+        candidate_context: str,
         news_context: str,
         market_context: str,
         options_context: str,
@@ -460,6 +468,8 @@ class TradingBrain:
             sections.extend(["", "=== YOUR THESIS JOURNAL ===", journal_context])
         if trade_history_context:
             sections.extend(["", "=== YOUR RECENT TRADE HISTORY ===", trade_history_context])
+        if candidate_context:
+            sections.extend(["", "=== BROAD CANDIDATE TRIAGE ===", candidate_context])
         sections.extend([
             "", "=== RECENT NEWS ===", news_context,
             "", "=== MARKET DATA ===", market_context,

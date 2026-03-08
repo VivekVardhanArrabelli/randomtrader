@@ -82,8 +82,9 @@ def test_build_prompt_repeat_loser_instruction():
     history_with = "WARNING — REPEAT LOSERS\n  AAPL: 3 trades, 0 wins"
     history_without = "Recent stats: 3W/1L net=$+500"
 
-    prompt_with = brain._build_prompt("port", "news", "mkt", "", "", history_with)
+    prompt_with = brain._build_prompt("port", "candidates", "news", "mkt", "", "", history_with)
     assert "genuinely different" in prompt_with
+    assert "=== BROAD CANDIDATE TRIAGE ===" in prompt_with
 
-    prompt_without = brain._build_prompt("port", "news", "mkt", "", "", history_without)
+    prompt_without = brain._build_prompt("port", "", "news", "mkt", "", "", history_without)
     assert "genuinely different" not in prompt_without

@@ -25,9 +25,23 @@ from dotenv import load_dotenv
 
 from . import config
 from .brain import MarketAnalysis, TradingBrain, TradeDecision
+from .candidates import (
+    build_candidate_ideas,
+    format_candidate_table,
+    select_candidate_finalists,
+)
 from .db import format_trade_history
 from .journal import ThesisJournal
-from .news import NewsItem, build_news_events, classify_catalyst_reaction, format_news_for_llm
+from .news import (
+    NewsItem,
+    build_news_events,
+    classify_catalyst_reaction,
+    expand_symbols_with_relationships,
+    format_news_for_llm,
+    map_best_events_by_symbol,
+    rank_symbols_from_events,
+    score_news_event,
+)
 from .options import (
     approx_delta,
     target_dte_for_expiry_preference,
@@ -1095,15 +1109,19 @@ def _build_catalyst_reaction_context(
     api_key: str,
     news_events: list,
     as_of: date | datetime,
+    focus_symbols: list[str] | None = None,
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
     max_events: int = 5,
 ) -> str:
     lines = ["Catalyst Reaction Snapshot:"]
     seen: set[str] = set()
+    focus_set = {symbol.upper() for symbol in (focus_symbols or [])}
     for event in news_events:
         symbol = next((sym.upper() for sym in event.symbols if sym), "")
         if not symbol or symbol in seen:
+            continue
+        if focus_set and symbol not in focus_set:
             continue
         metrics = _ticker_price_metrics_as_of(
             api_key,
@@ -1220,22 +1238,100 @@ def _extract_top_news_tickers(
 
 
 def _build_focus_tickers(
-    news: list[dict],
+    news_events: list,
     positions: list[SimPosition],
     journal: ThesisJournal | None,
+    api_key: str,
+    as_of: date | datetime,
+    cache: PolygonCache,
     max_tickers: int = config.WATCHLIST_SIZE,
-) -> list[str]:
-    """Build a compact focus list from live theses, open risk, and fresh news."""
-    tickers: list[str] = []
-    for pos in positions:
-        if pos.underlying:
-            tickers.append(pos.underlying.upper())
-    if journal:
-        for entry in journal.active_entries():
-            if entry.underlying:
-                tickers.append(entry.underlying.upper())
-    tickers.extend(_extract_top_news_tickers(news, max_tickers=max_tickers))
-    return list(dict.fromkeys(tickers))[:max_tickers]
+) -> tuple[str, list[str]]:
+    """Build a candidate table and finalist symbols for deep-dive context."""
+    source_tags_by_symbol: dict[str, set[str]] = {}
+    position_symbols = [pos.underlying.upper() for pos in positions if pos.underlying]
+    thesis_symbols = [
+        entry.underlying.upper()
+        for entry in (journal.active_entries() if journal else [])
+        if entry.underlying
+    ]
+    direct_symbols = rank_symbols_from_events(
+        news_events,
+        focus_symbols=position_symbols + thesis_symbols,
+        max_symbols=max_tickers,
+    )
+    if not direct_symbols and news_events:
+        direct_symbols = list(dict.fromkeys(
+            symbol.upper()
+            for event in news_events
+            for symbol in event.symbols
+            if symbol
+        ))[:max_tickers]
+    spillover_symbols = expand_symbols_with_relationships(
+        direct_symbols,
+        events=news_events,
+        max_symbols=max_tickers,
+    )
+
+    def _tag_symbols(symbols: list[str], tag: str) -> None:
+        for symbol in symbols:
+            normalized = symbol.upper()
+            if not normalized:
+                continue
+            source_tags_by_symbol.setdefault(normalized, set()).add(tag)
+
+    _tag_symbols(position_symbols, "position")
+    _tag_symbols(thesis_symbols, "thesis")
+    _tag_symbols(direct_symbols, "direct")
+    direct_set = {symbol.upper() for symbol in direct_symbols}
+    _tag_symbols(
+        [symbol for symbol in spillover_symbols if symbol.upper() not in direct_set],
+        "spillover",
+    )
+    _tag_symbols(["SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV"], "macro")
+
+    best_events = map_best_events_by_symbol(news_events)
+    event_scores = {
+        symbol: score_news_event(event)
+        for symbol, event in best_events.items()
+    }
+    metrics_by_symbol: dict[str, dict] = {}
+    for symbol in list(source_tags_by_symbol):
+        metrics = _ticker_price_metrics_as_of(
+            api_key,
+            symbol,
+            as_of,
+            cache=cache,
+        )
+        if not metrics:
+            continue
+        event = best_events.get(symbol)
+        reaction = ""
+        if event is not None:
+            reaction = classify_catalyst_reaction(
+                event.age_minutes,
+                metrics["intraday_chg"],
+                metrics["five_d_chg"],
+            )
+        metrics_by_symbol[symbol] = {
+            **metrics,
+            "reaction": reaction,
+        }
+
+    candidates = build_candidate_ideas(
+        source_tags_by_symbol,
+        metrics_by_symbol,
+        best_events,
+        event_scores,
+    )
+    candidate_context = format_candidate_table(
+        candidates,
+        max_rows=config.CANDIDATE_TABLE_SIZE,
+    )
+    finalists = select_candidate_finalists(
+        candidates,
+        max_symbols=config.CANDIDATE_FINALISTS,
+    )
+    return candidate_context, finalists
 
 
 def _build_options_context(
@@ -1265,7 +1361,7 @@ def _build_options_context(
     expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
     expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
-    for ticker in tickers:
+    for ticker in tickers[: config.CANDIDATE_FINALISTS]:
         # Fetch spot price + trend context (single range query, no extra call)
         trend_ctx, spot = _build_ticker_price_context(
             api_key, ticker, as_of_dt, cache=cache, bar_minutes=bar_minutes,
@@ -1590,15 +1686,25 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 reference_time=decision_time,
             )
             news_events = build_news_events(news_items, reference_time=decision_time)
+            candidate_context, finalist_symbols = _build_focus_tickers(
+                news_events,
+                positions,
+                journal,
+                polygon_key,
+                decision_time,
+                cache,
+            )
+            deep_focus_symbols = list(dict.fromkeys(context_focus_symbols + finalist_symbols))
             news_context = _format_news_for_backtest(
                 news,
-                focus_symbols=list(dict.fromkeys(context_focus_symbols)),
+                focus_symbols=deep_focus_symbols,
                 reference_time=decision_time,
             )
             catalyst_reaction_context = _build_catalyst_reaction_context(
                 polygon_key,
                 news_events,
                 decision_time,
+                focus_symbols=deep_focus_symbols,
                 cache=cache,
                 bar_minutes=bt_config.signal_bar_minutes,
             )
@@ -1635,10 +1741,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             if perf_summary:
                 trade_history_context += perf_summary
 
-            focus_tickers = _build_focus_tickers(news, positions, journal)
             options_context = _build_options_context(
                 polygon_key,
-                focus_tickers,
+                finalist_symbols or deep_focus_symbols,
                 decision_time,
                 cache,
                 bt_config.default_dte,
@@ -1651,6 +1756,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
             analysis = brain.analyze(
                 portfolio_context=portfolio_context,
+                candidate_context=candidate_context,
                 news_context=news_context,
                 market_context=market_context,
                 options_context=options_context,

@@ -287,6 +287,27 @@ def _event_signal_strength(event: NewsEvent) -> float:
     return event_weight * freshness_weight * corroboration * article_boost
 
 
+def score_news_event(event: NewsEvent) -> float:
+    """Public scoring helper for candidate ranking and watchlist building."""
+    return _event_signal_strength(event)
+
+
+def map_best_events_by_symbol(events: list[NewsEvent]) -> dict[str, NewsEvent]:
+    """Map each symbol to its strongest recent event."""
+    best_by_symbol: dict[str, NewsEvent] = {}
+    best_scores: dict[str, tuple[float, datetime]] = {}
+    for event in events:
+        signal = _event_signal_strength(event)
+        for symbol in event.symbols:
+            normalized = symbol.upper()
+            current = best_scores.get(normalized)
+            score_key = (signal, event.last_seen)
+            if current is None or score_key > current:
+                best_by_symbol[normalized] = event
+                best_scores[normalized] = score_key
+    return best_by_symbol
+
+
 def _symbol_scores_from_events(
     events: list[NewsEvent],
     focus_symbols: list[str] | None = None,

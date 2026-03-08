@@ -50,6 +50,8 @@ CLOSE_LIMIT_TIMEOUT_SECONDS = 15   # wait for limit fill before market fallback
 SCAN_INTERVAL_MINUTES = 15         # how often to run the full scan cycle
 NEWS_LOOKBACK_HOURS = 12           # how far back to fetch news (extended for multi-cycle context)
 WATCHLIST_SIZE = 20                # top N tickers to watch
+CANDIDATE_TABLE_SIZE = 12          # broad triage rows shown to the LLM
+CANDIDATE_FINALISTS = 6            # finalists that get rich news/options context
 POSITION_CHECK_INTERVAL_SECONDS = 60
 
 # ---------------------------------------------------------------------------
