@@ -25,6 +25,11 @@ class TradeDecision:
     risk_pct: float                # fraction of equity to risk (max 0.40)
     reasoning: str
     target_symbol: str | None      # specific option symbol for closes
+    contract_symbol: str | None = None
+    target_delta: float | None = None
+    min_dte: int | None = None
+    max_dte: int | None = None
+    max_spread_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,8 @@ You maintain a thesis journal across trading cycles. This is your memory.
 - Raise conviction and mark "ready" when evidence is strong enough to trade.
 - Mark "acted_on" after you trade on a thesis.
 - Mark "invalidated" when the thesis is disproven.
-- A good thesis builds over 2-3 cycles before becoming a trade.
+- Many thesis-driven setups should build over 2-3 cycles before becoming a trade.
+- Do not artificially delay clean, breaking catalysts just to force extra cycles.
 - Not every thesis needs to become a trade — invalidating is fine.
 - Reference thesis IDs when making trade decisions so there's a clear link.
 - Your journal has limited active slots. If it's full, the system will auto-prune \
@@ -130,6 +136,9 @@ approvals, major contracts, geopolitical events)
 - Sector rotation signals
 - Macro catalysts (Fed decisions, economic data)
 - A thesis that has matured with confirming evidence over multiple cycles
+- Immediate entries are allowed when the catalyst is truly fresh, clear, and \
+not obviously already priced in. Multi-cycle buildup is for ambiguous or \
+slower-developing setups, not a blanket rule.
 
 NEWS INTERPRETATION:
 You receive both raw headlines and a structured event map.
@@ -153,6 +162,20 @@ current price move.
 - Older catalyst + large same-day move can already be priced in.
 - When a move already looks extended, raise the bar for entry. Prefer a laggard,
   a sector expression, a better expiry/strike, or no trade at all.
+
+TRADE EXPRESSION:
+You are not limited to coarse contract buckets if the context supports a more
+precise view.
+- You may submit an exact `contract_symbol` for new trades when a specific
+  contract is clearly best.
+- You may also guide selection with `target_delta`, `min_dte`, `max_dte`, and
+  `max_spread_pct`.
+- You may trade the best expression of a thesis, including a related stock or
+  sector ETF, when it is cleaner than the headline ticker itself.
+- Use those fields only when they improve the trade thesis. Otherwise the
+  coarse strike/expiry preferences are fine.
+- If timing is not right yet, do not force a trade. Keep the thesis developing
+  or ready and state what you are waiting for.
 
 WHEN NOT TO TRADE:
 - Unclear or mixed signals
@@ -294,6 +317,47 @@ TRADE_TOOL = {
                                 "Leave empty for new trades."
                             ),
                         },
+                        "contract_symbol": {
+                            "type": "string",
+                            "description": (
+                                "Optional for new trades: exact option symbol to buy "
+                                "when you want a specific contract."
+                            ),
+                        },
+                        "target_delta": {
+                            "type": "number",
+                            "minimum": 0.05,
+                            "maximum": 0.95,
+                            "description": (
+                                "Optional for new trades: desired absolute delta "
+                                "(for example 0.35 or 0.60)."
+                            ),
+                        },
+                        "min_dte": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 90,
+                            "description": (
+                                "Optional for new trades: minimum days to expiry."
+                            ),
+                        },
+                        "max_dte": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 120,
+                            "description": (
+                                "Optional for new trades: maximum days to expiry."
+                            ),
+                        },
+                        "max_spread_pct": {
+                            "type": "number",
+                            "minimum": 0.01,
+                            "maximum": 0.50,
+                            "description": (
+                                "Optional for new trades: maximum acceptable bid-ask "
+                                "spread as a fraction of ask, such as 0.12 for 12%."
+                            ),
+                        },
                     },
                     "required": [
                         "action",
@@ -391,7 +455,8 @@ class TradingBrain:
             )
         instruction += (
             "Then decide whether to make any trades. Prefer trading on mature theses "
-            "over snap decisions."
+            "for ambiguous setups, but do not delay a clean breaking catalyst "
+            "just to force extra cycles."
         )
         sections.extend(["", instruction])
         return "\n".join(sections)
@@ -433,6 +498,27 @@ class TradingBrain:
                             risk_pct=risk_pct,
                             reasoning=t.get("reasoning", ""),
                             target_symbol=t.get("target_symbol"),
+                            contract_symbol=t.get("contract_symbol"),
+                            target_delta=(
+                                float(t.get("target_delta"))
+                                if t.get("target_delta") is not None
+                                else None
+                            ),
+                            min_dte=(
+                                int(t.get("min_dte"))
+                                if t.get("min_dte") is not None
+                                else None
+                            ),
+                            max_dte=(
+                                int(t.get("max_dte"))
+                                if t.get("max_dte") is not None
+                                else None
+                            ),
+                            max_spread_pct=(
+                                float(t.get("max_spread_pct"))
+                                if t.get("max_spread_pct") is not None
+                                else None
+                            ),
                         )
                     )
 

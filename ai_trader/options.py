@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from . import config
@@ -48,6 +48,17 @@ def target_dte_for_expiry_preference(expiry_preference: str) -> int:
     if expiry_preference == "monthly":
         return 25
     return 9
+
+
+def absolute_delta(contract: "OptionContract", underlying_price: float) -> float:
+    return abs(
+        approx_delta(
+            contract.strike,
+            underlying_price,
+            max(contract.dte, 1),
+            contract.option_type,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -99,15 +110,22 @@ def fetch_option_chain(
     underlying: str,
     underlying_price: float,
     option_type: str | None = None,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
+    strike_band_pct: float | None = None,
 ) -> list[OptionContract]:
     """Fetch and filter options contracts for an underlying."""
     today = now_eastern().date()
-    exp_gte = (today + timedelta(days=config.PREFERRED_DTE_MIN)).isoformat()
-    exp_lte = (today + timedelta(days=config.PREFERRED_DTE_MAX)).isoformat()
+    resolved_min_dte = max(min_dte if min_dte is not None else config.PREFERRED_DTE_MIN, 1)
+    resolved_max_dte = max_dte if max_dte is not None else config.PREFERRED_DTE_MAX
+    resolved_max_dte = max(resolved_max_dte, resolved_min_dte)
+    exp_gte = (today + timedelta(days=resolved_min_dte)).isoformat()
+    exp_lte = (today + timedelta(days=resolved_max_dte)).isoformat()
 
-    # Strike range: +/- 15% from current price
-    strike_gte = round(underlying_price * 0.85, 2)
-    strike_lte = round(underlying_price * 1.15, 2)
+    band_pct = strike_band_pct if strike_band_pct is not None else 0.15
+    band_pct = max(band_pct, 0.05)
+    strike_gte = round(underlying_price * max(0.05, 1.0 - band_pct), 2)
+    strike_lte = round(underlying_price * (1.0 + band_pct), 2)
 
     try:
         raw = alpaca.get_option_contracts(
@@ -136,7 +154,7 @@ def fetch_option_chain(
         except ValueError:
             continue
         dte = (exp_date - today).days
-        if dte < config.PREFERRED_DTE_MIN:
+        if dte < resolved_min_dte:
             continue
 
         contracts.append(
@@ -223,26 +241,52 @@ def select_contract(
     underlying_price: float,
     strike_preference: str = "atm",
     expiry_preference: str = "next_week",
+    contract_symbol: str | None = None,
+    target_delta: float | None = None,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
+    max_spread_pct: float | None = None,
 ) -> OptionContract | None:
     """Select the best contract based on moneyness, expiry, and quality."""
     if not contracts:
         return None
 
+    if contract_symbol:
+        exact_matches = [
+            c for c in contracts if c.symbol.upper() == contract_symbol.upper()
+        ]
+        return exact_matches[0] if exact_matches else None
+
+    candidates = list(contracts)
+    if min_dte is not None or max_dte is not None:
+        bounded = [
+            c for c in candidates
+            if (min_dte is None or c.dte >= min_dte)
+            and (max_dte is None or c.dte <= max_dte)
+        ]
+        if not bounded:
+            return None
+        candidates = bounded
+
+    if max_spread_pct is not None:
+        spread_filtered = [c for c in candidates if c.spread_pct <= max_spread_pct]
+        if not spread_filtered:
+            return None
+        candidates = spread_filtered
+
     if strike_preference == "itm":
         # For calls: strike < price. For puts: strike > price.
         # Sort by proximity to price, preferring ITM.
-        calls = [c for c in contracts if c.option_type == "call" and c.strike <= underlying_price]
-        puts = [c for c in contracts if c.option_type == "put" and c.strike >= underlying_price]
+        calls = [c for c in candidates if c.option_type == "call" and c.strike <= underlying_price]
+        puts = [c for c in candidates if c.option_type == "put" and c.strike >= underlying_price]
         candidates = calls + puts
     elif strike_preference == "otm":
-        calls = [c for c in contracts if c.option_type == "call" and c.strike >= underlying_price]
-        puts = [c for c in contracts if c.option_type == "put" and c.strike <= underlying_price]
+        calls = [c for c in candidates if c.option_type == "call" and c.strike >= underlying_price]
+        puts = [c for c in candidates if c.option_type == "put" and c.strike <= underlying_price]
         candidates = calls + puts
-    else:  # atm
-        candidates = list(contracts)
 
     if not candidates:
-        candidates = list(contracts)
+        return None
 
     target_dte = target_dte_for_expiry_preference(expiry_preference)
 
@@ -261,12 +305,16 @@ def select_contract(
         volume_penalty = 0.35 / (1.0 + min(contract.volume, 500) / 50.0)
         oi_penalty = 0.25 / (1.0 + min(contract.open_interest, 2000) / 200.0)
         dte_penalty = abs(contract.dte - target_dte) / 20.0
+        delta_penalty = 0.0
+        if target_delta is not None and underlying_price > 0:
+            delta_penalty = abs(absolute_delta(contract, underlying_price) - target_delta) * 4.0
         return (
             strike_penalty
             + spread_penalty
             + volume_penalty
             + oi_penalty
             + dte_penalty
+            + delta_penalty
         )
 
     candidates.sort(

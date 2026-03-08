@@ -95,21 +95,35 @@ def _execute_open_option(
         log(f"cannot get price for {underlying}")
         return ExecutionResult(False, underlying, None, 0, 0.0, "no price data")
 
-    chain = fetch_option_chain(alpaca, underlying, underlying_price, option_type=option_type)
+    chain = fetch_option_chain(
+        alpaca,
+        underlying,
+        underlying_price,
+        option_type=option_type,
+        min_dte=decision.min_dte,
+        max_dte=decision.max_dte,
+        strike_band_pct=0.35 if (decision.contract_symbol or decision.target_delta is not None) else None,
+    )
     if not chain:
         log(f"no suitable options for {underlying} {option_type}")
         return ExecutionResult(False, underlying, None, 0, 0.0, "no suitable contracts")
 
-    chain = _filter_by_expiry(chain, decision.expiry_preference)
-    if not chain:
-        log(f"no contracts matching expiry preference for {underlying}")
-        return ExecutionResult(False, underlying, None, 0, 0.0, "no matching expiry")
+    if not decision.contract_symbol and decision.min_dte is None and decision.max_dte is None:
+        chain = _filter_by_expiry(chain, decision.expiry_preference)
+        if not chain:
+            log(f"no contracts matching expiry preference for {underlying}")
+            return ExecutionResult(False, underlying, None, 0, 0.0, "no matching expiry")
 
     contract = select_contract(
         chain,
         underlying_price,
         decision.strike_preference,
         decision.expiry_preference,
+        contract_symbol=decision.contract_symbol,
+        target_delta=decision.target_delta,
+        min_dte=decision.min_dte,
+        max_dte=decision.max_dte,
+        max_spread_pct=decision.max_spread_pct,
     )
     if contract is None:
         log(f"no suitable contract selected for {underlying}")

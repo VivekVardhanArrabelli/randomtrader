@@ -100,6 +100,22 @@ def test_select_contract_monthly_prefers_more_appropriate_dte():
     assert result.symbol == "C150_30D"
 
 
+def test_select_contract_exact_symbol_overrides_bucket_heuristics():
+    contracts = [
+        _make_contract(symbol="C150", strike=150.0, dte=9),
+        _make_contract(symbol="C155", strike=155.0, dte=18),
+    ]
+    result = select_contract(
+        contracts,
+        underlying_price=150.0,
+        strike_preference="atm",
+        expiry_preference="next_week",
+        contract_symbol="C155",
+    )
+    assert result is not None
+    assert result.symbol == "C155"
+
+
 def test_select_contract_empty():
     result = select_contract([], underlying_price=150.0)
     assert result is None

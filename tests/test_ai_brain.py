@@ -13,10 +13,17 @@ def test_trade_decision_fields():
         risk_pct=0.20,
         reasoning="Strong earnings beat",
         target_symbol=None,
+        contract_symbol="AAPL250321C00150000",
+        target_delta=0.55,
+        min_dte=7,
+        max_dte=21,
+        max_spread_pct=0.12,
     )
     assert d.action == "buy_call"
     assert d.conviction == 0.85
     assert d.risk_pct <= 0.40
+    assert d.contract_symbol == "AAPL250321C00150000"
+    assert d.target_delta == 0.55
 
 
 def test_market_analysis_structure():
@@ -55,6 +62,11 @@ def test_trade_tool_schema():
     assert "thesis_updates" in schema["properties"]
     trade_props = schema["properties"]["trades"]["items"]["properties"]
     assert trade_props["risk_pct"]["maximum"] == 0.40
+    assert "contract_symbol" in trade_props
+    assert "target_delta" in trade_props
+    assert "min_dte" in trade_props
+    assert "max_dte" in trade_props
+    assert "max_spread_pct" in trade_props
 
 
 def test_system_prompt_contains_thesis_rules():
@@ -62,6 +74,7 @@ def test_system_prompt_contains_thesis_rules():
     assert "developing" in SYSTEM_PROMPT.lower()
     assert "invalidated" in SYSTEM_PROMPT.lower()
     assert "trade history" in SYSTEM_PROMPT.lower()
+    assert "clean, breaking catalysts" in SYSTEM_PROMPT.lower()
 
 
 def test_build_prompt_repeat_loser_instruction():

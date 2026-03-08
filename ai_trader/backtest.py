@@ -28,7 +28,7 @@ from .brain import MarketAnalysis, TradingBrain, TradeDecision
 from .db import format_trade_history
 from .journal import ThesisJournal
 from .news import NewsItem, build_news_events, classify_catalyst_reaction, format_news_for_llm
-from .options import target_dte_for_expiry_preference, target_strike_for_preference
+from .options import approx_delta, target_dte_for_expiry_preference, target_strike_for_preference
 from .risk import size_for_risk_budget
 from .utils import EASTERN_TZ, log, now_eastern
 
@@ -511,6 +511,11 @@ def _select_real_contract(
     strike_preference: str,
     expiry_preference: str,
     default_dte: int,
+    contract_symbol: str | None = None,
+    target_delta: float | None = None,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
+    max_spread_pct: float | None = None,
     cache: PolygonCache | None = None,
 ) -> dict | None:
     """Select a real Polygon option contract based on LLM preferences.
@@ -518,7 +523,13 @@ def _select_real_contract(
     Returns the contract dict from Polygon or None if nothing suitable found.
     """
     # Determine expiry range
-    if expiry_preference == "this_week":
+    if min_dte is not None or max_dte is not None:
+        resolved_min_dte = max(min_dte if min_dte is not None else config.PREFERRED_DTE_MIN, 1)
+        resolved_max_dte = max_dte if max_dte is not None else config.PREFERRED_DTE_MAX
+        resolved_max_dte = max(resolved_max_dte, resolved_min_dte)
+        expiry_gte = trade_date + timedelta(days=resolved_min_dte)
+        expiry_lte = trade_date + timedelta(days=resolved_max_dte)
+    elif expiry_preference == "this_week":
         days_until_friday = (4 - trade_date.weekday()) % 7
         if days_until_friday < 2:
             days_until_friday += 7
@@ -532,9 +543,9 @@ def _select_real_contract(
         expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
         expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
-    # Strike range: ±15% of spot
-    strike_gte = round(spot * 0.85, 2)
-    strike_lte = round(spot * 1.15, 2)
+    strike_band_pct = 0.35 if (contract_symbol or target_delta is not None) else 0.15
+    strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
+    strike_lte = round(spot * (1.0 + strike_band_pct), 2)
 
     contracts = fetch_polygon_option_contracts(
         api_key, underlying, option_type,
@@ -544,10 +555,34 @@ def _select_real_contract(
     if not contracts:
         return None
 
-    target_strike = target_strike_for_preference(spot, option_type, strike_preference)
-    target_dte = target_dte_for_expiry_preference(expiry_preference)
+    if contract_symbol:
+        exact = [c for c in contracts if str(c.get("ticker", "")).upper() == contract_symbol.upper()]
+        return exact[0] if exact else None
 
-    def _contract_score(contract: dict) -> tuple[float, int, float]:
+    if max_spread_pct is not None:
+        spread_filtered = []
+        for contract in contracts:
+            bid = float(contract.get("bid") or 0.0)
+            ask = float(contract.get("ask") or 0.0)
+            if ask <= 0 or bid < 0:
+                spread_filtered.append(contract)
+                continue
+            spread_pct = (ask - bid) / ask
+            if spread_pct <= max_spread_pct:
+                spread_filtered.append(contract)
+        if not spread_filtered:
+            return None
+        contracts = spread_filtered
+
+    target_strike = target_strike_for_preference(spot, option_type, strike_preference)
+    if min_dte is not None or max_dte is not None:
+        lower = min_dte if min_dte is not None else max(1, (max_dte or config.PREFERRED_DTE_MAX) - 7)
+        upper = max_dte if max_dte is not None else lower
+        target_dte = int((lower + upper) / 2)
+    else:
+        target_dte = target_dte_for_expiry_preference(expiry_preference)
+
+    def _contract_score(contract: dict) -> tuple[float, float, int, float]:
         strike = float(contract.get("strike_price", 0) or 0)
         expiry_raw = str(contract.get("expiration_date") or "")
         try:
@@ -557,7 +592,10 @@ def _select_real_contract(
             dte = target_dte
         strike_penalty = abs(strike - target_strike) / spot * 100 if spot > 0 else 0.0
         dte_penalty = abs(dte - target_dte)
-        return (strike_penalty, dte_penalty, dte)
+        delta_penalty = 0.0
+        if target_delta is not None and strike > 0 and spot > 0:
+            delta_penalty = abs(abs(approx_delta(strike, spot, max(dte, 1), option_type)) - target_delta)
+        return (delta_penalty, strike_penalty, dte_penalty, dte)
 
     best = min(contracts, key=_contract_score)
     return best
@@ -1724,6 +1762,11 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     decision.strike_preference or "atm",
                     decision.expiry_preference or "next_week",
                     bt_config.default_dte,
+                    contract_symbol=decision.contract_symbol,
+                    target_delta=decision.target_delta,
+                    min_dte=decision.min_dte,
+                    max_dte=decision.max_dte,
+                    max_spread_pct=decision.max_spread_pct,
                     cache=cache,
                 )
                 if contract is None:
