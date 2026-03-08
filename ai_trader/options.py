@@ -30,6 +30,26 @@ def approx_delta(strike: float, spot: float, dte: int, option_type: str) -> floa
     return round(call_delta, 2)
 
 
+def target_strike_for_preference(
+    underlying_price: float,
+    option_type: str,
+    strike_preference: str,
+) -> float:
+    if strike_preference == "otm":
+        return underlying_price * (1.03 if option_type == "call" else 0.97)
+    if strike_preference == "itm":
+        return underlying_price * (0.97 if option_type == "call" else 1.03)
+    return underlying_price
+
+
+def target_dte_for_expiry_preference(expiry_preference: str) -> int:
+    if expiry_preference == "this_week":
+        return 4
+    if expiry_preference == "monthly":
+        return 25
+    return 9
+
+
 @dataclass(frozen=True)
 class OptionContract:
     symbol: str               # OCC symbol e.g. AAPL250321C00150000
@@ -202,8 +222,9 @@ def select_contract(
     contracts: list[OptionContract],
     underlying_price: float,
     strike_preference: str = "atm",
+    expiry_preference: str = "next_week",
 ) -> OptionContract | None:
-    """Select the best contract based on strike preference."""
+    """Select the best contract based on moneyness, expiry, and quality."""
     if not contracts:
         return None
 
@@ -223,9 +244,39 @@ def select_contract(
     if not candidates:
         candidates = list(contracts)
 
-    # Sort by distance from ATM, then by DTE (prefer sooner but not too soon)
+    target_dte = target_dte_for_expiry_preference(expiry_preference)
+
+    def _selection_score(contract: OptionContract) -> float:
+        target_strike = target_strike_for_preference(
+            underlying_price,
+            contract.option_type,
+            strike_preference,
+        )
+        strike_penalty = (
+            abs(contract.strike - target_strike) / underlying_price * 100
+            if underlying_price > 0
+            else 0.0
+        )
+        spread_penalty = contract.spread_pct * 4.0
+        volume_penalty = 0.35 / (1.0 + min(contract.volume, 500) / 50.0)
+        oi_penalty = 0.25 / (1.0 + min(contract.open_interest, 2000) / 200.0)
+        dte_penalty = abs(contract.dte - target_dte) / 20.0
+        return (
+            strike_penalty
+            + spread_penalty
+            + volume_penalty
+            + oi_penalty
+            + dte_penalty
+        )
+
     candidates.sort(
-        key=lambda c: (abs(c.strike - underlying_price) / underlying_price, c.dte)
+        key=lambda c: (
+            _selection_score(c),
+            c.spread_pct,
+            -c.volume,
+            -c.open_interest,
+            c.dte,
+        )
     )
     return candidates[0] if candidates else None
 

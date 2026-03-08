@@ -345,6 +345,25 @@ def merge_news_items(
     return deduped
 
 
+def classify_catalyst_reaction(
+    age_minutes: int,
+    intraday_chg: float,
+    five_d_chg: float,
+) -> str:
+    """Classify whether a catalyst still looks early or already extended."""
+    move_size = abs(intraday_chg)
+    multi_day_move = abs(five_d_chg)
+    if move_size < 0.75:
+        return "not_moving_yet"
+    if age_minutes <= 30 and move_size <= 1.5:
+        return "early_move"
+    if age_minutes <= 120 and move_size <= 3.0:
+        return "developing_move"
+    if move_size >= 4.0 or (age_minutes >= 60 and move_size >= 2.5 and multi_day_move >= 5.0):
+        return "extended_move"
+    return "active_move"
+
+
 def expand_symbols_with_relationships(
     symbols: list[str],
     events: list[NewsEvent] | None = None,

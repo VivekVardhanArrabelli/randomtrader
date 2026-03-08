@@ -29,6 +29,7 @@ from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
 from .news import (
     build_news_events,
+    classify_catalyst_reaction,
     expand_symbols_with_relationships,
     fetch_news,
     fetch_targeted_news,
@@ -188,11 +189,21 @@ def _get_market_context(alpaca: AlpacaClient) -> str:
 
 
 def _get_ticker_trend(alpaca: AlpacaClient, symbol: str) -> str | None:
-    """Build a compact price trend string for a single ticker.
+    metrics = _get_ticker_trend_metrics(alpaca, symbol)
+    if not metrics:
+        return None
 
-    Returns something like: spot=$140.00 today(-1.5%) 5d(+8.2%) 10d(+12.1%) hi/lo=$145/$125
-    Returns None if no data available.
-    """
+    return (
+        f"spot=${metrics['price']:.2f}"
+        f" today({metrics['intraday_chg']:+.1f}%)"
+        f" 5d({metrics['five_d_chg']:+.1f}%)"
+        f" 10d({metrics['ten_d_chg']:+.1f}%)"
+        f" hi/lo=${metrics['high']:.0f}/${metrics['low']:.0f}"
+    )
+
+
+def _get_ticker_trend_metrics(alpaca: AlpacaClient, symbol: str) -> dict | None:
+    """Return daily trend metrics for a single ticker."""
     today = now_eastern().date()
     start = (today - timedelta(days=18)).isoformat()
     try:
@@ -203,14 +214,40 @@ def _get_ticker_trend(alpaca: AlpacaClient, symbol: str) -> str | None:
     t = _compute_bar_trends(bars)
     if not t:
         return None
+    return t
 
-    return (
-        f"spot=${t['price']:.2f}"
-        f" today({t['intraday_chg']:+.1f}%)"
-        f" 5d({t['five_d_chg']:+.1f}%)"
-        f" 10d({t['ten_d_chg']:+.1f}%)"
-        f" hi/lo=${t['high']:.0f}/${t['low']:.0f}"
-    )
+
+def _build_catalyst_reaction_context(
+    alpaca: AlpacaClient,
+    news_events: list,
+    max_events: int = 5,
+) -> str:
+    lines = ["Catalyst Reaction Snapshot:"]
+    seen: set[str] = set()
+    for event in news_events:
+        symbol = next((sym.upper() for sym in event.symbols if sym), "")
+        if not symbol or symbol in seen:
+            continue
+        metrics = _get_ticker_trend_metrics(alpaca, symbol)
+        if not metrics:
+            continue
+        reaction = classify_catalyst_reaction(
+            event.age_minutes,
+            metrics["intraday_chg"],
+            metrics["five_d_chg"],
+        )
+        lines.append(
+            f"  {symbol}: event={event.event_type}/{event.freshness}"
+            f" age={event.age_minutes}m"
+            f" today({metrics['intraday_chg']:+.1f}%)"
+            f" 5d({metrics['five_d_chg']:+.1f}%)"
+            f" trend={metrics['trend']}"
+            f" reaction={reaction}"
+        )
+        seen.add(symbol)
+        if len(seen) >= max_events:
+            break
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _get_options_context(
@@ -421,6 +458,9 @@ def run_cycle(
         focus_symbols=focus_symbols,
         reference_time=cycle_time,
     )
+    catalyst_reaction_context = _build_catalyst_reaction_context(alpaca, news_events)
+    if catalyst_reaction_context:
+        news_context = f"{catalyst_reaction_context}\n\n{news_context}"
 
     # 6. Get market context
     market_context = _get_market_context(alpaca)

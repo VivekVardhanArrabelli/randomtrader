@@ -5,6 +5,7 @@ from ai_trader.news import (
     NewsItem,
     build_news_events,
     build_relationship_briefs,
+    classify_catalyst_reaction,
     expand_symbols_with_relationships,
     format_news_for_llm,
     merge_news_items,
@@ -168,6 +169,12 @@ def test_merge_news_items_dedupes_cross_query_duplicates():
     assert len(merged) == 2
     assert merged[0].source == "Bloomberg"
     assert merged[1].source == "Reuters"
+
+
+def test_classify_catalyst_reaction_distinguishes_early_vs_extended():
+    assert classify_catalyst_reaction(15, 0.8, 1.2) == "early_move"
+    assert classify_catalyst_reaction(90, 4.5, 6.0) == "extended_move"
+    assert classify_catalyst_reaction(45, 0.2, 0.8) == "not_moving_yet"
 
 
 def test_format_news_for_llm_outputs_structured_and_raw_sections(monkeypatch):

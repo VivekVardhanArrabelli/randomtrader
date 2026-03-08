@@ -54,6 +54,52 @@ def test_select_contract_otm_call():
     assert result.strike >= 150.0
 
 
+def test_select_contract_prefers_quality_when_strikes_are_close():
+    contracts = [
+        _make_contract(
+            strike=150.0,
+            symbol="C150_BAD",
+            bid=4.30,
+            ask=5.00,
+            volume=10,
+            open_interest=50,
+            dte=9,
+        ),
+        _make_contract(
+            strike=151.0,
+            symbol="C151_GOOD",
+            bid=4.90,
+            ask=5.00,
+            volume=400,
+            open_interest=2000,
+            dte=9,
+        ),
+    ]
+    result = select_contract(
+        contracts,
+        underlying_price=150.0,
+        strike_preference="atm",
+        expiry_preference="next_week",
+    )
+    assert result is not None
+    assert result.symbol == "C151_GOOD"
+
+
+def test_select_contract_monthly_prefers_more_appropriate_dte():
+    contracts = [
+        _make_contract(symbol="C150_14D", strike=150.0, dte=14),
+        _make_contract(symbol="C150_30D", strike=150.0, dte=30),
+    ]
+    result = select_contract(
+        contracts,
+        underlying_price=150.0,
+        strike_preference="atm",
+        expiry_preference="monthly",
+    )
+    assert result is not None
+    assert result.symbol == "C150_30D"
+
+
 def test_select_contract_empty():
     result = select_contract([], underlying_price=150.0)
     assert result is None

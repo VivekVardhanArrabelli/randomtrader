@@ -27,7 +27,8 @@ from . import config
 from .brain import MarketAnalysis, TradingBrain, TradeDecision
 from .db import format_trade_history
 from .journal import ThesisJournal
-from .news import NewsItem, format_news_for_llm
+from .news import NewsItem, build_news_events, classify_catalyst_reaction, format_news_for_llm
+from .options import target_dte_for_expiry_preference, target_strike_for_preference
 from .risk import size_for_risk_budget
 from .utils import EASTERN_TZ, log, now_eastern
 
@@ -543,25 +544,22 @@ def _select_real_contract(
     if not contracts:
         return None
 
-    # Determine target strike
-    if strike_preference == "atm":
-        target_strike = spot
-    elif strike_preference == "otm":
-        if option_type == "call":
-            target_strike = spot * 1.03
-        else:
-            target_strike = spot * 0.97
-    else:  # itm
-        if option_type == "call":
-            target_strike = spot * 0.97
-        else:
-            target_strike = spot * 1.03
+    target_strike = target_strike_for_preference(spot, option_type, strike_preference)
+    target_dte = target_dte_for_expiry_preference(expiry_preference)
 
-    # Pick closest contract to target strike
-    best = min(
-        contracts,
-        key=lambda c: abs(c.get("strike_price", 0) - target_strike),
-    )
+    def _contract_score(contract: dict) -> tuple[float, int, float]:
+        strike = float(contract.get("strike_price", 0) or 0)
+        expiry_raw = str(contract.get("expiration_date") or "")
+        try:
+            expiry = date.fromisoformat(expiry_raw)
+            dte = max((expiry - trade_date).days, 0)
+        except ValueError:
+            dte = target_dte
+        strike_penalty = abs(strike - target_strike) / spot * 100 if spot > 0 else 0.0
+        dte_penalty = abs(dte - target_dte)
+        return (strike_penalty, dte_penalty, dte)
+
+    best = min(contracts, key=_contract_score)
     return best
 
 
@@ -721,6 +719,18 @@ def _format_news_for_backtest(
     focus_symbols: list[str] | None = None,
     reference_time: datetime | None = None,
 ) -> str:
+    items = _news_items_from_backtest_articles(articles, reference_time=reference_time)
+    return format_news_for_llm(
+        items,
+        focus_symbols=focus_symbols,
+        reference_time=reference_time,
+    )
+
+
+def _news_items_from_backtest_articles(
+    articles: list[dict],
+    reference_time: datetime | None = None,
+) -> list[NewsItem]:
     items: list[NewsItem] = []
     for article in articles:
         published_raw = article.get("published_utc", "")
@@ -738,11 +748,7 @@ def _format_news_for_backtest(
                 url=article.get("article_url") or "",
             )
         )
-    return format_news_for_llm(
-        items,
-        focus_symbols=focus_symbols,
-        reference_time=reference_time,
-    )
+    return items
 
 
 def _build_performance_summary(
@@ -928,19 +934,48 @@ def _build_ticker_price_context(
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
 ) -> tuple[str | None, float]:
-    """Build price trend context for a single ticker as of a timestamp.
+    """Build price trend context for a single ticker as of a timestamp."""
+    metrics = _ticker_price_metrics_as_of(
+        api_key,
+        ticker,
+        as_of,
+        lookback_days=lookback_days,
+        cache=cache,
+        bar_minutes=bar_minutes,
+    )
+    if not metrics:
+        return None, 0.0
 
-    Returns (context_string, spot_price).  context_string looks like:
-      spot=$140.00 today(-1.5%) 5d(+8.2%) 10d(+12.1%) hi/lo=$145/$125
-    Returns (None, 0.0) if no data available.
-    """
+    ctx = (
+        f"spot=${metrics['price']:.2f}"
+        f" {'now' if metrics['is_intraday'] else 'today'}({metrics['intraday_chg']:+.1f}%)"
+        f" 5d({metrics['five_d_chg']:+.1f}%)"
+        f" 10d({metrics['ten_d_chg']:+.1f}%)"
+        f" {'session' if metrics['is_intraday'] else 'hi/lo'}=${metrics['session_low']:.0f}/${metrics['session_high']:.0f}"
+    )
+    if metrics["is_intraday"]:
+        ctx += (
+            f" 10d_hi/lo=${metrics['recent_high']:.0f}/{metrics['recent_low']:.0f}"
+        )
+    return ctx, metrics["price"]
+
+
+def _ticker_price_metrics_as_of(
+    api_key: str,
+    ticker: str,
+    as_of: date | datetime,
+    lookback_days: int = 10,
+    cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
+) -> dict | None:
+    """Return price/trend metrics for a ticker using only info available at as_of."""
     is_intraday = isinstance(as_of, datetime)
     as_of_dt = _coerce_eastern_datetime(as_of)
     last_completed_day = _last_completed_trading_day(as_of_dt)
     start = last_completed_day - timedelta(days=int(lookback_days * 1.8))
     bars = fetch_historical_daily_bars_range(api_key, ticker, start, last_completed_day)
     if not bars:
-        return None, 0.0
+        return None
 
     current_price = float(bars[-1].get("c", 0))
     intraday_chg = 0.0
@@ -973,7 +1008,7 @@ def _build_ticker_price_context(
         session_low = float(today_bar.get("l", current_price) or current_price)
 
     if current_price <= 0:
-        return None, 0.0
+        return None
 
     five_d_chg = 0.0
     if len(bars) >= 6:
@@ -993,17 +1028,63 @@ def _build_ticker_price_context(
     if not is_intraday:
         session_high = recent_high
         session_low = recent_low
+    trend = "up" if current_price >= (
+        sum(float(b.get("c", 0)) for b in recent_bars) / len(recent_bars)
+    ) else "down"
+    return {
+        "price": current_price,
+        "intraday_chg": intraday_chg,
+        "five_d_chg": five_d_chg,
+        "ten_d_chg": ten_d_chg,
+        "session_high": session_high,
+        "session_low": session_low,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "trend": trend,
+        "is_intraday": is_intraday,
+    }
 
-    ctx = (
-        f"spot=${current_price:.2f}"
-        f" {'now' if is_intraday else 'today'}({intraday_chg:+.1f}%)"
-        f" 5d({five_d_chg:+.1f}%)"
-        f" 10d({ten_d_chg:+.1f}%)"
-        f" {'session' if is_intraday else 'hi/lo'}=${session_low:.0f}/${session_high:.0f}"
-    )
-    if is_intraday:
-        ctx += f" 10d_hi/lo=${recent_high:.0f}/${recent_low:.0f}"
-    return ctx, current_price
+
+def _build_catalyst_reaction_context(
+    api_key: str,
+    news_events: list,
+    as_of: date | datetime,
+    cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
+    max_events: int = 5,
+) -> str:
+    lines = ["Catalyst Reaction Snapshot:"]
+    seen: set[str] = set()
+    for event in news_events:
+        symbol = next((sym.upper() for sym in event.symbols if sym), "")
+        if not symbol or symbol in seen:
+            continue
+        metrics = _ticker_price_metrics_as_of(
+            api_key,
+            symbol,
+            as_of,
+            cache=cache,
+            bar_minutes=bar_minutes,
+        )
+        if not metrics:
+            continue
+        reaction = classify_catalyst_reaction(
+            event.age_minutes,
+            metrics["intraday_chg"],
+            metrics["five_d_chg"],
+        )
+        lines.append(
+            f"  {symbol}: event={event.event_type}/{event.freshness}"
+            f" age={event.age_minutes}m"
+            f" now({metrics['intraday_chg']:+.1f}%)"
+            f" 5d({metrics['five_d_chg']:+.1f}%)"
+            f" trend={metrics['trend']}"
+            f" reaction={reaction}"
+        )
+        seen.add(symbol)
+        if len(seen) >= max_events:
+            break
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _annotate_closed_trades(
@@ -1435,11 +1516,25 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             context_focus_symbols = [p.underlying for p in positions]
             if journal:
                 context_focus_symbols.extend(entry.underlying for entry in journal.active_entries())
+            news_items = _news_items_from_backtest_articles(
+                news,
+                reference_time=decision_time,
+            )
+            news_events = build_news_events(news_items, reference_time=decision_time)
             news_context = _format_news_for_backtest(
                 news,
                 focus_symbols=list(dict.fromkeys(context_focus_symbols)),
                 reference_time=decision_time,
             )
+            catalyst_reaction_context = _build_catalyst_reaction_context(
+                polygon_key,
+                news_events,
+                decision_time,
+                cache=cache,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+            if catalyst_reaction_context:
+                news_context = f"{catalyst_reaction_context}\n\n{news_context}"
 
             market_context = _build_market_trend_context(
                 polygon_key,

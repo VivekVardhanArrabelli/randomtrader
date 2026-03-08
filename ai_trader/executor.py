@@ -105,7 +105,12 @@ def _execute_open_option(
         log(f"no contracts matching expiry preference for {underlying}")
         return ExecutionResult(False, underlying, None, 0, 0.0, "no matching expiry")
 
-    contract = select_contract(chain, underlying_price, decision.strike_preference)
+    contract = select_contract(
+        chain,
+        underlying_price,
+        decision.strike_preference,
+        decision.expiry_preference,
+    )
     if contract is None:
         log(f"no suitable contract selected for {underlying}")
         return ExecutionResult(False, underlying, None, 0, 0.0, "no suitable contract")

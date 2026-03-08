@@ -146,6 +146,14 @@ You receive both raw headlines and a structured event map.
 - Fresh, multi-source events deserve more attention than stale echoes of the
   same story.
 
+ENTRY TIMING:
+You may also receive a catalyst reaction snapshot that links event age to the
+current price move.
+- Fresh catalyst + small move can still be early.
+- Older catalyst + large same-day move can already be priced in.
+- When a move already looks extended, raise the bar for entry. Prefer a laggard,
+  a sector expression, a better expiry/strike, or no trade at all.
+
 WHEN NOT TO TRADE:
 - Unclear or mixed signals
 - Low-volume, illiquid names
