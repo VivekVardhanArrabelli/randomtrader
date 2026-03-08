@@ -100,15 +100,27 @@ def _execute_open_option(
         underlying,
         underlying_price,
         option_type=option_type,
-        min_dte=decision.min_dte,
-        max_dte=decision.max_dte,
-        strike_band_pct=0.35 if (decision.contract_symbol or decision.target_delta is not None) else None,
+        min_dte=(
+            decision.target_dte_range[0]
+            if decision.target_dte_range is not None
+            else None
+        ),
+        max_dte=(
+            decision.target_dte_range[1]
+            if decision.target_dte_range is not None
+            else None
+        ),
+        strike_band_pct=(
+            0.35
+            if (decision.contract_symbol or decision.target_delta_range is not None)
+            else None
+        ),
     )
     if not chain:
         log(f"no suitable options for {underlying} {option_type}")
         return ExecutionResult(False, underlying, None, 0, 0.0, "no suitable contracts")
 
-    if not decision.contract_symbol and decision.min_dte is None and decision.max_dte is None:
+    if not decision.contract_symbol and decision.target_dte_range is None:
         chain = _filter_by_expiry(chain, decision.expiry_preference)
         if not chain:
             log(f"no contracts matching expiry preference for {underlying}")
@@ -120,9 +132,8 @@ def _execute_open_option(
         decision.strike_preference,
         decision.expiry_preference,
         contract_symbol=decision.contract_symbol,
-        target_delta=decision.target_delta,
-        min_dte=decision.min_dte,
-        max_dte=decision.max_dte,
+        target_delta_range=decision.target_delta_range,
+        target_dte_range=decision.target_dte_range,
         max_spread_pct=decision.max_spread_pct,
     )
     if contract is None:

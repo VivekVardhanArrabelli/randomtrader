@@ -61,6 +61,35 @@ def absolute_delta(contract: "OptionContract", underlying_price: float) -> float
     )
 
 
+def _normalize_float_range(
+    value_range: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    if value_range is None:
+        return None
+    low, high = value_range
+    return (min(low, high), max(low, high))
+
+
+def _normalize_int_range(
+    value_range: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    if value_range is None:
+        return None
+    low, high = value_range
+    return (min(low, high), max(low, high))
+
+
+def _distance_to_range(value: float, value_range: tuple[float, float] | None) -> float:
+    if value_range is None:
+        return 0.0
+    low, high = value_range
+    if value < low:
+        return low - value
+    if value > high:
+        return value - high
+    return 0.0
+
+
 @dataclass(frozen=True)
 class OptionContract:
     symbol: str               # OCC symbol e.g. AAPL250321C00150000
@@ -242,36 +271,60 @@ def select_contract(
     strike_preference: str = "atm",
     expiry_preference: str = "next_week",
     contract_symbol: str | None = None,
-    target_delta: float | None = None,
-    min_dte: int | None = None,
-    max_dte: int | None = None,
+    target_delta_range: tuple[float, float] | None = None,
+    target_dte_range: tuple[int, int] | None = None,
     max_spread_pct: float | None = None,
 ) -> OptionContract | None:
-    """Select the best contract based on moneyness, expiry, and quality."""
+    ranked = rank_contracts(
+        contracts,
+        underlying_price,
+        strike_preference=strike_preference,
+        expiry_preference=expiry_preference,
+        contract_symbol=contract_symbol,
+        target_delta_range=target_delta_range,
+        target_dte_range=target_dte_range,
+        max_spread_pct=max_spread_pct,
+    )
+    return ranked[0] if ranked else None
+
+
+def rank_contracts(
+    contracts: list[OptionContract],
+    underlying_price: float,
+    strike_preference: str = "atm",
+    expiry_preference: str = "next_week",
+    contract_symbol: str | None = None,
+    target_delta_range: tuple[float, float] | None = None,
+    target_dte_range: tuple[int, int] | None = None,
+    max_spread_pct: float | None = None,
+) -> list[OptionContract]:
+    """Rank contracts by fit and quality, preserving exact-symbol override."""
     if not contracts:
-        return None
+        return []
 
     if contract_symbol:
         exact_matches = [
             c for c in contracts if c.symbol.upper() == contract_symbol.upper()
         ]
-        return exact_matches[0] if exact_matches else None
+        return exact_matches[:1]
 
     candidates = list(contracts)
-    if min_dte is not None or max_dte is not None:
+    normalized_delta_range = _normalize_float_range(target_delta_range)
+    normalized_dte_range = _normalize_int_range(target_dte_range)
+    if normalized_dte_range is not None:
+        min_dte, max_dte = normalized_dte_range
         bounded = [
             c for c in candidates
-            if (min_dte is None or c.dte >= min_dte)
-            and (max_dte is None or c.dte <= max_dte)
+            if min_dte <= c.dte <= max_dte
         ]
         if not bounded:
-            return None
+            return []
         candidates = bounded
 
     if max_spread_pct is not None:
         spread_filtered = [c for c in candidates if c.spread_pct <= max_spread_pct]
         if not spread_filtered:
-            return None
+            return []
         candidates = spread_filtered
 
     if strike_preference == "itm":
@@ -286,9 +339,12 @@ def select_contract(
         candidates = calls + puts
 
     if not candidates:
-        return None
+        return []
 
-    target_dte = target_dte_for_expiry_preference(expiry_preference)
+    if normalized_dte_range is not None:
+        target_dte = (normalized_dte_range[0] + normalized_dte_range[1]) / 2
+    else:
+        target_dte = target_dte_for_expiry_preference(expiry_preference)
 
     def _selection_score(contract: OptionContract) -> float:
         target_strike = target_strike_for_preference(
@@ -304,10 +360,15 @@ def select_contract(
         spread_penalty = contract.spread_pct * 4.0
         volume_penalty = 0.35 / (1.0 + min(contract.volume, 500) / 50.0)
         oi_penalty = 0.25 / (1.0 + min(contract.open_interest, 2000) / 200.0)
-        dte_penalty = abs(contract.dte - target_dte) / 20.0
+        dte_penalty = _distance_to_range(contract.dte, normalized_dte_range) / 10.0
+        if normalized_dte_range is None:
+            dte_penalty = abs(contract.dte - target_dte) / 20.0
         delta_penalty = 0.0
-        if target_delta is not None and underlying_price > 0:
-            delta_penalty = abs(absolute_delta(contract, underlying_price) - target_delta) * 4.0
+        if normalized_delta_range is not None and underlying_price > 0:
+            delta_penalty = _distance_to_range(
+                absolute_delta(contract, underlying_price),
+                normalized_delta_range,
+            ) * 4.0
         return (
             strike_penalty
             + spread_penalty
@@ -326,7 +387,25 @@ def select_contract(
             c.dte,
         )
     )
-    return candidates[0] if candidates else None
+    return candidates
+
+
+def shortlist_contracts(
+    contracts: list[OptionContract],
+    underlying_price: float,
+    per_type: int = 3,
+) -> dict[str, list[OptionContract]]:
+    shortlists: dict[str, list[OptionContract]] = {"call": [], "put": []}
+    for option_type in ("call", "put"):
+        typed_contracts = [c for c in contracts if c.option_type == option_type]
+        ranked = rank_contracts(
+            typed_contracts,
+            underlying_price,
+            strike_preference="atm",
+            expiry_preference="next_week",
+        )
+        shortlists[option_type] = ranked[:per_type]
+    return shortlists
 
 
 def format_chain_for_llm(
@@ -336,5 +415,17 @@ def format_chain_for_llm(
 ) -> str:
     if not contracts:
         return "No options contracts available."
-    lines = [c.to_context_str(underlying_price) for c in contracts[:max_contracts]]
+    lines: list[str] = []
+    shortlists = shortlist_contracts(contracts, underlying_price, per_type=3)
+    if any(shortlists.values()):
+        lines.append("Suggested contract shortlist:")
+        for option_type, label in (("call", "Calls"), ("put", "Puts")):
+            ranked = shortlists[option_type]
+            if not ranked:
+                continue
+            lines.append(f"  {label}:")
+            for index, contract in enumerate(ranked, start=1):
+                lines.append(f"    {index}. {contract.to_context_str(underlying_price)}")
+        lines.append("--- Full filtered chain ---")
+    lines.extend(c.to_context_str(underlying_price) for c in contracts[:max_contracts])
     return "\n".join(lines)

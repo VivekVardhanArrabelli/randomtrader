@@ -28,7 +28,11 @@ from .brain import MarketAnalysis, TradingBrain, TradeDecision
 from .db import format_trade_history
 from .journal import ThesisJournal
 from .news import NewsItem, build_news_events, classify_catalyst_reaction, format_news_for_llm
-from .options import approx_delta, target_dte_for_expiry_preference, target_strike_for_preference
+from .options import (
+    approx_delta,
+    target_dte_for_expiry_preference,
+    target_strike_for_preference,
+)
 from .risk import size_for_risk_budget
 from .utils import EASTERN_TZ, log, now_eastern
 
@@ -512,9 +516,8 @@ def _select_real_contract(
     expiry_preference: str,
     default_dte: int,
     contract_symbol: str | None = None,
-    target_delta: float | None = None,
-    min_dte: int | None = None,
-    max_dte: int | None = None,
+    target_delta_range: tuple[float, float] | None = None,
+    target_dte_range: tuple[int, int] | None = None,
     max_spread_pct: float | None = None,
     cache: PolygonCache | None = None,
 ) -> dict | None:
@@ -523,9 +526,9 @@ def _select_real_contract(
     Returns the contract dict from Polygon or None if nothing suitable found.
     """
     # Determine expiry range
-    if min_dte is not None or max_dte is not None:
-        resolved_min_dte = max(min_dte if min_dte is not None else config.PREFERRED_DTE_MIN, 1)
-        resolved_max_dte = max_dte if max_dte is not None else config.PREFERRED_DTE_MAX
+    if target_dte_range is not None:
+        resolved_min_dte = max(min(target_dte_range), 1)
+        resolved_max_dte = max(target_dte_range)
         resolved_max_dte = max(resolved_max_dte, resolved_min_dte)
         expiry_gte = trade_date + timedelta(days=resolved_min_dte)
         expiry_lte = trade_date + timedelta(days=resolved_max_dte)
@@ -543,7 +546,7 @@ def _select_real_contract(
         expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
         expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
-    strike_band_pct = 0.35 if (contract_symbol or target_delta is not None) else 0.15
+    strike_band_pct = 0.35 if (contract_symbol or target_delta_range is not None) else 0.15
     strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
     strike_lte = round(spot * (1.0 + strike_band_pct), 2)
 
@@ -575,9 +578,9 @@ def _select_real_contract(
         contracts = spread_filtered
 
     target_strike = target_strike_for_preference(spot, option_type, strike_preference)
-    if min_dte is not None or max_dte is not None:
-        lower = min_dte if min_dte is not None else max(1, (max_dte or config.PREFERRED_DTE_MAX) - 7)
-        upper = max_dte if max_dte is not None else lower
+    if target_dte_range is not None:
+        lower = min(target_dte_range)
+        upper = max(target_dte_range)
         target_dte = int((lower + upper) / 2)
     else:
         target_dte = target_dte_for_expiry_preference(expiry_preference)
@@ -593,8 +596,13 @@ def _select_real_contract(
         strike_penalty = abs(strike - target_strike) / spot * 100 if spot > 0 else 0.0
         dte_penalty = abs(dte - target_dte)
         delta_penalty = 0.0
-        if target_delta is not None and strike > 0 and spot > 0:
-            delta_penalty = abs(abs(approx_delta(strike, spot, max(dte, 1), option_type)) - target_delta)
+        if target_delta_range is not None and strike > 0 and spot > 0:
+            delta = abs(approx_delta(strike, spot, max(dte, 1), option_type))
+            low, high = (min(target_delta_range), max(target_delta_range))
+            if delta < low:
+                delta_penalty = low - delta
+            elif delta > high:
+                delta_penalty = delta - high
         return (delta_penalty, strike_penalty, dte_penalty, dte)
 
     best = min(contracts, key=_contract_score)
@@ -1240,7 +1248,7 @@ def _build_options_context(
 ) -> str:
     """Build a real options context string for the most-discussed tickers.
 
-    For each ticker: fetch spot price, find ATM call+put contracts,
+    For each ticker: fetch spot price, build a call/put shortlist,
     and show the latest premium available before as_of.
     """
     if not tickers:
@@ -1287,41 +1295,64 @@ def _build_options_context(
             )
             if not contracts:
                 continue
-            # Pick ATM contract
-            best = min(contracts, key=lambda c: abs(c.get("strike_price", 0) - spot))
-            opt_ticker = best.get("ticker", "")
-            strike = best.get("strike_price", 0)
-            expiry = best.get("expiration_date", "")
-            if not opt_ticker:
-                continue
-
-            session_bars = _session_intraday_bars_before(
-                api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
-            )
-            if session_bars:
-                opt_bar = session_bars[-1]
-                premium = _option_bar_price(opt_bar)
-                vol = sum(int(b.get("v") or 0) for b in session_bars)
-                lows = [float(b.get("l", 0)) for b in session_bars if float(b.get("l", 0)) > 0]
-                highs = [float(b.get("h", 0)) for b in session_bars if float(b.get("h", 0)) > 0]
-                session_range = (
-                    f" session_range=${min(lows):.2f}-${max(highs):.2f}"
-                    if lows and highs else ""
+            def _shortlist_key(contract: dict) -> tuple[float, int]:
+                strike = float(contract.get("strike_price", 0) or 0)
+                expiry_raw = str(contract.get("expiration_date") or "")
+                try:
+                    expiry = date.fromisoformat(expiry_raw)
+                    dte = max((expiry - trade_date).days, 0)
+                except ValueError:
+                    dte = default_dte
+                return (
+                    abs(strike - spot),
+                    abs(dte - default_dte),
                 )
-            else:
-                opt_bar = fetch_option_daily_bar(api_key, opt_ticker, trade_date, cache=cache)
-                premium = _option_bar_price(opt_bar) if opt_bar else 0
-                vol = int(opt_bar.get("v", 0)) if opt_bar else 0
-                session_range = ""
+            ranked_contracts = sorted(
+                contracts,
+                key=_shortlist_key,
+            )[:3]
+            if ranked_contracts:
+                lines.append(f"    {opt_type.upper()} shortlist:")
+            for best in ranked_contracts:
+                opt_ticker = best.get("ticker", "")
+                strike = float(best.get("strike_price", 0) or 0)
+                expiry = str(best.get("expiration_date") or "")
+                if not opt_ticker or strike <= 0:
+                    continue
 
-            if premium > 0:
-                bar_time = _bar_timestamp_eastern(opt_bar) if opt_bar else None
-                bar_label = f" asof={bar_time.strftime('%H:%M')}" if bar_time else ""
-                lines.append(
-                    f"    {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
-                    f" premium=${premium:.2f} vol={vol}{session_range}{bar_label}"
+                session_bars = _session_intraday_bars_before(
+                    api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
                 )
-                found_any = True
+                if session_bars:
+                    opt_bar = session_bars[-1]
+                    premium = _option_bar_price(opt_bar)
+                    vol = sum(int(b.get("v") or 0) for b in session_bars)
+                    lows = [float(b.get("l", 0)) for b in session_bars if float(b.get("l", 0)) > 0]
+                    highs = [float(b.get("h", 0)) for b in session_bars if float(b.get("h", 0)) > 0]
+                    session_range = (
+                        f" session_range=${min(lows):.2f}-${max(highs):.2f}"
+                        if lows and highs else ""
+                    )
+                else:
+                    opt_bar = fetch_option_daily_bar(api_key, opt_ticker, trade_date, cache=cache)
+                    premium = _option_bar_price(opt_bar) if opt_bar else 0
+                    vol = int(opt_bar.get("v", 0)) if opt_bar else 0
+                    session_range = ""
+
+                if premium > 0:
+                    dte = default_dte
+                    try:
+                        dte = max((date.fromisoformat(expiry) - trade_date).days, 0)
+                    except ValueError:
+                        pass
+                    delta = abs(approx_delta(strike, spot, max(dte, 1), opt_type))
+                    bar_time = _bar_timestamp_eastern(opt_bar) if opt_bar else None
+                    bar_label = f" asof={bar_time.strftime('%H:%M')}" if bar_time else ""
+                    lines.append(
+                        f"      {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
+                        f" delta~{delta:.2f} premium=${premium:.2f} vol={vol}{session_range}{bar_label}"
+                    )
+                    found_any = True
 
         # Rate limit between tickers (range bars + contract lookups + option bars)
         time_module.sleep(1.0)
@@ -1763,9 +1794,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     decision.expiry_preference or "next_week",
                     bt_config.default_dte,
                     contract_symbol=decision.contract_symbol,
-                    target_delta=decision.target_delta,
-                    min_dte=decision.min_dte,
-                    max_dte=decision.max_dte,
+                    target_delta_range=decision.target_delta_range,
+                    target_dte_range=decision.target_dte_range,
                     max_spread_pct=decision.max_spread_pct,
                     cache=cache,
                 )

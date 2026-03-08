@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from ai_trader.options import OptionContract, select_contract
+from ai_trader.options import OptionContract, format_chain_for_llm, select_contract
 
 
 def _make_contract(
@@ -116,6 +116,24 @@ def test_select_contract_exact_symbol_overrides_bucket_heuristics():
     assert result.symbol == "C155"
 
 
+def test_select_contract_respects_delta_and_dte_ranges():
+    contracts = [
+        _make_contract(symbol="C150_FAST", strike=150.0, dte=5),
+        _make_contract(symbol="C150_TARGET", strike=150.0, dte=14),
+        _make_contract(symbol="C145_DEEP", strike=145.0, dte=20),
+    ]
+    result = select_contract(
+        contracts,
+        underlying_price=150.0,
+        strike_preference="atm",
+        expiry_preference="next_week",
+        target_delta_range=(0.45, 0.60),
+        target_dte_range=(10, 18),
+    )
+    assert result is not None
+    assert result.symbol == "C150_TARGET"
+
+
 def test_select_contract_empty():
     result = select_contract([], underlying_price=150.0)
     assert result is None
@@ -132,3 +150,20 @@ def test_context_str():
     assert "AAPL" in s
     assert "CALL" in s
     assert "150.00" in s
+
+
+def test_format_chain_for_llm_includes_shortlist():
+    contracts = [
+        _make_contract(symbol="CALL1", option_type="call", strike=150.0),
+        _make_contract(symbol="CALL2", option_type="call", strike=151.0, dte=12),
+        _make_contract(symbol="CALL3", option_type="call", strike=152.0, dte=16),
+        _make_contract(symbol="PUT1", option_type="put", strike=150.0),
+        _make_contract(symbol="PUT2", option_type="put", strike=149.0, dte=12),
+        _make_contract(symbol="PUT3", option_type="put", strike=148.0, dte=16),
+    ]
+    text = format_chain_for_llm(contracts, max_contracts=6, underlying_price=150.0)
+    assert "Suggested contract shortlist" in text
+    assert "Calls:" in text
+    assert "Puts:" in text
+    assert "CALL1" in text
+    assert "PUT1" in text

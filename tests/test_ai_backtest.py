@@ -319,6 +319,32 @@ def test_select_real_contract_exact_symbol(monkeypatch):
     assert result["ticker"] == "O:AAPL250207C00155000"
 
 
+def test_select_real_contract_respects_target_dte_range(monkeypatch):
+    contracts = [
+        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
+        {"ticker": "O:AAPL250131C00150000", "strike_price": 150, "expiration_date": "2025-01-31"},
+    ]
+    import ai_trader.backtest as bt_mod
+    monkeypatch.setattr(
+        bt_mod, "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=150.0,
+        trade_date=date(2025, 1, 10),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        target_dte_range=(18, 25),
+    )
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250131C00150000"
+
+
 # ---------------------------------------------------------------------------
 # SimPosition / SimTrade
 # ---------------------------------------------------------------------------

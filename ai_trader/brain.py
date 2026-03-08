@@ -26,9 +26,8 @@ class TradeDecision:
     reasoning: str
     target_symbol: str | None      # specific option symbol for closes
     contract_symbol: str | None = None
-    target_delta: float | None = None
-    min_dte: int | None = None
-    max_dte: int | None = None
+    target_delta_range: tuple[float, float] | None = None
+    target_dte_range: tuple[int, int] | None = None
     max_spread_pct: float | None = None
 
 
@@ -168,8 +167,11 @@ You are not limited to coarse contract buckets if the context supports a more
 precise view.
 - You may submit an exact `contract_symbol` for new trades when a specific
   contract is clearly best.
-- You may also guide selection with `target_delta`, `min_dte`, `max_dte`, and
-  `max_spread_pct`.
+- You may also guide selection with `target_delta_range`, `target_dte_range`,
+  and `max_spread_pct`.
+- The options context may include a top-3 shortlist for calls and puts. When one
+  of those contracts is clearly the best expression, choose it directly with
+  `contract_symbol`.
 - You may trade the best expression of a thesis, including a related stock or
   sector ETF, when it is cleaner than the headline ticker itself.
 - Use those fields only when they improve the trade thesis. Otherwise the
@@ -324,30 +326,44 @@ TRADE_TOOL = {
                                 "when you want a specific contract."
                             ),
                         },
-                        "target_delta": {
-                            "type": "number",
-                            "minimum": 0.05,
-                            "maximum": 0.95,
+                        "target_delta_range": {
+                            "type": "object",
                             "description": (
-                                "Optional for new trades: desired absolute delta "
-                                "(for example 0.35 or 0.60)."
+                                "Optional for new trades: desired absolute delta range "
+                                "for the option."
                             ),
+                            "properties": {
+                                "min": {
+                                    "type": "number",
+                                    "minimum": 0.05,
+                                    "maximum": 0.95,
+                                },
+                                "max": {
+                                    "type": "number",
+                                    "minimum": 0.05,
+                                    "maximum": 0.95,
+                                },
+                            },
+                            "required": ["min", "max"],
                         },
-                        "min_dte": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 90,
+                        "target_dte_range": {
+                            "type": "object",
                             "description": (
-                                "Optional for new trades: minimum days to expiry."
+                                "Optional for new trades: desired days-to-expiry range."
                             ),
-                        },
-                        "max_dte": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 120,
-                            "description": (
-                                "Optional for new trades: maximum days to expiry."
-                            ),
+                            "properties": {
+                                "min": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 90,
+                                },
+                                "max": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 120,
+                                },
+                            },
+                            "required": ["min", "max"],
                         },
                         "max_spread_pct": {
                             "type": "number",
@@ -372,6 +388,22 @@ TRADE_TOOL = {
         "required": ["market_analysis", "thesis_updates", "trades"],
     },
 }
+
+
+def _parse_range(
+    raw: object,
+    caster,
+) -> tuple | None:
+    if not isinstance(raw, dict):
+        return None
+    if "min" not in raw or "max" not in raw:
+        return None
+    try:
+        low = caster(raw["min"])
+        high = caster(raw["max"])
+    except (TypeError, ValueError):
+        return None
+    return (min(low, high), max(low, high))
 
 
 class TradingBrain:
@@ -487,6 +519,27 @@ class TradingBrain:
                         continue
 
                     risk_pct = min(float(t.get("risk_pct", 0.10)), config.MAX_RISK_PER_TRADE)
+                    target_delta_range = _parse_range(t.get("target_delta_range"), float)
+                    legacy_target_delta = t.get("target_delta")
+                    if target_delta_range is None and legacy_target_delta is not None:
+                        try:
+                            delta_value = float(legacy_target_delta)
+                            target_delta_range = (delta_value, delta_value)
+                        except (TypeError, ValueError):
+                            target_delta_range = None
+
+                    target_dte_range = _parse_range(t.get("target_dte_range"), int)
+                    legacy_min_dte = t.get("min_dte")
+                    legacy_max_dte = t.get("max_dte")
+                    if target_dte_range is None and (
+                        legacy_min_dte is not None or legacy_max_dte is not None
+                    ):
+                        try:
+                            low = int(legacy_min_dte if legacy_min_dte is not None else legacy_max_dte)
+                            high = int(legacy_max_dte if legacy_max_dte is not None else legacy_min_dte)
+                            target_dte_range = (min(low, high), max(low, high))
+                        except (TypeError, ValueError):
+                            target_dte_range = None
 
                     trades.append(
                         TradeDecision(
@@ -499,21 +552,8 @@ class TradingBrain:
                             reasoning=t.get("reasoning", ""),
                             target_symbol=t.get("target_symbol"),
                             contract_symbol=t.get("contract_symbol"),
-                            target_delta=(
-                                float(t.get("target_delta"))
-                                if t.get("target_delta") is not None
-                                else None
-                            ),
-                            min_dte=(
-                                int(t.get("min_dte"))
-                                if t.get("min_dte") is not None
-                                else None
-                            ),
-                            max_dte=(
-                                int(t.get("max_dte"))
-                                if t.get("max_dte") is not None
-                                else None
-                            ),
+                            target_delta_range=target_delta_range,
+                            target_dte_range=target_dte_range,
                             max_spread_pct=(
                                 float(t.get("max_spread_pct"))
                                 if t.get("max_spread_pct") is not None

@@ -14,16 +14,16 @@ def test_trade_decision_fields():
         reasoning="Strong earnings beat",
         target_symbol=None,
         contract_symbol="AAPL250321C00150000",
-        target_delta=0.55,
-        min_dte=7,
-        max_dte=21,
+        target_delta_range=(0.45, 0.60),
+        target_dte_range=(7, 21),
         max_spread_pct=0.12,
     )
     assert d.action == "buy_call"
     assert d.conviction == 0.85
     assert d.risk_pct <= 0.40
     assert d.contract_symbol == "AAPL250321C00150000"
-    assert d.target_delta == 0.55
+    assert d.target_delta_range == (0.45, 0.60)
+    assert d.target_dte_range == (7, 21)
 
 
 def test_market_analysis_structure():
@@ -63,9 +63,8 @@ def test_trade_tool_schema():
     trade_props = schema["properties"]["trades"]["items"]["properties"]
     assert trade_props["risk_pct"]["maximum"] == 0.40
     assert "contract_symbol" in trade_props
-    assert "target_delta" in trade_props
-    assert "min_dte" in trade_props
-    assert "max_dte" in trade_props
+    assert "target_delta_range" in trade_props
+    assert "target_dte_range" in trade_props
     assert "max_spread_pct" in trade_props
 
 
