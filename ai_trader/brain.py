@@ -23,6 +23,7 @@ class TradeDecision:
     risk_pct: float                # fraction of equity to risk (max 0.40)
     reasoning: str
     target_symbol: str | None      # specific option symbol for closes
+    expression_profile: str | None = None
     contract_symbol: str | None = None
     target_delta_range: tuple[float, float] | None = None
     target_dte_range: tuple[int, int] | None = None
@@ -158,6 +159,10 @@ You receive both raw headlines and a structured event map.
 - You may also receive a relationship map: peers, ecosystem links, and sector
   ETFs connected to the catalyst names. Use it to reason about second-order
   beneficiaries, losers, and basket expressions.
+- You may also receive catalyst-quality tags. Treat `hard_catalyst` as a
+  reported event, `soft_catalyst` as weaker or more interpretive signal, and
+  `opinion_or_recap` as commentary that usually needs stronger price
+  confirmation.
 - Do not treat the event map as ground truth. Verify nuance in the raw headlines
   before trading.
 - Do not treat sympathy moves as automatic. A relationship map is a causal clue,
@@ -178,11 +183,17 @@ You are not limited to coarse contract buckets if the context supports a more
 precise view.
 - You may submit an exact `contract_symbol` for new trades when a specific
   contract is clearly best.
+- You may also choose an `expression_profile` such as balanced, time_cushion,
+  stock_proxy, or convex when you want the selector to express the thesis in a
+  particular style without naming an exact contract.
 - You may also guide selection with `target_delta_range`, `target_dte_range`,
   and `max_spread_pct`.
 - The options context may include a top-3 shortlist for calls and puts. When one
   of those contracts is clearly the best expression, choose it directly with
   `contract_symbol`.
+- The shortlist may also show safer and more aggressive alternatives. On softer
+  catalysts or mixed setups, a longer-DTE alternative can be a cleaner
+  expression than a fast-decay weekly.
 - You may trade the best expression of a thesis, including a related stock or
   sector ETF, when it is cleaner than the headline ticker itself.
 - Use those fields only when they improve the trade thesis. Otherwise the
@@ -204,7 +215,13 @@ poor odds. Cheap options are cheap for a reason.
 
 You will receive the current portfolio state, thesis journal, recent trade \
 history, news, and market data. Analyze everything, update your journal, \
-and decide whether to make any trades.\
+and decide whether to make any trades.
+
+FORMAT DISCIPLINE:
+- Every returned string value must be short plain text.
+- Do not use markdown bullets, code fences, or embedded double quotes inside string values.
+- Keep `market_analysis` to 2-4 short sentences.
+- Keep thesis/reasoning fields to one short sentence each when possible.\
 """
 
 TRADE_TOOL = {
@@ -220,8 +237,8 @@ TRADE_TOOL = {
             "market_analysis": {
                 "type": "string",
                 "description": (
-                    "Your concise market analysis (2-4 sentences). "
-                    "What's the overall market doing? Any key themes?"
+                    "Your concise market analysis (2-4 short plain-text sentences). "
+                    "No markdown or embedded quotes."
                 ),
             },
             "thesis_updates": {
@@ -253,7 +270,7 @@ TRADE_TOOL = {
                         },
                         "thesis": {
                             "type": "string",
-                            "description": "The core thesis (1-2 sentences).",
+                            "description": "The core thesis in 1 short plain-text sentence. No embedded quotes.",
                         },
                         "conviction": {
                             "type": "number",
@@ -273,7 +290,7 @@ TRADE_TOOL = {
                         },
                         "new_observation": {
                             "type": "string",
-                            "description": "What new evidence did you see this cycle?",
+                            "description": "What new evidence did you see this cycle? One short plain-text sentence.",
                         },
                     },
                     "required": ["underlying", "direction", "thesis", "conviction", "status"],
@@ -321,7 +338,10 @@ TRADE_TOOL = {
                         },
                         "reasoning": {
                             "type": "string",
-                            "description": "Why you're making this trade. Reference a thesis ID if applicable.",
+                            "description": (
+                                "Why you're making this trade. One short plain-text sentence; "
+                                "reference a thesis ID if applicable and avoid embedded quotes."
+                            ),
                         },
                         "target_symbol": {
                             "type": "string",
@@ -335,6 +355,15 @@ TRADE_TOOL = {
                             "description": (
                                 "Optional for new trades: exact option symbol to buy "
                                 "when you want a specific contract."
+                            ),
+                        },
+                        "expression_profile": {
+                            "type": "string",
+                            "enum": ["balanced", "time_cushion", "stock_proxy", "convex"],
+                            "description": (
+                                "Optional for new trades: preferred contract style "
+                                "when you want the selector to favor more time, "
+                                "deeper delta, or more convexity."
                             ),
                         },
                         "target_delta_range": {
@@ -426,7 +455,7 @@ class TradingBrain:
         model: str | None = None,
         adapter: LLMAdapter | None = None,
     ) -> None:
-        self.model = model or config.LLM_MODEL
+        self.model = config.resolved_llm_model(model)
         self.provider = (
             adapter.provider
             if adapter is not None
@@ -516,17 +545,46 @@ class TradingBrain:
         request_packet = packet.with_target(provider=self.provider, model=self.model)
 
         log("sending market data to LLM for analysis...")
-        try:
-            completion = self.adapter.complete_structured(
-                model=request_packet.model,
-                max_tokens=request_packet.max_tokens,
-                temperature=request_packet.temperature,
-                system_prompt=request_packet.system_prompt,
-                user_message=request_packet.user_message,
-                tool=request_packet.tool,
-            )
-        except Exception as exc:
-            log(f"LLM API error: {exc}")
+        last_exc: Exception | None = None
+        completion: LLMCompletion | None = None
+        max_attempts = max(config.LLM_MAX_ATTEMPTS, 1)
+        for attempt in range(max_attempts):
+            try:
+                completion = self.adapter.complete_structured(
+                    model=request_packet.model,
+                    max_tokens=request_packet.max_tokens,
+                    temperature=request_packet.temperature,
+                    system_prompt=request_packet.system_prompt,
+                    user_message=request_packet.user_message,
+                    tool=request_packet.tool,
+                )
+                if not completion.tool_calls and attempt < max_attempts - 1:
+                    log(
+                        f"LLM returned no structured tool call "
+                        f"(attempt {attempt + 1}/{max_attempts})"
+                    )
+                    continue
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_attempts - 1:
+                    log(f"LLM API error (attempt {attempt + 1}/{max_attempts}): {exc}")
+                    continue
+                log(f"LLM API error: {exc}")
+                analysis = MarketAnalysis(analysis=f"LLM error: {exc}", trades=[], thesis_updates=[])
+                return AnalysisRun(
+                    packet=request_packet,
+                    completion=LLMCompletion(
+                        provider=self.provider,
+                        model=self.model,
+                        text_blocks=[str(exc)],
+                        raw_response={"error": str(exc)},
+                    ),
+                    analysis=analysis,
+                )
+
+        if completion is None:
+            exc = last_exc or RuntimeError("LLM request failed")
             analysis = MarketAnalysis(analysis=f"LLM error: {exc}", trades=[], thesis_updates=[])
             return AnalysisRun(
                 packet=request_packet,
@@ -589,6 +647,26 @@ class TradingBrain:
                 "You have repeat-loser tickers in your history. Before trading them "
                 "again, state what is genuinely different this time — a new catalyst, "
                 "not the same thesis repackaged. "
+            )
+        if "High-conviction review" in trade_history_context:
+            instruction += (
+                "Calibrate conviction to actual edge, not narrative quality. If recent "
+                "high-conviction trades underperformed, lower conviction or choose a "
+                "cleaner expression. "
+            )
+        if "Fast-decay review" in trade_history_context:
+            instruction += (
+                "If fast-decay entries are underperforming, prefer a longer-DTE or "
+                "higher-quality expression on softer setups. "
+            )
+        if (
+            "Short-dated calls (<=14 DTE)" in trade_history_context
+            or "Stop-loss cluster" in trade_history_context
+        ):
+            instruction += (
+                "If one contract style keeps stopping out, change the expression "
+                "before changing nothing else; use more time, a cleaner trigger, "
+                "or smaller size rather than repeating the same fast entry. "
             )
         instruction += (
             "Then decide whether to make any trades. Prefer trading on mature theses "
@@ -656,6 +734,7 @@ class TradingBrain:
                             risk_pct=risk_pct,
                             reasoning=t.get("reasoning", ""),
                             target_symbol=t.get("target_symbol"),
+                            expression_profile=t.get("expression_profile"),
                             contract_symbol=t.get("contract_symbol"),
                             target_delta_range=target_delta_range,
                             target_dte_range=target_dte_range,

@@ -16,6 +16,8 @@ def _make_contract(
     volume: int = 100,
     open_interest: int = 500,
     dte: int = 20,
+    delta: float | None = None,
+    implied_volatility: float | None = None,
 ) -> OptionContract:
     return OptionContract(
         symbol=symbol,
@@ -29,6 +31,8 @@ def _make_contract(
         volume=volume,
         open_interest=open_interest,
         dte=dte,
+        delta=delta,
+        implied_volatility=implied_volatility,
     )
 
 
@@ -134,6 +138,21 @@ def test_select_contract_respects_delta_and_dte_ranges():
     assert result.symbol == "C150_TARGET"
 
 
+def test_select_contract_respects_expression_profile_stock_proxy():
+    contracts = [
+        _make_contract(symbol="C150_BAL", strike=150.0, dte=10, delta=0.52),
+        _make_contract(symbol="C145_STOCK", strike=145.0, dte=28, delta=0.76),
+        _make_contract(symbol="C155_CONVEX", strike=155.0, dte=7, delta=0.28),
+    ]
+    result = select_contract(
+        contracts,
+        underlying_price=150.0,
+        expression_profile="stock_proxy",
+    )
+    assert result is not None
+    assert result.symbol == "C145_STOCK"
+
+
 def test_select_contract_empty():
     result = select_contract([], underlying_price=150.0)
     assert result is None
@@ -145,25 +164,47 @@ def test_spread_pct():
 
 
 def test_context_str():
-    c = _make_contract()
-    s = c.to_context_str()
+    c = _make_contract(delta=0.56, implied_volatility=0.32)
+    s = c.to_context_str(underlying_price=150.0)
     assert "AAPL" in s
     assert "CALL" in s
     assert "150.00" in s
+    assert "delta=0.56" in s
+    assert "iv=32.0%" in s
+    assert "premium=" in s
+    assert "be_move=" in s
+    assert "spread=" in s
 
 
 def test_format_chain_for_llm_includes_shortlist():
     contracts = [
+        _make_contract(symbol="CALL0", option_type="call", strike=147.0, dte=28, delta=0.76),
         _make_contract(symbol="CALL1", option_type="call", strike=150.0),
         _make_contract(symbol="CALL2", option_type="call", strike=151.0, dte=12),
-        _make_contract(symbol="CALL3", option_type="call", strike=152.0, dte=16),
+        _make_contract(symbol="CALL3", option_type="call", strike=150.0, dte=25),
+        _make_contract(symbol="CALL4", option_type="call", strike=154.0, dte=7),
+        _make_contract(symbol="PUT0", option_type="put", strike=153.0, dte=28, delta=-0.74),
         _make_contract(symbol="PUT1", option_type="put", strike=150.0),
         _make_contract(symbol="PUT2", option_type="put", strike=149.0, dte=12),
-        _make_contract(symbol="PUT3", option_type="put", strike=148.0, dte=16),
+        _make_contract(symbol="PUT3", option_type="put", strike=150.0, dte=25),
+        _make_contract(symbol="PUT4", option_type="put", strike=146.0, dte=7),
     ]
-    text = format_chain_for_llm(contracts, max_contracts=6, underlying_price=150.0)
+    text = format_chain_for_llm(
+        contracts,
+        max_contracts=8,
+        underlying_price=150.0,
+        expression_guidance=["Recent expression outcomes: time_cushion 2/3 wins net=$+4,500"],
+    )
+    assert "Recent expression outcomes: time_cushion 2/3 wins net=$+4,500" in text
     assert "Suggested contract shortlist" in text
+    assert "More time = slower decay / thesis room" in text
     assert "Calls:" in text
     assert "Puts:" in text
+    assert "Primary:" in text
+    assert "More time:" in text
+    assert "Stock proxy:" in text
+    assert "Convex upside:" in text
     assert "CALL1" in text
+    assert "CALL3" in text
     assert "PUT1" in text
+    assert "PUT3" in text

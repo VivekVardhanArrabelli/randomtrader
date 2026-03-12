@@ -8,7 +8,38 @@ from datetime import date, datetime, timedelta
 
 from . import config
 from .alpaca_client import AlpacaClient
-from .utils import log, now_eastern
+from .utils import log, now_eastern, parse_timestamp
+
+EXPRESSION_PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
+    "balanced": {
+        "label": "Balanced",
+        "strike_preference": "atm",
+        "expiry_preference": "next_week",
+        "target_delta_range": (0.35, 0.60),
+        "target_dte_range": (7, 21),
+    },
+    "time_cushion": {
+        "label": "More time",
+        "strike_preference": "atm",
+        "expiry_preference": "monthly",
+        "target_delta_range": (0.45, 0.70),
+        "target_dte_range": (20, 45),
+    },
+    "stock_proxy": {
+        "label": "Stock proxy",
+        "strike_preference": "itm",
+        "expiry_preference": "monthly",
+        "target_delta_range": (0.65, 0.90),
+        "target_dte_range": (20, 45),
+    },
+    "convex": {
+        "label": "Convex",
+        "strike_preference": "otm",
+        "expiry_preference": "this_week",
+        "target_delta_range": (0.15, 0.40),
+        "target_dte_range": (5, 14),
+    },
+}
 
 
 def approx_delta(strike: float, spot: float, dte: int, option_type: str) -> float:
@@ -51,6 +82,8 @@ def target_dte_for_expiry_preference(expiry_preference: str) -> int:
 
 
 def absolute_delta(contract: "OptionContract", underlying_price: float) -> float:
+    if contract.delta is not None:
+        return abs(contract.delta)
     return abs(
         approx_delta(
             contract.strike,
@@ -90,6 +123,32 @@ def _distance_to_range(value: float, value_range: tuple[float, float] | None) ->
     return 0.0
 
 
+def resolve_expression_profile(
+    strike_preference: str,
+    expiry_preference: str,
+    expression_profile: str | None = None,
+    target_delta_range: tuple[float, float] | None = None,
+    target_dte_range: tuple[int, int] | None = None,
+) -> tuple[str, str, tuple[float, float] | None, tuple[int, int] | None]:
+    profile = EXPRESSION_PROFILE_DEFAULTS.get((expression_profile or "").strip().lower())
+    resolved_strike = strike_preference or config.DEFAULT_STRIKE_PREFERENCE
+    resolved_expiry = expiry_preference or "next_week"
+    resolved_delta_range = target_delta_range
+    resolved_dte_range = target_dte_range
+    if profile is None:
+        return resolved_strike, resolved_expiry, resolved_delta_range, resolved_dte_range
+
+    if strike_preference in ("", config.DEFAULT_STRIKE_PREFERENCE):
+        resolved_strike = str(profile["strike_preference"])
+    if expiry_preference in ("", "next_week"):
+        resolved_expiry = str(profile["expiry_preference"])
+    if resolved_delta_range is None:
+        resolved_delta_range = profile["target_delta_range"]  # type: ignore[assignment]
+    if resolved_dte_range is None:
+        resolved_dte_range = profile["target_dte_range"]  # type: ignore[assignment]
+    return resolved_strike, resolved_expiry, resolved_delta_range, resolved_dte_range
+
+
 @dataclass(frozen=True)
 class OptionContract:
     symbol: str               # OCC symbol e.g. AAPL250321C00150000
@@ -103,6 +162,9 @@ class OptionContract:
     volume: int
     open_interest: int
     dte: int                   # days to expiry
+    delta: float | None = None
+    implied_volatility: float | None = None
+    quote_timestamp: datetime | None = None
 
     @property
     def spread_pct(self) -> float:
@@ -124,13 +186,32 @@ class OptionContract:
             atm = pct < 0.5
             moneyness_str = "ATM" if atm else f"{pct:.1f}% {label}"
             parts.append(f"({moneyness_str})")
-            d = approx_delta(self.strike, underlying_price, self.dte, self.option_type)
-            parts.append(f"delta~{d:.2f}")
+            d = self.delta if self.delta is not None else approx_delta(
+                self.strike, underlying_price, self.dte, self.option_type,
+            )
+            parts.append(f"delta={d:.2f}" if self.delta is not None else f"delta~{d:.2f}")
+            premium_pct = self.mid / underlying_price * 100 if self.mid > 0 else 0.0
+            break_even_move_pct = (
+                abs((self.strike + self.mid) - underlying_price) / underlying_price * 100
+                if self.option_type == "call"
+                else abs((self.strike - self.mid) - underlying_price) / underlying_price * 100
+            )
+            parts.append(f"premium={premium_pct:.1f}%spot")
+            parts.append(f"be_move={break_even_move_pct:.1f}%")
+        parts.append(f"spread={self.spread_pct * 100:.1f}%")
+        if self.implied_volatility is not None:
+            parts.append(f"iv={self.implied_volatility * 100:.1f}%")
         parts.append(
             f"exp={self.expiration} DTE={self.dte} "
             f"bid={self.bid:.2f} ask={self.ask:.2f} mid={self.mid:.2f} "
             f"vol={self.volume} OI={self.open_interest}"
         )
+        if self.quote_timestamp is not None and self.quote_timestamp.tzinfo is not None:
+            age_seconds = max((now_eastern() - self.quote_timestamp).total_seconds(), 0.0)
+            if age_seconds < 60:
+                parts.append(f"quote_age={int(age_seconds)}s")
+            else:
+                parts.append(f"quote_age={int(age_seconds // 60)}m")
         return " ".join(parts)
 
 
@@ -202,9 +283,9 @@ def fetch_option_chain(
             )
         )
 
-    # Try to get live quotes for these contracts
+    # Try to get live snapshots for these contracts
     if contracts:
-        contracts = _enrich_with_quotes(alpaca, contracts)
+        contracts = _enrich_with_market_data(alpaca, underlying, contracts)
 
     # Filter by quality
     filtered = []
@@ -221,10 +302,43 @@ def fetch_option_chain(
     return filtered
 
 
-def _enrich_with_quotes(
-    alpaca: AlpacaClient, contracts: list[OptionContract]
+def _extract_snapshot_map(data: dict | list | None) -> dict[str, dict]:
+    if not isinstance(data, dict):
+        return {}
+    if "snapshots" in data and isinstance(data["snapshots"], dict):
+        return {
+            str(symbol): snapshot
+            for symbol, snapshot in data["snapshots"].items()
+            if isinstance(snapshot, dict)
+        }
+    return {
+        str(symbol): snapshot
+        for symbol, snapshot in data.items()
+        if isinstance(snapshot, dict)
+    }
+
+
+def _snapshot_quote(snapshot: dict) -> dict:
+    return (
+        snapshot.get("latestQuote")
+        or snapshot.get("latest_quote")
+        or snapshot.get("quote")
+        or {}
+    )
+
+
+def _enrich_with_market_data(
+    alpaca: AlpacaClient,
+    underlying: str,
+    contracts: list[OptionContract],
 ) -> list[OptionContract]:
-    """Add bid/ask/volume data from live quotes."""
+    """Add bid/ask plus snapshot greeks/IV when Alpaca exposes them."""
+    snapshot_map: dict[str, dict] = {}
+    try:
+        snapshot_map = _extract_snapshot_map(alpaca.get_option_snapshots(underlying))
+    except Exception as exc:
+        log(f"option snapshots fetch error for {underlying}: {exc}")
+
     symbols = [c.symbol for c in contracts]
     # Fetch in chunks of 20
     enriched = []
@@ -240,13 +354,30 @@ def _enrich_with_quotes(
 
         quotes = data.get("quotes", data) if isinstance(data, dict) else {}
         for contract in chunk_contracts:
-            quote = quotes.get(contract.symbol, {})
+            snapshot = snapshot_map.get(contract.symbol, {})
+            quote = _snapshot_quote(snapshot) if snapshot else {}
+            if not quote:
+                quote = quotes.get(contract.symbol, {})
             if not isinstance(quote, dict):
                 enriched.append(contract)
                 continue
             bid = float(quote.get("bp") or quote.get("bid_price") or 0.0)
             ask = float(quote.get("ap") or quote.get("ask_price") or 0.0)
             mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+            greeks = snapshot.get("greeks") or {}
+            delta = greeks.get("delta")
+            iv = (
+                snapshot.get("impliedVolatility")
+                or snapshot.get("implied_volatility")
+                or snapshot.get("iv")
+            )
+            day = snapshot.get("day") or {}
+            quote_timestamp = parse_timestamp(
+                quote.get("t")
+                or quote.get("timestamp")
+                or snapshot.get("updated_at")
+                or snapshot.get("latest_trade", {}).get("t")
+            )
             enriched.append(
                 OptionContract(
                     symbol=contract.symbol,
@@ -257,9 +388,19 @@ def _enrich_with_quotes(
                     bid=bid,
                     ask=ask,
                     mid=mid,
-                    volume=int(quote.get("volume") or contract.volume),
-                    open_interest=contract.open_interest,
+                    volume=int(
+                        quote.get("volume")
+                        or day.get("volume")
+                        or contract.volume
+                    ),
+                    open_interest=int(
+                        snapshot.get("open_interest")
+                        or contract.open_interest
+                    ),
                     dte=contract.dte,
+                    delta=float(delta) if delta is not None else None,
+                    implied_volatility=float(iv) if iv is not None else None,
+                    quote_timestamp=quote_timestamp,
                 )
             )
     return enriched
@@ -270,6 +411,7 @@ def select_contract(
     underlying_price: float,
     strike_preference: str = "atm",
     expiry_preference: str = "next_week",
+    expression_profile: str | None = None,
     contract_symbol: str | None = None,
     target_delta_range: tuple[float, float] | None = None,
     target_dte_range: tuple[int, int] | None = None,
@@ -280,6 +422,7 @@ def select_contract(
         underlying_price,
         strike_preference=strike_preference,
         expiry_preference=expiry_preference,
+        expression_profile=expression_profile,
         contract_symbol=contract_symbol,
         target_delta_range=target_delta_range,
         target_dte_range=target_dte_range,
@@ -293,6 +436,7 @@ def rank_contracts(
     underlying_price: float,
     strike_preference: str = "atm",
     expiry_preference: str = "next_week",
+    expression_profile: str | None = None,
     contract_symbol: str | None = None,
     target_delta_range: tuple[float, float] | None = None,
     target_dte_range: tuple[int, int] | None = None,
@@ -307,6 +451,19 @@ def rank_contracts(
             c for c in contracts if c.symbol.upper() == contract_symbol.upper()
         ]
         return exact_matches[:1]
+
+    (
+        strike_preference,
+        expiry_preference,
+        target_delta_range,
+        target_dte_range,
+    ) = resolve_expression_profile(
+        strike_preference,
+        expiry_preference,
+        expression_profile=expression_profile,
+        target_delta_range=target_delta_range,
+        target_dte_range=target_dte_range,
+    )
 
     candidates = list(contracts)
     normalized_delta_range = _normalize_float_range(target_delta_range)
@@ -408,24 +565,99 @@ def shortlist_contracts(
     return shortlists
 
 
+def _expression_shortlist(
+    contracts: list[OptionContract],
+    underlying_price: float,
+    option_type: str,
+) -> list[tuple[str, OptionContract]]:
+    typed_contracts = [c for c in contracts if c.option_type == option_type]
+    if not typed_contracts:
+        return []
+
+    profiles = [
+        (
+            "Primary",
+            dict(
+                expression_profile="balanced",
+                strike_preference="atm",
+                expiry_preference="next_week",
+            ),
+        ),
+        (
+            "More time",
+            dict(
+                expression_profile="time_cushion",
+            ),
+        ),
+        (
+            "Stock proxy",
+            dict(
+                expression_profile="stock_proxy",
+            ),
+        ),
+        (
+            "Convex upside",
+            dict(
+                expression_profile="convex",
+            ),
+        ),
+    ]
+
+    labeled: list[tuple[str, OptionContract]] = []
+    seen: set[str] = set()
+    for label, params in profiles:
+        ranked = rank_contracts(typed_contracts, underlying_price, **params)
+        match = next((contract for contract in ranked if contract.symbol not in seen), None)
+        if match is None:
+            continue
+        labeled.append((label, match))
+        seen.add(match.symbol)
+
+    if len(labeled) < 3:
+        fallback = rank_contracts(
+            typed_contracts,
+            underlying_price,
+            strike_preference="atm",
+            expiry_preference="next_week",
+        )
+        for contract in fallback:
+            if contract.symbol in seen:
+                continue
+            labeled.append(("Alternative", contract))
+            seen.add(contract.symbol)
+            if len(labeled) >= 3:
+                break
+    return labeled
+
+
 def format_chain_for_llm(
     contracts: list[OptionContract],
     max_contracts: int = 15,
     underlying_price: float = 0.0,
+    expression_guidance: list[str] | None = None,
 ) -> str:
     if not contracts:
         return "No options contracts available."
     lines: list[str] = []
-    shortlists = shortlist_contracts(contracts, underlying_price, per_type=3)
-    if any(shortlists.values()):
+    if contracts:
+        if expression_guidance:
+            lines.extend(expression_guidance)
         lines.append("Suggested contract shortlist:")
+        lines.append(
+            "  Primary = cleanest current expression | "
+            "More time = slower decay / thesis room | "
+            "Stock proxy = deeper delta / closer to shares | "
+            "Convex = cheaper and faster but more fragile"
+        )
         for option_type, label in (("call", "Calls"), ("put", "Puts")):
-            ranked = shortlists[option_type]
+            ranked = _expression_shortlist(contracts, underlying_price, option_type)
             if not ranked:
                 continue
             lines.append(f"  {label}:")
-            for index, contract in enumerate(ranked, start=1):
-                lines.append(f"    {index}. {contract.to_context_str(underlying_price)}")
+            for shortlist_label, contract in ranked:
+                lines.append(
+                    f"    {shortlist_label}: {contract.to_context_str(underlying_price)}"
+                )
         lines.append("--- Full filtered chain ---")
     lines.extend(c.to_context_str(underlying_price) for c in contracts[:max_contracts])
     return "\n".join(lines)

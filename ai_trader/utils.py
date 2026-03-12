@@ -47,6 +47,22 @@ def parse_timestamp(value) -> datetime | None:
     return None
 
 
+def prioritized_symbol_watchlist(*symbol_groups: list[str], limit: int) -> list[str]:
+    """Build a de-duplicated symbol list while preserving group priority."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for group in symbol_groups:
+        for symbol in group:
+            normalized = str(symbol or "").upper().strip()
+            if not normalized or normalized in seen:
+                continue
+            ordered.append(normalized)
+            seen.add(normalized)
+            if len(ordered) >= limit:
+                return ordered
+    return ordered
+
+
 @dataclass(frozen=True)
 class AccountSnapshot:
     equity: float

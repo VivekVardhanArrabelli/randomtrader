@@ -173,7 +173,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=5, help="Number of recent packets to replay")
     parser.add_argument("--decision-id", type=int, help="Replay a specific ai_decisions rowid")
     parser.add_argument("--provider", help="Provider to replay through (anthropic/openai)")
-    parser.add_argument("--model", default=config.LLM_MODEL, help="Model to replay through")
+    parser.add_argument("--model", default=None, help="Model to replay through")
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     args = parser.parse_args()
 
@@ -182,7 +182,8 @@ def main() -> None:
         env_path = Path(__file__).parent.parent / "momentum_trader" / ".env"
     load_dotenv(env_path, override=True)
 
-    provider = infer_provider(model=args.model, provider=args.provider or config.LLM_PROVIDER)
+    model = config.resolved_llm_model(args.model)
+    provider = infer_provider(model=model, provider=args.provider or config.LLM_PROVIDER)
     api_key = resolve_api_key(provider)
     if not api_key:
         raise SystemExit(f"{api_key_env_name(provider)} not set")
@@ -198,7 +199,7 @@ def main() -> None:
     results = replay_records(
         records,
         provider=provider,
-        model=args.model,
+        model=model,
         api_key=api_key,
     )
     if args.json:

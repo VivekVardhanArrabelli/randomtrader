@@ -2,6 +2,8 @@
 
 from datetime import date, datetime, timedelta
 
+import pytest
+
 from ai_trader.backtest import (
     BacktestConfig,
     BacktestResult,
@@ -10,22 +12,32 @@ from ai_trader.backtest import (
     SimTrade,
     _decision_timestamps_for_day,
     _first_bar_at_or_after,
+    _is_trading_day,
     _last_completed_trading_day,
     _latest_bar_before,
     _annotate_closed_trades,
     _build_enriched_portfolio_context,
     _build_market_trend_context,
+    _build_options_context,
     _build_performance_summary,
     _build_ticker_price_context,
     _extract_top_news_tickers,
     _filter_news_quality,
     _option_bar_price,
+    _exit_premium_for_position,
+    _prefetch_prepare_option_data,
+    _rank_prefetch_contracts,
     _previous_trading_day,
+    _session_intraday_bars_before,
+    _ticker_price_metrics_as_of,
     _select_real_contract,
     _trading_days,
+    fetch_historical_daily_bars_range,
     print_backtest_result,
     save_debug_log,
 )
+from ai_trader.historical_cache import PolygonResponseStore
+from ai_trader.news import NewsEvent
 from ai_trader.utils import EASTERN_TZ
 
 
@@ -52,9 +64,25 @@ def test_previous_trading_day_skips_weekend():
     assert _previous_trading_day(date(2025, 1, 7)) == date(2025, 1, 6)  # Tuesday -> Monday
 
 
+def test_trading_days_skip_nyse_holidays():
+    days = _trading_days(date(2025, 12, 24), date(2025, 12, 26))
+
+    assert days == [date(2025, 12, 24), date(2025, 12, 26)]
+    assert not _is_trading_day(date(2025, 12, 25))
+
+
+def test_previous_trading_day_skips_thanksgiving():
+    assert _previous_trading_day(date(2025, 11, 28)) == date(2025, 11, 26)
+
+
 def test_last_completed_trading_day_intraday_uses_prior_session():
     as_of = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
     assert _last_completed_trading_day(as_of) == date(2025, 1, 3)
+
+
+def test_last_completed_trading_day_skips_holiday_session():
+    as_of = datetime(2025, 12, 25, 12, 0, tzinfo=EASTERN_TZ)
+    assert _last_completed_trading_day(as_of) == date(2025, 12, 24)
 
 
 def test_decision_timestamps_for_day_match_scan_cadence():
@@ -106,6 +134,293 @@ def test_polygon_cache_option_bars():
     assert cache.option_bars[ticker]["2025-01-10"] == bar
 
 
+def test_fetch_historical_daily_bars_range_uses_cache(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    calls = {"count": 0}
+    bars = _make_bars([100, 101, 102])
+
+    def mock_polygon_request(api_key, path, params=None, store=None, offline=False):
+        calls["count"] += 1
+        return {"results": bars}
+
+    monkeypatch.setattr(bt_mod, "_polygon_request", mock_polygon_request)
+
+    cache = PolygonCache()
+    first = fetch_historical_daily_bars_range(
+        "fake", "AAPL", date(2025, 1, 1), date(2025, 1, 3), cache=cache,
+    )
+    second = fetch_historical_daily_bars_range(
+        "fake", "AAPL", date(2025, 1, 1), date(2025, 1, 3), cache=cache,
+    )
+
+    assert first == second == bars
+    assert calls["count"] == 1
+
+
+def test_polygon_request_uses_persistent_store(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    calls = {"count": 0}
+
+    class DummyResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"results": [{"ticker": "AAPL"}]}
+
+    def mock_get(url, params=None, timeout=30):
+        calls["count"] += 1
+        return DummyResponse()
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    store = PolygonResponseStore(tmp_path / "historical.db")
+    first = bt_mod._polygon_request("live-key", "/v2/test", {"ticker": "AAPL"}, store=store)
+    second = bt_mod._polygon_request("", "/v2/test", {"ticker": "AAPL"}, store=store, offline=True)
+
+    assert first == second == {"results": [{"ticker": "AAPL"}]}
+    assert calls["count"] == 1
+
+
+def test_polygon_request_offline_cache_miss_raises(tmp_path):
+    import ai_trader.backtest as bt_mod
+
+    store = PolygonResponseStore(tmp_path / "historical.db")
+    with pytest.raises(RuntimeError, match="offline Polygon cache miss"):
+        bt_mod._polygon_request("", "/v2/missing", {"ticker": "AAPL"}, store=store, offline=True)
+
+
+def test_fetch_historical_daily_bars_range_offline_reraises(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    def mock_polygon_request(api_key, path, params=None, store=None, offline=False):
+        raise RuntimeError("offline Polygon cache miss for /v2/aggs/ticker/AAPL")
+
+    monkeypatch.setattr(bt_mod, "_polygon_request", mock_polygon_request)
+
+    cache = PolygonCache(offline=True)
+    with pytest.raises(RuntimeError, match="offline Polygon cache miss"):
+        fetch_historical_daily_bars_range(
+            "fake", "AAPL", date(2025, 1, 1), date(2025, 1, 3), cache=cache,
+        )
+
+
+def test_session_intraday_bars_before_uses_filtered_cache(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    calls = {"count": 0}
+    bars = [
+        {"t": int(datetime(2025, 1, 6, 9, 30, tzinfo=EASTERN_TZ).timestamp() * 1000), "c": 100.0},
+        {"t": int(datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ).timestamp() * 1000), "c": 101.0},
+    ]
+
+    def mock_intraday(api_key, ticker, trading_day, multiplier=5, cache=None):
+        calls["count"] += 1
+        return bars
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
+
+    cache = PolygonCache()
+    as_of = datetime(2025, 1, 6, 9, 36, tzinfo=EASTERN_TZ)
+    first = _session_intraday_bars_before("fake", "AAPL", as_of, cache=cache)
+    second = _session_intraday_bars_before("fake", "AAPL", as_of, cache=cache)
+
+    assert first == second == bars
+    assert calls["count"] == 1
+
+
+def test_ticker_price_metrics_as_of_uses_metrics_cache(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    calls = {"count": 0}
+    bars = _make_bars([130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 142])
+
+    def mock_bars_range(api_key, symbol, start, end, cache=None):
+        calls["count"] += 1
+        return bars
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_daily_bars_range", mock_bars_range)
+    monkeypatch.setattr(bt_mod, "_session_intraday_bars_before", lambda *a, **k: [])
+
+    cache = PolygonCache()
+    metrics_cache: dict[str, dict | None] = {}
+    first = _ticker_price_metrics_as_of(
+        "fake",
+        "NVDA",
+        date(2025, 1, 10),
+        cache=cache,
+        metrics_cache=metrics_cache,
+    )
+    second = _ticker_price_metrics_as_of(
+        "fake",
+        "NVDA",
+        date(2025, 1, 10),
+        cache=cache,
+        metrics_cache=metrics_cache,
+    )
+
+    assert first == second
+    assert first is not None
+    assert calls["count"] == 1
+
+
+def test_rank_prefetch_contracts_balances_moneyness_buckets():
+    contracts = [
+        {"ticker": "ATM1", "strike_price": 100, "expiration_date": "2025-01-24"},
+        {"ticker": "ITM1", "strike_price": 95, "expiration_date": "2025-01-24"},
+        {"ticker": "OTM1", "strike_price": 105, "expiration_date": "2025-01-24"},
+        {"ticker": "ATM2", "strike_price": 101, "expiration_date": "2025-01-31"},
+        {"ticker": "ITM2", "strike_price": 94, "expiration_date": "2025-01-31"},
+        {"ticker": "OTM2", "strike_price": 106, "expiration_date": "2025-01-31"},
+    ]
+
+    ranked = _rank_prefetch_contracts(
+        contracts,
+        spot=100.0,
+        trade_date=date(2025, 1, 10),
+        default_dte=14,
+        option_type="call",
+        limit=4,
+    )
+
+    assert [contract["ticker"] for contract in ranked[:3]] == ["ATM1", "ITM1", "OTM1"]
+    assert len(ranked) == 4
+
+
+def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    call_contracts = [
+        {"ticker": "CALLATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+        {"ticker": "CALLITM", "strike_price": 95, "expiration_date": "2025-01-24"},
+        {"ticker": "CALLOTM", "strike_price": 105, "expiration_date": "2025-01-24"},
+    ]
+    put_contracts = [
+        {"ticker": "PUTATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+        {"ticker": "PUTITM", "strike_price": 105, "expiration_date": "2025-01-24"},
+        {"ticker": "PUTOTM", "strike_price": 95, "expiration_date": "2025-01-24"},
+    ]
+    intraday_calls: list[str] = []
+    daily_calls: list[str] = []
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_build_ticker_price_context",
+        lambda *args, **kwargs: ("spot=$100.00", 100.0),
+    )
+
+    def mock_fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
+        return call_contracts if option_type == "call" else put_contracts
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_historical_intraday_bars",
+        lambda api_key, ticker, trading_day, multiplier=5, cache=None: intraday_calls.append(ticker) or [],
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_option_daily_bar",
+        lambda api_key, ticker, trade_date, cache=None: daily_calls.append(ticker) or None,
+    )
+
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=2,
+        max_symbols=1,
+    )
+
+    assert count == 4
+    assert intraday_calls == ["CALLATM", "CALLITM", "PUTATM", "PUTITM"]
+    assert daily_calls == intraday_calls
+
+
+def test_build_options_context_fetches_intraday_only_for_primary_contracts(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    call_contracts = [
+        {"ticker": "CALLATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+        {"ticker": "CALLITM", "strike_price": 95, "expiration_date": "2025-01-24"},
+        {"ticker": "CALLOTM", "strike_price": 105, "expiration_date": "2025-01-24"},
+    ]
+    put_contracts = [
+        {"ticker": "PUTATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+        {"ticker": "PUTITM", "strike_price": 105, "expiration_date": "2025-01-24"},
+        {"ticker": "PUTOTM", "strike_price": 95, "expiration_date": "2025-01-24"},
+    ]
+    intraday_calls: list[str] = []
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_build_ticker_price_context",
+        lambda *args, **kwargs: ("spot=$100.00", 100.0),
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda api_key, ticker, option_type, *args, **kwargs: call_contracts if option_type == "call" else put_contracts,
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "_session_intraday_bars_before",
+        lambda api_key, ticker, as_of, cache=None, multiplier=5: intraday_calls.append(ticker) or [
+            {
+                "t": int(datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ).timestamp() * 1000),
+                "c": 1.5,
+                "h": 1.6,
+                "l": 1.4,
+                "v": 10,
+            }
+        ],
+    )
+    monkeypatch.setattr(bt_mod.time_module, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("unexpected sleep")))
+
+    context = _build_options_context(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        best_events={
+            "NVDA": NewsEvent(
+                headline="NVDA raises AI guidance",
+                summary="Fresh hard catalyst",
+                source_count=2,
+                article_count=2,
+                symbols=["NVDA"],
+                event_type="guidance",
+                freshness="fresh",
+                first_seen=datetime(2025, 1, 10, 8, 45, tzinfo=EASTERN_TZ),
+                last_seen=datetime(2025, 1, 10, 9, 10, tzinfo=EASTERN_TZ),
+                supporting_sources=["Reuters", "Bloomberg"],
+                supporting_headlines=["NVDA raises AI guidance"],
+                age_minutes=25,
+                catalyst_quality="hard_catalyst",
+            )
+        },
+        closed_trades=[
+            {
+                "symbol": "CALLATM",
+                "underlying": "NVDA",
+                "pnl": 1250.0,
+                "expression_profile": "time_cushion",
+            }
+        ],
+    )
+
+    assert intraday_calls == ["CALLATM", "PUTATM"]
+    assert "Recent expression outcomes: time_cushion 1/1 wins net=$+1,250" in context
+    assert "Setup (NVDA): catalyst=hard_catalyst/guidance/fresh/2src" in context
+    assert "CALLITM CALL $95.00" in context
+    assert "PUTITM PUT $105.00" in context
+    assert "premium=$1.50" in context
+
+
 # ---------------------------------------------------------------------------
 # _option_bar_price
 # ---------------------------------------------------------------------------
@@ -128,6 +443,40 @@ def test_option_bar_price_zero_vwap():
 def test_option_bar_price_empty():
     bar = {}
     assert _option_bar_price(bar) == 0.0
+
+
+def test_exit_premium_for_position_keeps_live_position_without_bar():
+    pos = SimPosition(
+        underlying="AAPL",
+        option_type="call",
+        strike=150.0,
+        entry_date=date(2025, 1, 6),
+        expiry_date=date(2025, 1, 17),
+        entry_premium=5.0,
+        qty=1,
+        conviction=0.7,
+        reasoning="test",
+        polygon_ticker="O:AAPL250117C00150000",
+    )
+    decision_time = datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ)
+    assert _exit_premium_for_position(pos, decision_time, None) is None
+
+
+def test_exit_premium_for_position_forces_expired_position_to_zero_without_bar():
+    pos = SimPosition(
+        underlying="RCL",
+        option_type="call",
+        strike=292.5,
+        entry_date=date(2025, 12, 19),
+        expiry_date=date(2025, 12, 26),
+        entry_premium=7.0,
+        qty=12,
+        conviction=0.62,
+        reasoning="test",
+        polygon_ticker="O:RCL251226C00292500",
+    )
+    decision_time = datetime(2025, 12, 29, 9, 35, tzinfo=EASTERN_TZ)
+    assert _exit_premium_for_position(pos, decision_time, None) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +694,32 @@ def test_select_real_contract_respects_target_dte_range(monkeypatch):
     assert result["ticker"] == "O:AAPL250131C00150000"
 
 
+def test_select_real_contract_respects_expression_profile(monkeypatch):
+    contracts = [
+        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
+        {"ticker": "O:AAPL250131C00145000", "strike_price": 145, "expiration_date": "2025-01-31"},
+    ]
+    import ai_trader.backtest as bt_mod
+    monkeypatch.setattr(
+        bt_mod, "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=150.0,
+        trade_date=date(2025, 1, 10),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        expression_profile="stock_proxy",
+    )
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250131C00145000"
+
+
 # ---------------------------------------------------------------------------
 # SimPosition / SimTrade
 # ---------------------------------------------------------------------------
@@ -531,6 +906,31 @@ def test_performance_summary_all_losses():
     assert "-0.8%" in result  # return
 
 
+def test_performance_summary_includes_conviction_and_dte_reviews():
+    trades = [
+        {
+            "underlying": "AAPL",
+            "symbol": "AAPL250116C00150000",
+            "entry_date": "2025-01-06",
+            "conviction": 0.70,
+            "pnl": -500,
+        },
+        {
+            "underlying": "MSFT",
+            "symbol": "MSFT250221C00420000",
+            "entry_date": "2025-01-06",
+            "conviction": 0.60,
+            "pnl": 400,
+        },
+    ]
+    result = _build_performance_summary(trades, 99_900, 100_000)
+    assert "High-conviction review (>=0.65): 0/1 wins net=$-500" in result
+    assert "Fast-decay review (<=10 DTE at entry): 0/1 wins net=$-500" in result
+    assert "More-time review (>10 DTE at entry): 1/1 wins net=$+400" in result
+    assert "Expression review: Calls 1/2 wins net=$-100" in result
+    assert "Short-dated calls (<=14 DTE): 0/1 wins net=$-500" in result
+
+
 # ---------------------------------------------------------------------------
 # _extract_top_news_tickers
 # ---------------------------------------------------------------------------
@@ -712,7 +1112,7 @@ def test_build_market_trend_context_basic(monkeypatch):
     qqq_closes = [490, 491, 492, 493, 494, 495, 496, 497, 498, 499, 500, 498]
     iwm_closes = [230, 229, 228, 227, 226, 225, 224, 223, 222, 221, 220, 218]
 
-    def mock_bars_range(api_key, symbol, start, end):
+    def mock_bars_range(api_key, symbol, start, end, cache=None):
         if symbol == "SPY":
             return _make_bars(spy_closes)
         elif symbol == "QQQ":
@@ -743,7 +1143,7 @@ def test_build_market_trend_context_trend_direction(monkeypatch):
     # Falling: today=218, avg of last 10 ~ 224 → down
     iwm_closes = [230, 229, 228, 227, 226, 225, 224, 223, 222, 221, 220, 218]
 
-    def mock_bars(api_key, symbol, start, end):
+    def mock_bars(api_key, symbol, start, end, cache=None):
         if symbol == "SPY":
             return _make_bars(spy_closes)
         elif symbol == "IWM":
@@ -795,6 +1195,8 @@ def test_build_ticker_price_context_basic(monkeypatch):
     assert "5d(" in ctx
     assert "10d(" in ctx
     assert "hi/lo=" in ctx
+    assert "range=" in ctx
+    assert "near_10d_high" in ctx
 
 
 def test_build_ticker_price_context_no_data(monkeypatch):
@@ -825,6 +1227,7 @@ def test_build_ticker_price_context_short_history(monkeypatch):
     # 5d and 10d changes should be 0 (not enough data)
     assert "5d(+0.0%)" in ctx
     assert "10d(+0.0%)" in ctx
+    assert "range=" in ctx
 
 
 # ---------------------------------------------------------------------------

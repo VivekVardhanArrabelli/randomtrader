@@ -112,7 +112,11 @@ def _execute_open_option(
         ),
         strike_band_pct=(
             0.35
-            if (decision.contract_symbol or decision.target_delta_range is not None)
+            if (
+                decision.contract_symbol
+                or decision.target_delta_range is not None
+                or decision.expression_profile in {"time_cushion", "stock_proxy", "convex"}
+            )
             else None
         ),
     )
@@ -131,6 +135,7 @@ def _execute_open_option(
         underlying_price,
         decision.strike_preference,
         decision.expiry_preference,
+        expression_profile=decision.expression_profile,
         contract_symbol=decision.contract_symbol,
         target_delta_range=decision.target_delta_range,
         target_dte_range=decision.target_dte_range,
@@ -760,6 +765,7 @@ def _log_close_option_trade(
             market_analysis=market_analysis,
             order_id=order_id,
             status=status,
+            expression_profile=decision.expression_profile or "",
         )
     )
 
@@ -1027,6 +1033,7 @@ def _log_option_trade(
             market_analysis=market_analysis,
             order_id=order_id,
             status=status,
+            expression_profile=decision.expression_profile or "",
         )
     )
 
@@ -1059,5 +1066,6 @@ def _log_stock_trade(
             market_analysis=market_analysis,
             order_id=order_id,
             status=status,
+            expression_profile=decision.expression_profile or "",
         )
     )

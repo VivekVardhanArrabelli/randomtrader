@@ -29,7 +29,7 @@ from .candidates import (
     format_candidate_table,
     select_candidate_finalists,
 )
-from .db import AIDecisionRecord, AITradeLogger, format_trade_history
+from .db import AIDecisionRecord, AITradeLogger, expression_guidance_lines, format_trade_history
 from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
 from .llm import api_key_env_name, infer_provider, resolve_api_key
@@ -39,6 +39,7 @@ from .news import (
     expand_symbols_with_relationships,
     fetch_news,
     fetch_targeted_news,
+    format_symbol_setup_context,
     format_news_for_llm,
     map_best_events_by_symbol,
     merge_news_items,
@@ -48,7 +49,13 @@ from .news import (
 from .options import fetch_option_chain, format_chain_for_llm
 from .portfolio import get_portfolio_state
 from .risk import PositionRiskAlert, PositionRiskState, assess_position_risk, evaluate_trade_risk
-from .utils import EASTERN_TZ, is_market_open, log, now_eastern
+from .utils import (
+    EASTERN_TZ,
+    is_market_open,
+    log,
+    now_eastern,
+    prioritized_symbol_watchlist,
+)
 
 
 def _within_trading_window(current: datetime) -> bool:
@@ -100,6 +107,16 @@ def _compute_bar_trends(bars: list[dict]) -> dict:
 
     recent_high = max(float(b.get("h") or b.get("high") or 0) for b in recent_bars)
     recent_low = min(float(b.get("l") or b.get("low") or float("inf")) for b in recent_bars)
+    if recent_high > recent_low:
+        range_pos_pct = max(0.0, min(100.0, (today_close - recent_low) / (recent_high - recent_low) * 100))
+    else:
+        range_pos_pct = 50.0
+    if range_pos_pct >= 85:
+        range_label = "near_10d_high"
+    elif range_pos_pct <= 15:
+        range_label = "near_10d_low"
+    else:
+        range_label = "mid_range"
 
     return {
         "price": today_close,
@@ -109,6 +126,8 @@ def _compute_bar_trends(bars: list[dict]) -> dict:
         "trend": trend,
         "high": recent_high,
         "low": recent_low,
+        "range_pos_pct": range_pos_pct,
+        "range_label": range_label,
     }
 
 
@@ -211,6 +230,7 @@ def _get_ticker_trend(
         f" 5d({metrics['five_d_chg']:+.1f}%)"
         f" 10d({metrics['ten_d_chg']:+.1f}%)"
         f" hi/lo=${metrics['high']:.0f}/${metrics['low']:.0f}"
+        f" range={metrics['range_pos_pct']:.0f}% {metrics['range_label']}"
     )
 
 
@@ -287,26 +307,47 @@ def _build_catalyst_reaction_context(
 def _get_options_context(
     alpaca: AlpacaClient,
     watchlist: list[str],
+    best_events: dict[str, object] | None = None,
+    recent_trades: list[dict] | None = None,
+    recent_closes: list[dict] | None = None,
     metrics_cache: dict[str, dict | None] | None = None,
 ) -> str:
     """Fetch options chains for watchlist symbols to give LLM context."""
     if not watchlist:
         return ""
 
+    guidance = expression_guidance_lines(recent_closes or [], recent_trades or [])
     all_lines = []
-    for sym in watchlist[: config.CANDIDATE_FINALISTS]:
+    show_guidance = True
+    for sym in watchlist:
         price = _get_price(alpaca, sym)
         if price <= 0:
             continue
+        metrics = _get_ticker_trend_metrics(alpaca, sym, metrics_cache=metrics_cache)
         # Add per-ticker trend context
         trend = _get_ticker_trend(alpaca, sym, metrics_cache=metrics_cache)
         if trend:
             all_lines.append(f"\n{sym} ({trend}):")
         else:
             all_lines.append(f"\n{sym} (${price:.2f}):")
+        all_lines.append(
+            format_symbol_setup_context(
+                sym,
+                metrics,
+                (best_events or {}).get(sym.upper()),
+            )
+        )
         chain = fetch_option_chain(alpaca, sym, price)
         if chain:
-            all_lines.append(format_chain_for_llm(chain, max_contracts=20, underlying_price=price))
+            all_lines.append(
+                format_chain_for_llm(
+                    chain,
+                    max_contracts=20,
+                    underlying_price=price,
+                    expression_guidance=guidance if show_guidance else None,
+                )
+            )
+            show_guidance = False
 
     return "\n".join(all_lines) if all_lines else ""
 
@@ -595,10 +636,21 @@ def run_cycle(
     market_context = _get_market_context(alpaca)
 
     # 7. Get deep-dive options context only for finalists
-    finalist_watchlist = finalists or focus_symbols
+    finalist_watchlist = prioritized_symbol_watchlist(
+        position_symbols,
+        thesis_symbols,
+        finalists,
+        limit=min(
+            config.WATCHLIST_SIZE,
+            len(position_symbols) + len(thesis_symbols) + config.CANDIDATE_FINALISTS,
+        ),
+    )
     options_context = _get_options_context(
         alpaca,
         finalist_watchlist,
+        best_events=map_best_events_by_symbol(news_events),
+        recent_trades=recent_trades,
+        recent_closes=recent_closes,
         metrics_cache=metrics_cache,
     )
 
@@ -642,6 +694,7 @@ def run_cycle(
                     "risk_pct": d.risk_pct,
                     "reasoning": d.reasoning,
                     "target_symbol": d.target_symbol,
+                    "expression_profile": d.expression_profile,
                     "contract_symbol": d.contract_symbol,
                     "target_delta_range": d.target_delta_range,
                     "target_dte_range": d.target_dte_range,
@@ -708,8 +761,9 @@ def run() -> None:
     load_dotenv(env_path, override=True)
 
     # Validate required env vars
+    llm_model = config.resolved_llm_model()
     llm_provider = infer_provider(
-        model=config.LLM_MODEL,
+        model=llm_model,
         provider=os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER,
     )
     llm_api_key = resolve_api_key(llm_provider)
@@ -727,7 +781,7 @@ def run() -> None:
     brain = TradingBrain(
         api_key=llm_api_key,
         provider=llm_provider,
-        model=config.LLM_MODEL,
+        model=llm_model,
     )
     logger = AITradeLogger()
 
@@ -759,7 +813,7 @@ def run() -> None:
     log(f"  Paper trading: {config.PAPER_TRADING}")
     log(f"  Max risk per trade: {config.MAX_RISK_PER_TRADE:.0%}")
     log(f"  Scan interval: {config.SCAN_INTERVAL_MINUTES} min")
-    log(f"  LLM provider/model: {llm_provider}/{config.LLM_MODEL}")
+    log(f"  LLM provider/model: {llm_provider}/{llm_model}")
     log(f"  Active theses: {active_theses}")
     log("=" * 60)
 

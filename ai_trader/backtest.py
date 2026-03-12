@@ -18,8 +18,9 @@ import os
 import re
 import time as time_module
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,7 +32,11 @@ from .candidates import (
     format_candidate_table,
     select_candidate_finalists,
 )
-from .db import format_trade_history
+from .db import expression_guidance_lines, format_trade_history, profile_calibration_lines
+from .historical_cache import (
+    DEFAULT_HISTORICAL_CACHE_DB_PATH,
+    PolygonResponseStore,
+)
 from .journal import ThesisJournal
 from .llm import api_key_env_name, infer_provider, resolve_api_key
 from .news import (
@@ -39,6 +44,7 @@ from .news import (
     build_news_events,
     classify_catalyst_reaction,
     expand_symbols_with_relationships,
+    format_symbol_setup_context,
     format_news_for_llm,
     map_best_events_by_symbol,
     rank_symbols_from_events,
@@ -46,32 +52,76 @@ from .news import (
 )
 from .options import (
     approx_delta,
+    resolve_expression_profile,
     target_dte_for_expiry_preference,
     target_strike_for_preference,
 )
 from .risk import size_for_risk_budget
-from .utils import EASTERN_TZ, log, now_eastern
+from .utils import (
+    EASTERN_TZ,
+    log,
+    now_eastern,
+    prioritized_symbol_watchlist,
+)
 
 
 # ---------------------------------------------------------------------------
 # Historical data fetching (Polygon — equities)
 # ---------------------------------------------------------------------------
 
-def _polygon_request(api_key: str, path: str, params: dict | None = None) -> dict:
+_LAST_POLYGON_REQUEST_AT = 0.0
+
+
+def _respect_polygon_rate_limit() -> None:
+    global _LAST_POLYGON_REQUEST_AT
+    min_interval = max(float(config.POLYGON_MIN_REQUEST_INTERVAL_SECONDS), 0.0)
+    if min_interval <= 0:
+        return
+    now = time_module.monotonic()
+    elapsed = now - _LAST_POLYGON_REQUEST_AT
+    if _LAST_POLYGON_REQUEST_AT > 0 and elapsed < min_interval:
+        time_module.sleep(min_interval - elapsed)
+    _LAST_POLYGON_REQUEST_AT = time_module.monotonic()
+
+def _polygon_request(
+    api_key: str,
+    path: str,
+    params: dict | None = None,
+    *,
+    store: PolygonResponseStore | None = None,
+    offline: bool = False,
+) -> dict:
     import requests
 
     params = params or {}
-    params["apiKey"] = api_key
+    cached = store.get(path, params) if store is not None else None
+    if cached is not None:
+        return cached
+    if offline:
+        raise RuntimeError(f"offline Polygon cache miss for {path}")
+
+    request_params = dict(params)
+    request_params["apiKey"] = api_key
     url = f"https://api.polygon.io{path}"
-    response = requests.get(url, params=params, timeout=30)
+    _respect_polygon_rate_limit()
+    response = requests.get(url, params=request_params, timeout=30)
     for attempt in range(3):
         if response.status_code != 429:
             break
         time_module.sleep(12 + attempt * 5)
-        response = requests.get(url, params=params, timeout=30)
+        _respect_polygon_rate_limit()
+        response = requests.get(url, params=request_params, timeout=30)
     if response.status_code >= 400:
         raise RuntimeError(f"Polygon {response.status_code}: {response.text[:200]}")
-    return response.json()
+    data = response.json()
+    if store is not None:
+        store.put(path, params, data)
+    return data
+
+
+def _raise_if_offline(cache: PolygonCache | None, exc: Exception) -> None:
+    if cache and cache.offline:
+        raise RuntimeError(str(exc)) from exc
 
 
 def fetch_historical_news_window(
@@ -79,6 +129,7 @@ def fetch_historical_news_window(
     start_time: datetime,
     end_time: datetime,
     limit: int = 50,
+    cache: PolygonCache | None = None,
 ) -> list[dict]:
     """Fetch Polygon news published within a precise timestamp window."""
     if end_time <= start_time:
@@ -97,53 +148,77 @@ def fetch_historical_news_window(
                 "sort": "published_utc",
                 "order": "desc",
             },
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
     except Exception as exc:
         log(f"news fetch error for {start_time} -> {end_time}: {exc}")
+        _raise_if_offline(cache, exc)
         return []
     return data.get("results", [])
 
 
 def fetch_historical_news(
-    api_key: str, trade_date: date, limit: int = 50,
+    api_key: str,
+    trade_date: date,
+    limit: int = 50,
+    cache: PolygonCache | None = None,
 ) -> list[dict]:
     """Fetch all news for a given date from Polygon."""
     start = datetime.combine(trade_date, time(0, 0, tzinfo=EASTERN_TZ))
     end = datetime.combine(trade_date, time(23, 59, 59, tzinfo=EASTERN_TZ))
-    return fetch_historical_news_window(api_key, start, end, limit=limit)
+    return fetch_historical_news_window(api_key, start, end, limit=limit, cache=cache)
 
 
 def fetch_historical_daily_bar(
-    api_key: str, symbol: str, trade_date: date,
+    api_key: str,
+    symbol: str,
+    trade_date: date,
+    cache: PolygonCache | None = None,
 ) -> dict | None:
     """Fetch OHLCV for an equity symbol on a given date."""
     try:
         data = _polygon_request(
             api_key,
             f"/v1/open-close/{symbol}/{trade_date}",
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
         if data.get("status") == "OK":
             return data
-    except Exception:
-        pass
+    except Exception as exc:
+        _raise_if_offline(cache, exc)
     return None
 
 
 def fetch_historical_daily_bars_range(
-    api_key: str, symbol: str, start: date, end: date,
+    api_key: str,
+    symbol: str,
+    start: date,
+    end: date,
+    cache: PolygonCache | None = None,
 ) -> list[dict]:
     """Fetch daily bars for an equity over a date range."""
+    cache_key = (symbol.upper(), start.isoformat(), end.isoformat())
+    if cache and cache_key in cache.daily_bars:
+        return cache.daily_bars[cache_key]
     try:
         data = _polygon_request(
             api_key,
             f"/v2/aggs/ticker/{symbol}/range/1/day"
             f"/{start.isoformat()}/{end.isoformat()}",
             params={"adjusted": "true", "sort": "asc", "limit": "250"},
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
     except Exception as exc:
         log(f"bars fetch error for {symbol}: {exc}")
+        _raise_if_offline(cache, exc)
         return []
-    return data.get("results", [])
+    results = data.get("results", [])
+    if cache is not None:
+        cache.daily_bars[cache_key] = results
+    return results
 
 
 def fetch_historical_intraday_bars(
@@ -165,9 +240,12 @@ def fetch_historical_intraday_bars(
             api_key,
             f"/v2/aggs/ticker/{ticker}/range/{multiplier}/minute/{start_ms}/{end_ms}",
             params={"adjusted": "true", "sort": "asc", "limit": "5000"},
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
     except Exception as exc:
         log(f"intraday bars fetch error for {ticker} on {trading_day}: {exc}")
+        _raise_if_offline(cache, exc)
         return []
 
     results = data.get("results", [])
@@ -189,6 +267,14 @@ class PolygonCache:
     option_bars: dict[str, dict[str, dict]] = field(default_factory=dict)
     # (ticker, date_iso, multiplier) -> list[agg_bar_dict]
     intraday_bars: dict[tuple[str, str, int], list[dict]] = field(default_factory=dict)
+    # (ticker, start_iso, end_iso) -> list[daily_bar_dict]
+    daily_bars: dict[tuple[str, str, str], list[dict]] = field(default_factory=dict)
+    # (ticker, as_of_iso, multiplier) -> list[agg_bar_dict] filtered to < as_of
+    session_bars_before: dict[tuple[str, str, int], list[dict]] = field(default_factory=dict)
+    # (ticker, as_of_iso, lookback_days, bar_minutes) -> metrics dict
+    ticker_metrics: dict[tuple[str, str, int, int], dict | None] = field(default_factory=dict)
+    store: PolygonResponseStore | None = None
+    offline: bool = False
 
 
 def _coerce_eastern_datetime(
@@ -249,6 +335,71 @@ def _first_bar_at_or_after(bars: list[dict], cutoff: datetime) -> dict | None:
     return None
 
 
+def _nth_weekday_of_month(year: int, month: int, weekday: int, occurrence: int) -> date:
+    current = date(year, month, 1)
+    while current.weekday() != weekday:
+        current += timedelta(days=1)
+    return current + timedelta(days=7 * (occurrence - 1))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        current = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        current = date(year, month + 1, 1) - timedelta(days=1)
+    while current.weekday() != weekday:
+        current -= timedelta(days=1)
+    return current
+
+
+def _observed_weekday_holiday(holiday: date) -> date:
+    if holiday.weekday() == 5:
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def _easter_sunday(year: int) -> date:
+    """Anonymous Gregorian algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+@lru_cache(maxsize=None)
+def _nyse_holidays(year: int) -> frozenset[date]:
+    holidays = {
+        _observed_weekday_holiday(date(year, 1, 1)),      # New Year's Day
+        _nth_weekday_of_month(year, 1, 0, 3),             # Martin Luther King Jr. Day
+        _nth_weekday_of_month(year, 2, 0, 3),             # Presidents Day
+        _easter_sunday(year) - timedelta(days=2),         # Good Friday
+        _last_weekday_of_month(year, 5, 0),               # Memorial Day
+        _observed_weekday_holiday(date(year, 6, 19)),     # Juneteenth
+        _observed_weekday_holiday(date(year, 7, 4)),      # Independence Day
+        _nth_weekday_of_month(year, 9, 0, 1),             # Labor Day
+        _nth_weekday_of_month(year, 11, 3, 4),            # Thanksgiving
+        _observed_weekday_holiday(date(year, 12, 25)),    # Christmas
+    }
+    return frozenset(holidays)
+
+
+def _is_trading_day(value: date) -> bool:
+    return value.weekday() < 5 and value not in _nyse_holidays(value.year)
+
+
 def _decision_timestamps_for_day(
     trading_day: date,
     interval_minutes: int,
@@ -307,9 +458,12 @@ def fetch_polygon_option_contracts(
             api_key,
             "/v3/reference/options/contracts",
             params=params,
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
     except Exception as exc:
         log(f"option contracts fetch error for {underlying}: {exc}")
+        _raise_if_offline(cache, exc)
         return []
 
     results = data.get("results", [])
@@ -338,9 +492,12 @@ def fetch_option_daily_bar(
             f"/v2/aggs/ticker/{option_ticker}/range/1/day"
             f"/{date_key}/{date_key}",
             params={"adjusted": "true", "sort": "asc", "limit": "1"},
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
     except Exception as exc:
         log(f"option bar fetch error for {option_ticker} on {trade_date}: {exc}")
+        _raise_if_offline(cache, exc)
         return None
 
     results = data.get("results", [])
@@ -367,9 +524,12 @@ def fetch_option_daily_bars_range(
             f"/v2/aggs/ticker/{option_ticker}/range/1/day"
             f"/{start.isoformat()}/{end.isoformat()}",
             params={"adjusted": "true", "sort": "asc", "limit": "250"},
+            store=cache.store if cache else None,
+            offline=cache.offline if cache else False,
         )
     except Exception as exc:
         log(f"option bars range fetch error for {option_ticker}: {exc}")
+        _raise_if_offline(cache, exc)
         return []
 
     results = data.get("results", [])
@@ -452,7 +612,7 @@ def _current_equity_bar(
         return _latest_intraday_bar_before(
             api_key, symbol, as_of, cache=cache, multiplier=bar_minutes,
         )
-    return fetch_historical_daily_bar(api_key, symbol, as_of)
+    return fetch_historical_daily_bar(api_key, symbol, as_of, cache=cache)
 
 
 def _session_intraday_bars_before(
@@ -463,6 +623,9 @@ def _session_intraday_bars_before(
     multiplier: int = 5,
 ) -> list[dict]:
     as_of_dt = _coerce_eastern_datetime(as_of)
+    cache_key = (ticker, as_of_dt.isoformat(), multiplier)
+    if cache and cache_key in cache.session_bars_before:
+        return cache.session_bars_before[cache_key]
     bars = fetch_historical_intraday_bars(
         api_key, ticker, as_of_dt.date(), multiplier=multiplier, cache=cache,
     )
@@ -471,6 +634,8 @@ def _session_intraday_bars_before(
         ts = _bar_timestamp_eastern(bar)
         if ts and ts < as_of_dt:
             eligible.append(bar)
+    if cache is not None:
+        cache.session_bars_before[cache_key] = eligible
     return eligible
 
 
@@ -531,6 +696,7 @@ def _select_real_contract(
     strike_preference: str,
     expiry_preference: str,
     default_dte: int,
+    expression_profile: str | None = None,
     contract_symbol: str | None = None,
     target_delta_range: tuple[float, float] | None = None,
     target_dte_range: tuple[int, int] | None = None,
@@ -541,6 +707,19 @@ def _select_real_contract(
 
     Returns the contract dict from Polygon or None if nothing suitable found.
     """
+    (
+        strike_preference,
+        expiry_preference,
+        target_delta_range,
+        target_dte_range,
+    ) = resolve_expression_profile(
+        strike_preference,
+        expiry_preference,
+        expression_profile=expression_profile,
+        target_delta_range=target_delta_range,
+        target_dte_range=target_dte_range,
+    )
+
     # Determine expiry range
     if target_dte_range is not None:
         resolved_min_dte = max(min(target_dte_range), 1)
@@ -562,7 +741,15 @@ def _select_real_contract(
         expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
         expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
-    strike_band_pct = 0.35 if (contract_symbol or target_delta_range is not None) else 0.15
+    strike_band_pct = (
+        0.35
+        if (
+            contract_symbol
+            or target_delta_range is not None
+            or expression_profile in {"time_cushion", "stock_proxy", "convex"}
+        )
+        else 0.15
+    )
     strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
     strike_lte = round(spot * (1.0 + strike_band_pct), 2)
 
@@ -640,6 +827,7 @@ class SimPosition:
     qty: int
     conviction: float
     reasoning: str
+    expression_profile: str = ""
     polygon_ticker: str = ""
 
     @property
@@ -660,8 +848,29 @@ class SimTrade:
     pnl: float
     exit_reason: str
     conviction: float
+    expression_profile: str = ""
     polygon_ticker: str = ""
     reasoning: str = ""
+
+
+def _exit_premium_for_position(
+    pos: SimPosition,
+    decision_time: datetime,
+    option_bar: dict | None,
+) -> float | None:
+    """Return the premium to use for auto-exit checks.
+
+    Expired contracts must leave the book even if Polygon has no bar left for
+    them; in that case we mark them at zero instead of keeping stale positions
+    alive indefinitely.
+    """
+    if option_bar is not None:
+        premium = _option_bar_price(option_bar)
+        if premium > 0:
+            return premium
+    if decision_time.date() >= pos.expiry_date:
+        return 0.0
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +899,12 @@ class BacktestConfig:
     journal_max_full_display: int = 5
     journal_stale_cycles: int = 8
     journal_stale_conviction: float = 0.4
+    offline: bool = False
+    prepare_only: bool = False
+    cache_db_path: Path | None = None
+    prepare_prefetch_symbols: int = config.PREPARE_PREFETCH_SYMBOLS
+    prepare_prefetch_contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE
+    prepare_prefetch_strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT
 
 
 @dataclass
@@ -712,21 +927,31 @@ class BacktestResult:
     decision_log: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class PrepareBacktestResult:
+    start_date: date
+    end_date: date
+    days_prepared: int
+    decision_points: int
+    cache_db_path: Path
+    cache_entries: int
+
+
 def _trading_days(start: date, end: date) -> list[date]:
-    """Generate weekdays between start and end (inclusive)."""
+    """Generate NYSE trading days between start and end (inclusive)."""
     days = []
     current = start
     while current <= end:
-        if current.weekday() < 5:
+        if _is_trading_day(current):
             days.append(current)
         current += timedelta(days=1)
     return days
 
 
 def _previous_trading_day(trade_date: date) -> date:
-    """Return the prior weekday for daily backtest signal generation."""
+    """Return the prior NYSE session for daily backtest signal generation."""
     previous = trade_date - timedelta(days=1)
-    while previous.weekday() >= 5:
+    while not _is_trading_day(previous):
         previous -= timedelta(days=1)
     return previous
 
@@ -735,7 +960,7 @@ def _last_completed_trading_day(as_of: date | datetime) -> date:
     """Return the most recent fully completed session available at as_of."""
     as_of_dt = _coerce_eastern_datetime(as_of)
     session_day = as_of_dt.date()
-    while session_day.weekday() >= 5:
+    while not _is_trading_day(session_day):
         session_day = _previous_trading_day(session_day)
     if as_of_dt < _market_close_dt(session_day):
         return _previous_trading_day(session_day)
@@ -820,6 +1045,34 @@ def _build_performance_summary(
     if not closed_trades:
         return ""
 
+    def _symbol_expiration(symbol: str) -> date | None:
+        for index, char in enumerate(symbol):
+            if not char.isdigit() or index + 6 > len(symbol):
+                continue
+            try:
+                value = symbol[index:index + 6]
+                year = 2000 + int(value[:2])
+                month = int(value[2:4])
+                day = int(value[4:6])
+                return date(year, month, day)
+            except ValueError:
+                continue
+        return None
+
+    def _entry_dte(trade: dict) -> int | None:
+        entry_raw = str(trade.get("entry_date", "") or "")[:10]
+        symbol = str(trade.get("symbol") or trade.get("polygon_ticker") or "")
+        if not entry_raw or not symbol:
+            return None
+        try:
+            entry_day = date.fromisoformat(entry_raw)
+        except ValueError:
+            return None
+        expiry = _symbol_expiration(symbol)
+        if expiry is None:
+            return None
+        return max((expiry - entry_day).days, 0)
+
     wins = [t for t in closed_trades if (t.get("pnl") or 0) > 0]
     losses = [t for t in closed_trades if (t.get("pnl") or 0) < 0]
     total = len(closed_trades)
@@ -892,6 +1145,42 @@ def _build_performance_summary(
             f"({m_wins}W/{m_losses}L)"
         )
 
+    high_conviction = [t for t in closed_trades if float(t.get("conviction") or 0) >= 0.65]
+    if high_conviction:
+        high_conviction_wins = sum(1 for t in high_conviction if (t.get("pnl") or 0) > 0)
+        high_conviction_net = sum(t.get("pnl", 0) for t in high_conviction)
+        lines.append(
+            "High-conviction review (>=0.65): "
+            f"{high_conviction_wins}/{len(high_conviction)} wins net=${high_conviction_net:+,.0f}"
+        )
+
+    short_dte_trades = []
+    longer_dte_trades = []
+    for trade in closed_trades:
+        entry_dte = _entry_dte(trade)
+        if entry_dte is None:
+            continue
+        if entry_dte <= 10:
+            short_dte_trades.append(trade)
+        else:
+            longer_dte_trades.append(trade)
+
+    if short_dte_trades:
+        short_wins = sum(1 for trade in short_dte_trades if (trade.get("pnl") or 0) > 0)
+        short_net = sum(trade.get("pnl", 0) for trade in short_dte_trades)
+        lines.append(
+            "Fast-decay review (<=10 DTE at entry): "
+            f"{short_wins}/{len(short_dte_trades)} wins net=${short_net:+,.0f}"
+        )
+    if longer_dte_trades:
+        long_wins = sum(1 for trade in longer_dte_trades if (trade.get("pnl") or 0) > 0)
+        long_net = sum(trade.get("pnl", 0) for trade in longer_dte_trades)
+        lines.append(
+            "More-time review (>10 DTE at entry): "
+            f"{long_wins}/{len(longer_dte_trades)} wins net=${long_net:+,.0f}"
+        )
+    lines.extend(profile_calibration_lines(closed_trades))
+
     lines.extend([
         f"Total trades: {total} | Wins: {n_wins} | Losses: {n_losses} | Win rate: {win_rate:.1f}%",
         f"Net P&L: ${net_pnl:+,.2f} | Equity: ${equity:,.2f} ({ret_pct:+.1f}% vs start)",
@@ -912,12 +1201,11 @@ def _build_market_trend_context(
     lookback_days: int = 10,
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> str:
     """Build market trend context using only information available at as_of."""
     is_intraday = isinstance(as_of, datetime)
     as_of_dt = _coerce_eastern_datetime(as_of)
-    last_completed_day = _last_completed_trading_day(as_of_dt)
-    start = last_completed_day - timedelta(days=int(lookback_days * 1.8))
     if is_intraday:
         lines = [
             f"Major Indices ({lookback_days}-day view) as of "
@@ -929,60 +1217,24 @@ def _build_market_trend_context(
         change_label = "today"
 
     for idx_sym in ["SPY", "QQQ", "IWM"]:
-        bars = fetch_historical_daily_bars_range(api_key, idx_sym, start, last_completed_day)
-        time_module.sleep(0.25)
-        if not bars:
+        metrics = _ticker_price_metrics_as_of(
+            api_key,
+            idx_sym,
+            as_of_dt,
+            lookback_days=lookback_days,
+            cache=cache,
+            bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
+        )
+        if not metrics:
             continue
-
-        current_price = float(bars[-1].get("c", 0))
-        intraday_chg = 0.0
-
-        if isinstance(as_of, datetime):
-            intraday_bars = _session_intraday_bars_before(
-                api_key, idx_sym, as_of_dt, cache=cache, multiplier=bar_minutes,
-            )
-            if intraday_bars:
-                first_bar = intraday_bars[0]
-                latest_bar = intraday_bars[-1]
-                current_price = _equity_bar_price(latest_bar)
-                session_open = float(first_bar.get("o", 0))
-                intraday_chg = (
-                    (current_price - session_open) / session_open * 100
-                    if session_open > 0 and current_price > 0 else 0.0
-                )
-        else:
-            today_bar = bars[-1]
-            today_open = float(today_bar.get("o", 0))
-            intraday_chg = (
-                (current_price - today_open) / today_open * 100
-                if today_open > 0 and current_price > 0 else 0.0
-            )
-
-        if current_price <= 0:
-            continue
-
-        five_d_chg = 0.0
-        if len(bars) >= 6:
-            ref = float(bars[-6].get("c", 0))
-            if ref > 0:
-                five_d_chg = (current_price - ref) / ref * 100
-
-        ten_d_chg = 0.0
-        if len(bars) >= 11:
-            ref = float(bars[-11].get("c", 0))
-            if ref > 0:
-                ten_d_chg = (current_price - ref) / ref * 100
-
-        recent_bars = bars[-lookback_days:] if len(bars) >= lookback_days else bars
-        avg_close = sum(float(b.get("c", 0)) for b in recent_bars) / len(recent_bars)
-        trend = "up" if current_price >= avg_close else "down"
 
         lines.append(
-            f"  {idx_sym}: ${current_price:.2f}"
-            f" {change_label}({intraday_chg:+.2f}%)"
-            f" 5d({five_d_chg:+.1f}%)"
-            f" 10d({ten_d_chg:+.1f}%)"
-            f" trend={trend}"
+            f"  {idx_sym}: ${metrics['price']:.2f}"
+            f" {change_label}({metrics['intraday_chg']:+.2f}%)"
+            f" 5d({metrics['five_d_chg']:+.1f}%)"
+            f" 10d({metrics['ten_d_chg']:+.1f}%)"
+            f" trend={metrics['trend']}"
         )
 
     return "\n".join(lines)
@@ -995,6 +1247,7 @@ def _build_ticker_price_context(
     lookback_days: int = 10,
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> tuple[str | None, float]:
     """Build price trend context for a single ticker as of a timestamp."""
     metrics = _ticker_price_metrics_as_of(
@@ -1004,6 +1257,7 @@ def _build_ticker_price_context(
         lookback_days=lookback_days,
         cache=cache,
         bar_minutes=bar_minutes,
+        metrics_cache=metrics_cache,
     )
     if not metrics:
         return None, 0.0
@@ -1014,6 +1268,7 @@ def _build_ticker_price_context(
         f" 5d({metrics['five_d_chg']:+.1f}%)"
         f" 10d({metrics['ten_d_chg']:+.1f}%)"
         f" {'session' if metrics['is_intraday'] else 'hi/lo'}=${metrics['session_low']:.0f}/${metrics['session_high']:.0f}"
+        f" range={metrics['range_pos_pct']:.0f}% {metrics['range_label']}"
     )
     if metrics["is_intraday"]:
         ctx += (
@@ -1029,14 +1284,34 @@ def _ticker_price_metrics_as_of(
     lookback_days: int = 10,
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> dict | None:
     """Return price/trend metrics for a ticker using only info available at as_of."""
     is_intraday = isinstance(as_of, datetime)
     as_of_dt = _coerce_eastern_datetime(as_of)
+    normalized_ticker = ticker.upper()
+    if metrics_cache is not None and normalized_ticker in metrics_cache:
+        return metrics_cache[normalized_ticker]
+    cache_key = (normalized_ticker, as_of_dt.isoformat(), lookback_days, bar_minutes)
+    if cache is not None and cache_key in cache.ticker_metrics:
+        cached = cache.ticker_metrics[cache_key]
+        if metrics_cache is not None:
+            metrics_cache[normalized_ticker] = cached
+        return cached
     last_completed_day = _last_completed_trading_day(as_of_dt)
     start = last_completed_day - timedelta(days=int(lookback_days * 1.8))
-    bars = fetch_historical_daily_bars_range(api_key, ticker, start, last_completed_day)
+    bars = fetch_historical_daily_bars_range(
+        api_key,
+        ticker,
+        start,
+        last_completed_day,
+        cache=cache,
+    )
     if not bars:
+        if cache is not None:
+            cache.ticker_metrics[cache_key] = None
+        if metrics_cache is not None:
+            metrics_cache[normalized_ticker] = None
         return None
 
     current_price = float(bars[-1].get("c", 0))
@@ -1087,13 +1362,23 @@ def _ticker_price_metrics_as_of(
     recent_bars = bars[-lookback_days:] if len(bars) >= lookback_days else bars
     recent_high = max(float(b.get("h", 0)) for b in recent_bars)
     recent_low = min(float(b.get("l", float("inf"))) for b in recent_bars)
+    if recent_high > recent_low:
+        range_pos_pct = max(0.0, min(100.0, (current_price - recent_low) / (recent_high - recent_low) * 100))
+    else:
+        range_pos_pct = 50.0
+    if range_pos_pct >= 85:
+        range_label = "near_10d_high"
+    elif range_pos_pct <= 15:
+        range_label = "near_10d_low"
+    else:
+        range_label = "mid_range"
     if not is_intraday:
         session_high = recent_high
         session_low = recent_low
     trend = "up" if current_price >= (
         sum(float(b.get("c", 0)) for b in recent_bars) / len(recent_bars)
     ) else "down"
-    return {
+    result = {
         "price": current_price,
         "intraday_chg": intraday_chg,
         "five_d_chg": five_d_chg,
@@ -1102,9 +1387,16 @@ def _ticker_price_metrics_as_of(
         "session_low": session_low,
         "recent_high": recent_high,
         "recent_low": recent_low,
+        "range_pos_pct": range_pos_pct,
+        "range_label": range_label,
         "trend": trend,
         "is_intraday": is_intraday,
     }
+    if cache is not None:
+        cache.ticker_metrics[cache_key] = result
+    if metrics_cache is not None:
+        metrics_cache[normalized_ticker] = result
+    return result
 
 
 def _build_catalyst_reaction_context(
@@ -1115,6 +1407,7 @@ def _build_catalyst_reaction_context(
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
     max_events: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> str:
     lines = ["Catalyst Reaction Snapshot:"]
     seen: set[str] = set()
@@ -1131,6 +1424,7 @@ def _build_catalyst_reaction_context(
             as_of,
             cache=cache,
             bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
         )
         if not metrics:
             continue
@@ -1192,7 +1486,11 @@ def _annotate_closed_trades(
             if cache_key not in underlying_bars_cache:
                 # Fetch full range — usually already available from other queries
                 bars = fetch_historical_daily_bars_range(
-                    api_key, underlying, entry_dt, exit_dt,
+                    api_key,
+                    underlying,
+                    entry_dt,
+                    exit_dt,
+                    cache=cache,
                 )
                 underlying_bars_cache[cache_key] = bars
 
@@ -1247,6 +1545,7 @@ def _build_focus_tickers(
     as_of: date | datetime,
     cache: PolygonCache,
     max_tickers: int = config.WATCHLIST_SIZE,
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> tuple[str, list[str]]:
     """Build a candidate table and finalist symbols for deep-dive context."""
     source_tags_by_symbol: dict[str, set[str]] = {}
@@ -1303,6 +1602,7 @@ def _build_focus_tickers(
             symbol,
             as_of,
             cache=cache,
+            metrics_cache=metrics_cache,
         )
         if not metrics:
             continue
@@ -1341,8 +1641,11 @@ def _build_options_context(
     tickers: list[str],
     as_of: date | datetime,
     cache: PolygonCache,
+    best_events: dict[str, object] | None = None,
+    closed_trades: list[dict] | None = None,
     default_dte: int = 14,
     bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
 ) -> str:
     """Build a real options context string for the most-discussed tickers.
 
@@ -1356,17 +1659,32 @@ def _build_options_context(
     trade_date = as_of_dt.date()
     lines: list[str] = [
         "Available options for the current focus tickers "
-        f"(as of {as_of_dt.strftime('%H:%M %Z')}):"
+        f"(as of {as_of_dt.strftime('%H:%M %Z')}, detailed premium shown for the primary call/put only):"
     ]
+    lines.extend(expression_guidance_lines(closed_trades or []))
     found_any = False
 
     expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
     expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
-    for ticker in tickers[: config.CANDIDATE_FINALISTS]:
+    for ticker in tickers:
+        metrics = _ticker_price_metrics_as_of(
+            api_key,
+            ticker,
+            as_of_dt,
+            cache=cache,
+            lookback_days=10,
+            bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
+        )
         # Fetch spot price + trend context (single range query, no extra call)
         trend_ctx, spot = _build_ticker_price_context(
-            api_key, ticker, as_of_dt, cache=cache, bar_minutes=bar_minutes,
+            api_key,
+            ticker,
+            as_of_dt,
+            cache=cache,
+            bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
         )
         if spot <= 0:
             bar = _current_equity_bar(
@@ -1382,6 +1700,13 @@ def _build_options_context(
             lines.append(f"  {ticker} ({trend_ctx}):")
         else:
             lines.append(f"  {ticker} (spot=${spot:.2f}):")
+        lines.append(
+            format_symbol_setup_context(
+                ticker,
+                metrics,
+                (best_events or {}).get(ticker.upper()),
+            )
+        )
         strike_gte = round(spot * 0.97, 2)
         strike_lte = round(spot * 1.03, 2)
 
@@ -1411,54 +1736,194 @@ def _build_options_context(
             )[:3]
             if ranked_contracts:
                 lines.append(f"    {opt_type.upper()} shortlist:")
-            for best in ranked_contracts:
+            for idx, best in enumerate(ranked_contracts):
                 opt_ticker = best.get("ticker", "")
                 strike = float(best.get("strike_price", 0) or 0)
                 expiry = str(best.get("expiration_date") or "")
                 if not opt_ticker or strike <= 0:
                     continue
 
+                dte = default_dte
+                try:
+                    dte = max((date.fromisoformat(expiry) - trade_date).days, 0)
+                except ValueError:
+                    pass
+                delta = abs(approx_delta(strike, spot, max(dte, 1), opt_type))
+
+                if idx > 0:
+                    lines.append(
+                        f"      {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
+                        f" delta~{delta:.2f} alt"
+                    )
+                    found_any = True
+                    continue
+
                 session_bars = _session_intraday_bars_before(
                     api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
                 )
-                if session_bars:
-                    opt_bar = session_bars[-1]
-                    premium = _option_bar_price(opt_bar)
-                    vol = sum(int(b.get("v") or 0) for b in session_bars)
-                    lows = [float(b.get("l", 0)) for b in session_bars if float(b.get("l", 0)) > 0]
-                    highs = [float(b.get("h", 0)) for b in session_bars if float(b.get("h", 0)) > 0]
-                    session_range = (
-                        f" session_range=${min(lows):.2f}-${max(highs):.2f}"
-                        if lows and highs else ""
-                    )
-                else:
-                    opt_bar = fetch_option_daily_bar(api_key, opt_ticker, trade_date, cache=cache)
-                    premium = _option_bar_price(opt_bar) if opt_bar else 0
-                    vol = int(opt_bar.get("v", 0)) if opt_bar else 0
-                    session_range = ""
+                if not session_bars:
+                    continue
 
-                if premium > 0:
-                    dte = default_dte
-                    try:
-                        dte = max((date.fromisoformat(expiry) - trade_date).days, 0)
-                    except ValueError:
-                        pass
-                    delta = abs(approx_delta(strike, spot, max(dte, 1), opt_type))
-                    bar_time = _bar_timestamp_eastern(opt_bar) if opt_bar else None
-                    bar_label = f" asof={bar_time.strftime('%H:%M')}" if bar_time else ""
-                    lines.append(
-                        f"      {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
-                        f" delta~{delta:.2f} premium=${premium:.2f} vol={vol}{session_range}{bar_label}"
-                    )
-                    found_any = True
-
-        # Rate limit between tickers (range bars + contract lookups + option bars)
-        time_module.sleep(1.0)
+                opt_bar = session_bars[-1]
+                premium = _option_bar_price(opt_bar)
+                if premium <= 0:
+                    continue
+                vol = sum(int(b.get("v") or 0) for b in session_bars)
+                lows = [float(b.get("l", 0)) for b in session_bars if float(b.get("l", 0)) > 0]
+                highs = [float(b.get("h", 0)) for b in session_bars if float(b.get("h", 0)) > 0]
+                session_range = (
+                    f" session_range=${min(lows):.2f}-${max(highs):.2f}"
+                    if lows and highs else ""
+                )
+                bar_time = _bar_timestamp_eastern(opt_bar)
+                bar_label = f" asof={bar_time.strftime('%H:%M')}" if bar_time else ""
+                lines.append(
+                    f"      {opt_ticker} {opt_type.upper()} ${strike:.2f} exp={expiry}"
+                    f" delta~{delta:.2f} premium=${premium:.2f} vol={vol}{session_range}{bar_label}"
+                )
+                found_any = True
 
     if not found_any:
         return "(Backtest mode: real Polygon options data used for pricing)"
 
     return "\n".join(lines)
+
+
+def _contract_moneyness_bucket(option_type: str, strike: float, spot: float) -> str:
+    if strike <= 0 or spot <= 0:
+        return "atm"
+    distance_pct = abs(strike - spot) / spot
+    if distance_pct <= 0.02:
+        return "atm"
+    if option_type == "call":
+        return "itm" if strike < spot else "otm"
+    return "itm" if strike > spot else "otm"
+
+
+def _rank_prefetch_contracts(
+    contracts: list[dict],
+    *,
+    spot: float,
+    trade_date: date,
+    default_dte: int,
+    option_type: str,
+    limit: int,
+) -> list[dict]:
+    if limit <= 0 or not contracts:
+        return []
+
+    def _shortlist_key(contract: dict) -> tuple[float, int, str]:
+        strike = float(contract.get("strike_price", 0) or 0)
+        expiry_raw = str(contract.get("expiration_date") or "")
+        try:
+            expiry = date.fromisoformat(expiry_raw)
+            dte = max((expiry - trade_date).days, 0)
+        except ValueError:
+            dte = default_dte
+        return (
+            abs(strike - spot),
+            abs(dte - default_dte),
+            str(contract.get("ticker") or ""),
+        )
+
+    buckets: dict[str, list[dict]] = {"atm": [], "itm": [], "otm": []}
+    for contract in sorted(contracts, key=_shortlist_key):
+        strike = float(contract.get("strike_price", 0) or 0)
+        bucket = _contract_moneyness_bucket(option_type, strike, spot)
+        buckets.setdefault(bucket, []).append(contract)
+
+    ranked: list[dict] = []
+    while len(ranked) < limit and any(buckets.values()):
+        for bucket in ("atm", "itm", "otm"):
+            queue = buckets.get(bucket, [])
+            if not queue:
+                continue
+            ranked.append(queue.pop(0))
+            if len(ranked) >= limit:
+                break
+    return ranked
+
+
+def _prefetch_prepare_option_data(
+    api_key: str,
+    tickers: list[str],
+    as_of: date | datetime,
+    cache: PolygonCache,
+    default_dte: int = 14,
+    bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
+    max_symbols: int = config.PREPARE_PREFETCH_SYMBOLS,
+    contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE,
+    strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT,
+) -> int:
+    """Warm a broader option universe for offline backtests.
+
+    This is only used in prepare mode so the cold vendor cost is paid once,
+    outside the actual model/backtest comparison loop.
+    """
+    if not tickers or max_symbols <= 0 or contracts_per_side <= 0:
+        return 0
+
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    trade_date = as_of_dt.date()
+    expiry_gte = trade_date + timedelta(days=max(config.PREFERRED_DTE_MIN, default_dte - 10))
+    expiry_lte = trade_date + timedelta(days=min(config.PREFERRED_DTE_MAX, default_dte + 21))
+    prefetched: set[str] = set()
+
+    for ticker in tickers[:max_symbols]:
+        _, spot = _build_ticker_price_context(
+            api_key,
+            ticker,
+            as_of_dt,
+            cache=cache,
+            bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
+        )
+        if spot <= 0:
+            continue
+
+        strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
+        strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+        for option_type in ("call", "put"):
+            contracts = fetch_polygon_option_contracts(
+                api_key,
+                ticker,
+                option_type,
+                expiry_gte,
+                expiry_lte,
+                strike_gte,
+                strike_lte,
+                as_of=trade_date,
+                cache=cache,
+            )
+            ranked_contracts = _rank_prefetch_contracts(
+                contracts,
+                spot=spot,
+                trade_date=trade_date,
+                default_dte=default_dte,
+                option_type=option_type,
+                limit=contracts_per_side,
+            )
+            for contract in ranked_contracts:
+                option_ticker = str(contract.get("ticker") or "")
+                if not option_ticker or option_ticker in prefetched:
+                    continue
+                fetch_historical_intraday_bars(
+                    api_key,
+                    option_ticker,
+                    trade_date,
+                    multiplier=bar_minutes,
+                    cache=cache,
+                )
+                fetch_option_daily_bar(
+                    api_key,
+                    option_ticker,
+                    trade_date,
+                    cache=cache,
+                )
+                prefetched.add(option_ticker)
+
+    return len(prefetched)
 
 
 def _build_enriched_portfolio_context(
@@ -1537,25 +2002,31 @@ def _build_enriched_portfolio_context(
     return "\n".join(lines)
 
 
+def _historical_cache_path(bt_config: BacktestConfig) -> Path:
+    return Path(bt_config.cache_db_path or DEFAULT_HISTORICAL_CACHE_DB_PATH)
+
+
 def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     """Run the full backtest using real Polygon options data."""
-
-    llm_provider = infer_provider(
-        model=config.LLM_MODEL,
-        provider=os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER,
-    )
-    llm_api_key = resolve_api_key(llm_provider)
-    polygon_key = os.environ.get("POLYGON_API_KEY")
-    if not llm_api_key:
-        raise ValueError(f"{api_key_env_name(llm_provider)} required for backtesting")
-    if not polygon_key:
+    llm_provider = ""
+    brain: TradingBrain | None = None
+    if not bt_config.prepare_only:
+        llm_model = config.resolved_llm_model()
+        llm_provider = infer_provider(
+            model=llm_model,
+            provider=os.environ.get("LLM_PROVIDER") or config.LLM_PROVIDER,
+        )
+        llm_api_key = resolve_api_key(llm_provider)
+        if not llm_api_key:
+            raise ValueError(f"{api_key_env_name(llm_provider)} required for backtesting")
+        brain = TradingBrain(
+            api_key=llm_api_key,
+            provider=llm_provider,
+            model=llm_model,
+        )
+    polygon_key = os.environ.get("POLYGON_API_KEY") or ""
+    if not polygon_key and not bt_config.offline:
         raise ValueError("POLYGON_API_KEY required for backtesting")
-
-    brain = TradingBrain(
-        api_key=llm_api_key,
-        provider=llm_provider,
-        model=config.LLM_MODEL,
-    )
     journal = ThesisJournal(
         max_active=bt_config.journal_max_active,
         max_full_display=bt_config.journal_max_full_display,
@@ -1572,11 +2043,18 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     max_dd = 0.0
     daily_returns: list[float] = []
 
-    # Polygon cache — avoids redundant API calls for option bars
-    cache = PolygonCache()
+    # Polygon cache — avoids redundant API calls in-process and across runs.
+    cache = PolygonCache(
+        store=PolygonResponseStore(_historical_cache_path(bt_config)),
+        offline=bt_config.offline,
+    )
 
     log(f"backtest: {bt_config.start_date} to {bt_config.end_date} ({len(trading_days)} days)")
     log(f"initial equity: ${equity:,.2f}")
+    if bt_config.prepare_only:
+        log(f"mode: prepare-only cache warm ({cache.store.db_path})")
+    elif bt_config.offline:
+        log(f"mode: offline cache replay ({cache.store.db_path})")
     prior_day_equity = bt_config.initial_equity
     for day_idx, trade_date in enumerate(trading_days):
         log(
@@ -1605,12 +2083,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     cache=cache,
                     bar_minutes=bt_config.signal_bar_minutes,
                 )
-                if option_bar is None:
-                    remaining.append(pos)
-                    continue
-
-                current_premium = _option_bar_price(option_bar)
-                if current_premium <= 0:
+                current_premium = _exit_premium_for_position(pos, decision_time, option_bar)
+                if current_premium is None:
                     remaining.append(pos)
                     continue
 
@@ -1644,6 +2118,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                             pnl=trade_pnl,
                             exit_reason=exit_reason,
                             conviction=pos.conviction,
+                            expression_profile=pos.expression_profile,
                             polygon_ticker=pos.polygon_ticker,
                             reasoning=pos.reasoning,
                         )
@@ -1651,12 +2126,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     closed_trades.append({
                         "timestamp": decision_time.isoformat(),
                         "entry_date": pos.entry_date.isoformat(),
+                        "symbol": pos.polygon_ticker,
                         "underlying": pos.underlying,
                         "option_type": pos.option_type,
                         "entry_premium": pos.entry_premium,
                         "exit_premium": current_premium,
                         "pnl": trade_pnl,
                         "reason": exit_reason,
+                        "conviction": pos.conviction,
+                        "expression_profile": pos.expression_profile,
                         "polygon_ticker": pos.polygon_ticker,
                     })
                     log(
@@ -1682,6 +2160,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 news_window_start,
                 decision_time,
                 limit=50,
+                cache=cache,
             )
             news = _filter_news_quality(news_raw)
             log(
@@ -1696,6 +2175,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 reference_time=decision_time,
             )
             news_events = build_news_events(news_items, reference_time=decision_time)
+            metrics_cache: dict[str, dict | None] = {}
             candidate_context, finalist_symbols = _build_focus_tickers(
                 news_events,
                 positions,
@@ -1703,6 +2183,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 polygon_key,
                 decision_time,
                 cache,
+                metrics_cache=metrics_cache,
             )
             deep_focus_symbols = list(dict.fromkeys(context_focus_symbols + finalist_symbols))
             news_context = _format_news_for_backtest(
@@ -1717,6 +2198,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 focus_symbols=deep_focus_symbols,
                 cache=cache,
                 bar_minutes=bt_config.signal_bar_minutes,
+                metrics_cache=metrics_cache,
             )
             if catalyst_reaction_context:
                 news_context = f"{catalyst_reaction_context}\n\n{news_context}"
@@ -1726,6 +2208,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 decision_time,
                 cache=cache,
                 bar_minutes=bt_config.signal_bar_minutes,
+                metrics_cache=metrics_cache,
             )
             portfolio_context = _build_enriched_portfolio_context(
                 account_equity,
@@ -1741,8 +2224,11 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             )
 
             journal_context = journal.to_context_str() if journal else ""
-            annotated_trades = _annotate_closed_trades(closed_trades, polygon_key, cache)
-            trade_history_context = format_trade_history([], annotated_trades[-10:]) if journal else ""
+            trade_history_context = ""
+            annotated_trades = list(closed_trades)
+            if journal and closed_trades:
+                annotated_trades = _annotate_closed_trades(closed_trades, polygon_key, cache)
+                trade_history_context = format_trade_history([], annotated_trades[-10:])
             perf_summary = _build_performance_summary(
                 closed_trades,
                 account_equity,
@@ -1751,14 +2237,66 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             if perf_summary:
                 trade_history_context += perf_summary
 
+            position_symbols = [p.underlying.upper() for p in positions if p.underlying]
+            thesis_symbols = [
+                entry.underlying.upper()
+                for entry in (journal.active_entries() if journal else [])
+                if entry.underlying
+            ]
+            options_watchlist = prioritized_symbol_watchlist(
+                position_symbols,
+                thesis_symbols,
+                finalist_symbols,
+                limit=min(
+                    config.WATCHLIST_SIZE,
+                    len(position_symbols) + len(thesis_symbols) + config.CANDIDATE_FINALISTS,
+                ),
+            )
+
             options_context = _build_options_context(
                 polygon_key,
-                finalist_symbols or deep_focus_symbols,
+                options_watchlist or deep_focus_symbols,
                 decision_time,
                 cache,
-                bt_config.default_dte,
+                best_events=map_best_events_by_symbol(news_events),
+                closed_trades=annotated_trades,
+                default_dte=bt_config.default_dte,
                 bar_minutes=bt_config.signal_bar_minutes,
+                metrics_cache=metrics_cache,
             )
+
+            if bt_config.prepare_only:
+                prefetch_symbols = list(dict.fromkeys(finalist_symbols + deep_focus_symbols))
+                prefetched_contracts = _prefetch_prepare_option_data(
+                    polygon_key,
+                    prefetch_symbols,
+                    decision_time,
+                    cache,
+                    default_dte=bt_config.default_dte,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                    metrics_cache=metrics_cache,
+                    max_symbols=bt_config.prepare_prefetch_symbols,
+                    contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
+                    strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
+                )
+                cache_entries = cache.store.entry_count() if cache.store else 0
+                result.decision_log.append({
+                    "date": trade_date.isoformat(),
+                    "decision_time": decision_time.isoformat(),
+                    "news_window_start": news_window_start.isoformat(),
+                    "prepared_only": True,
+                    "finalists": finalist_symbols,
+                    "prefetched_option_contracts": prefetched_contracts,
+                    "cache_entries": cache_entries,
+                    "open_positions": len(positions),
+                })
+                log(
+                    f"  {decision_time.strftime('%H:%M')} PREPARED "
+                    f"finalists={len(finalist_symbols)} "
+                    f"prefetched_contracts={prefetched_contracts} "
+                    f"cache_entries={cache_entries}"
+                )
+                continue
 
             trade_results: list[dict] = []
             if bt_config.llm_delay_seconds > 0:
@@ -1845,6 +2383,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                             pnl=trade_pnl,
                             exit_reason="manual_close",
                             conviction=matched_pos.conviction,
+                            expression_profile=matched_pos.expression_profile,
                             polygon_ticker=matched_pos.polygon_ticker,
                             reasoning=matched_pos.reasoning,
                         )
@@ -1852,12 +2391,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     closed_trades.append({
                         "timestamp": decision_time.isoformat(),
                         "entry_date": matched_pos.entry_date.isoformat(),
+                        "symbol": matched_pos.polygon_ticker,
                         "underlying": matched_pos.underlying,
                         "option_type": matched_pos.option_type,
                         "entry_premium": matched_pos.entry_premium,
                         "exit_premium": exit_premium,
                         "pnl": trade_pnl,
                         "reason": "manual_close",
+                        "conviction": matched_pos.conviction,
+                        "expression_profile": matched_pos.expression_profile,
                         "polygon_ticker": matched_pos.polygon_ticker,
                     })
                     positions.remove(matched_pos)
@@ -1910,6 +2452,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     decision.strike_preference or "atm",
                     decision.expiry_preference or "next_week",
                     bt_config.default_dte,
+                    expression_profile=decision.expression_profile,
                     contract_symbol=decision.contract_symbol,
                     target_delta_range=decision.target_delta_range,
                     target_dte_range=decision.target_dte_range,
@@ -1974,6 +2517,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         qty=qty,
                         conviction=decision.conviction,
                         reasoning=decision.reasoning,
+                        expression_profile=decision.expression_profile or "",
                         polygon_ticker=polygon_ticker,
                     )
                 )
@@ -1981,6 +2525,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 trade_record["contract"] = polygon_ticker
                 trade_record["qty"] = qty
                 trade_record["premium"] = premium
+                if decision.expression_profile:
+                    trade_record["expression_profile"] = decision.expression_profile
                 trade_results.append(trade_record)
                 account_equity, _ = _mark_to_market_equity(
                     equity,
@@ -2045,8 +2591,6 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
         if dd > max_dd:
             max_dd = dd
 
-        time_module.sleep(0.25)
-
     # Close any remaining positions at last day
     last_date = trading_days[-1] if trading_days else bt_config.end_date
     for pos in positions:
@@ -2088,6 +2632,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 pnl=trade_pnl,
                 exit_reason="backtest_end",
                 conviction=pos.conviction,
+                expression_profile=pos.expression_profile,
                 polygon_ticker=pos.polygon_ticker,
                 reasoning=pos.reasoning,
             )
@@ -2123,6 +2668,25 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             result.sharpe_ratio = round((mean_r / std_r) * math.sqrt(252), 2)
 
     return result
+
+
+def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
+    """Warm the persistent historical cache without invoking the LLM."""
+    prepare_config = replace(
+        bt_config,
+        llm_delay_seconds=0.0,
+        prepare_only=True,
+    )
+    result = run_backtest(prepare_config)
+    store = PolygonResponseStore(_historical_cache_path(prepare_config))
+    return PrepareBacktestResult(
+        start_date=prepare_config.start_date,
+        end_date=prepare_config.end_date,
+        days_prepared=result.days_tested,
+        decision_points=len(result.decision_log),
+        cache_db_path=store.db_path,
+        cache_entries=store.entry_count(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2169,6 +2733,18 @@ def print_backtest_result(r: BacktestResult) -> None:
     print("=" * 60)
 
 
+def print_prepare_result(r: PrepareBacktestResult) -> None:
+    print("=" * 60)
+    print("  AI TRADER BACKTEST DATA PREP")
+    print("=" * 60)
+    print(f"\n  Period:           {r.start_date} to {r.end_date}")
+    print(f"  Trading days:     {r.days_prepared}")
+    print(f"  Decision points:  {r.decision_points}")
+    print(f"  Cache DB:         {r.cache_db_path}")
+    print(f"  Cache entries:    {r.cache_entries}")
+    print("=" * 60)
+
+
 def save_backtest_result(r: BacktestResult, path: Path) -> None:
     """Save backtest results to a JSON file."""
     out = {
@@ -2199,6 +2775,7 @@ def save_backtest_result(r: BacktestResult, path: Path) -> None:
                 "pnl": t.pnl,
                 "exit_reason": t.exit_reason,
                 "conviction": t.conviction,
+                "expression_profile": t.expression_profile,
                 "polygon_ticker": t.polygon_ticker,
                 "reasoning": t.reasoning,
             }
@@ -2209,6 +2786,20 @@ def save_backtest_result(r: BacktestResult, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
     log(f"results saved to {path}")
+
+
+def save_prepare_result(r: PrepareBacktestResult, path: Path) -> None:
+    out = {
+        "start_date": r.start_date.isoformat(),
+        "end_date": r.end_date.isoformat(),
+        "days_prepared": r.days_prepared,
+        "decision_points": r.decision_points,
+        "cache_db_path": str(r.cache_db_path),
+        "cache_entries": r.cache_entries,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2))
+    log(f"prepare summary saved to {path}")
 
 
 def save_debug_log(r: BacktestResult, path: Path) -> None:
@@ -2355,6 +2946,26 @@ def run() -> None:
         "--journal-max-display", type=int, default=5,
         help="Max theses shown in full detail (0=all, default=5)",
     )
+    parser.add_argument(
+        "--cache-db", type=str, default=None,
+        help="SQLite DB path for persistent historical Polygon cache",
+    )
+    parser.add_argument(
+        "--offline", action="store_true",
+        help="Fail on historical Polygon cache misses instead of going to the network",
+    )
+    parser.add_argument(
+        "--prepare-data", action="store_true",
+        help="Warm historical Polygon cache without invoking the LLM",
+    )
+    parser.add_argument(
+        "--prepare-prefetch-symbols", type=int, default=config.PREPARE_PREFETCH_SYMBOLS,
+        help="In prepare-data mode, number of symbols to broaden option prefetch for",
+    )
+    parser.add_argument(
+        "--prepare-prefetch-contracts", type=int, default=config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE,
+        help="In prepare-data mode, contracts per side to prefetch for each symbol",
+    )
     args = parser.parse_args()
 
     env_path = Path(__file__).with_name(".env")
@@ -2366,14 +2977,26 @@ def run() -> None:
         start_date=date.fromisoformat(args.start),
         end_date=date.fromisoformat(args.end),
         initial_equity=args.equity,
-        llm_delay_seconds=args.delay,
+        llm_delay_seconds=0.0 if args.prepare_data else args.delay,
         decision_interval_minutes=args.decision_interval,
         signal_bar_minutes=args.bar_minutes,
         news_lookback_hours=args.news_lookback_hours,
         use_journal=not args.no_journal,
         journal_max_active=args.journal_max_active,
         journal_max_full_display=args.journal_max_display,
+        offline=args.offline,
+        prepare_only=args.prepare_data,
+        cache_db_path=Path(args.cache_db) if args.cache_db else None,
+        prepare_prefetch_symbols=args.prepare_prefetch_symbols,
+        prepare_prefetch_contracts_per_side=args.prepare_prefetch_contracts,
     )
+
+    if args.prepare_data:
+        prepare_result = prepare_backtest_data(bt_config)
+        print_prepare_result(prepare_result)
+        if args.output:
+            save_prepare_result(prepare_result, Path(args.output))
+        return
 
     result = run_backtest(bt_config)
     print_backtest_result(result)

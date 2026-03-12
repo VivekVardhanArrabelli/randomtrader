@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(__file__).parent / "logs" / "ai_trades.db"
@@ -39,6 +40,7 @@ class AITradeRecord:
     market_analysis: str
     order_id: str | None
     status: str              # submitted / filled / rejected / error
+    expression_profile: str = ""
 
 
 @dataclass(frozen=True)
@@ -96,7 +98,8 @@ class AITradeLogger:
                     reasoning TEXT,
                     market_analysis TEXT,
                     order_id TEXT,
-                    status TEXT
+                    status TEXT,
+                    expression_profile TEXT
                 )
                 """
             )
@@ -142,6 +145,12 @@ class AITradeLogger:
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(ai_decisions)")
             }
+            trade_cols = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(ai_trades)")
+            }
+            if "expression_profile" not in trade_cols:
+                conn.execute("ALTER TABLE ai_trades ADD COLUMN expression_profile TEXT")
             if "llm_provider" not in decision_cols:
                 conn.execute("ALTER TABLE ai_decisions ADD COLUMN llm_provider TEXT")
             if "llm_model" not in decision_cols:
@@ -154,7 +163,7 @@ class AITradeLogger:
     def log_trade(self, record: AITradeRecord) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO ai_trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ai_trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.timestamp.isoformat(),
                     record.symbol,
@@ -171,6 +180,7 @@ class AITradeLogger:
                     record.market_analysis,
                     record.order_id,
                     record.status,
+                    record.expression_profile,
                 ),
             )
 
@@ -324,18 +334,25 @@ def _conviction_calibration(trades: list[dict], closes: list[dict]) -> list[str]
     """Group closes by conviction bucket and show win rate per bucket."""
     # Build a map from underlying -> conviction from the trades table
     # (trades table has conviction; closes table does not)
+    symbol_conviction: dict[str, float] = {}
     underlying_conviction: dict[str, float] = {}
     for t in trades:
         action = str(t.get("action") or "")
         if t.get("status") == "filled" and t.get("conviction") and action.startswith("buy_"):
+            symbol = t.get("symbol", "")
+            if symbol:
+                symbol_conviction[symbol] = float(t["conviction"])
             sym = t.get("underlying", "")
             underlying_conviction[sym] = float(t["conviction"])
 
     # Bucket: conviction -> list of pnl
     buckets: dict[str, list[float]] = {}
     for c in closes:
+        symbol = c.get("symbol", "")
         sym = c.get("underlying", "")
-        conv = underlying_conviction.get(sym)
+        conv = symbol_conviction.get(symbol)
+        if conv is None:
+            conv = underlying_conviction.get(sym)
         if conv is None:
             continue
         if conv < 0.7:
@@ -358,6 +375,198 @@ def _conviction_calibration(trades: list[dict], closes: list[dict]) -> list[str]
         total = len(pnls)
         wr = w / total * 100 if total > 0 else 0
         lines.append(f"    {bucket}: {w}/{total} wins ({wr:.0f}%)")
+    return lines
+
+
+def _symbol_expiration(symbol: str) -> date | None:
+    for match in re.finditer(r"(\d{6})[CP]", symbol):
+        value = match.group(1)
+        try:
+            return date(
+                2000 + int(value[:2]),
+                int(value[2:4]),
+                int(value[4:6]),
+            )
+        except ValueError:
+            continue
+    return None
+
+
+def _option_type_from_close(close: dict) -> str | None:
+    explicit = str(close.get("option_type") or "").lower().strip()
+    if explicit in {"call", "put"}:
+        return explicit
+    symbol = str(close.get("symbol") or close.get("polygon_ticker") or "")
+    match = re.search(r"\d{6}([CP])", symbol)
+    if not match:
+        return None
+    return "call" if match.group(1) == "C" else "put"
+
+
+def _entry_dte_from_close(close: dict) -> int | None:
+    entry_raw = str(close.get("entry_date", "") or "")[:10]
+    symbol = str(close.get("symbol") or close.get("polygon_ticker") or "")
+    if not entry_raw or not symbol:
+        return None
+    try:
+        entry_day = date.fromisoformat(entry_raw)
+    except ValueError:
+        return None
+    expiry = _symbol_expiration(symbol)
+    if expiry is None:
+        return None
+    return max((expiry - entry_day).days, 0)
+
+
+def _build_expression_profile_maps(trades: list[dict] | None) -> tuple[dict[str, str], dict[str, str]]:
+    if not trades:
+        return {}, {}
+
+    symbol_profiles: dict[str, str] = {}
+    underlying_profiles: dict[str, str] = {}
+    for trade in trades:
+        action = str(trade.get("action") or "")
+        status = str(trade.get("status") or "")
+        if not action.startswith("buy_") or status != "filled":
+            continue
+        profile = str(trade.get("expression_profile") or "").strip().lower()
+        if not profile:
+            continue
+        symbol = str(trade.get("symbol") or "")
+        underlying = str(trade.get("underlying") or "")
+        if symbol:
+            symbol_profiles[symbol] = profile
+        if underlying:
+            underlying_profiles[underlying] = profile
+    return symbol_profiles, underlying_profiles
+
+
+def _expression_profile_from_close(
+    close: dict,
+    symbol_profiles: dict[str, str],
+    underlying_profiles: dict[str, str],
+) -> str | None:
+    explicit = str(close.get("expression_profile") or "").strip().lower()
+    if explicit:
+        return explicit
+    symbol = str(close.get("symbol") or "")
+    if symbol and symbol in symbol_profiles:
+        return symbol_profiles[symbol]
+    underlying = str(close.get("underlying") or "")
+    if underlying and underlying in underlying_profiles:
+        return underlying_profiles[underlying]
+    return None
+
+
+def expression_guidance_lines(
+    closes: list[dict],
+    trades: list[dict] | None = None,
+    max_profiles: int = 4,
+) -> list[str]:
+    """Return short factual expression-outcome lines for the options packet."""
+    if not closes:
+        return []
+
+    symbol_profiles, underlying_profiles = _build_expression_profile_maps(trades)
+    by_profile: dict[str, list[dict]] = {}
+    for close in closes:
+        profile = _expression_profile_from_close(close, symbol_profiles, underlying_profiles)
+        if not profile:
+            continue
+        by_profile.setdefault(profile, []).append(close)
+
+    if not by_profile:
+        return []
+
+    ordered = sorted(
+        by_profile.items(),
+        key=lambda item: (len(item[1]), sum(float(row.get("pnl") or 0) for row in item[1])),
+        reverse=True,
+    )[:max_profiles]
+    segments = []
+    for profile, rows in ordered:
+        wins = sum(1 for row in rows if (row.get("pnl") or 0) > 0)
+        net = sum(float(row.get("pnl") or 0) for row in rows)
+        segments.append(f"{profile} {wins}/{len(rows)} wins net=${net:+,.0f}")
+
+    return ["Recent expression outcomes: " + " | ".join(segments)]
+
+
+def profile_calibration_lines(closes: list[dict], trades: list[dict] | None = None) -> list[str]:
+    """Summarize expression-level patterns without imposing trade vetoes."""
+    if not closes:
+        return []
+
+    def _summary(label: str, rows: list[dict]) -> str | None:
+        if not rows:
+            return None
+        wins = sum(1 for row in rows if (row.get("pnl") or 0) > 0)
+        net = sum(float(row.get("pnl") or 0) for row in rows)
+        return f"{label}: {wins}/{len(rows)} wins net=${net:+,.0f}"
+
+    symbol_profiles, underlying_profiles = _build_expression_profile_maps(trades)
+    by_profile: dict[str, list[dict]] = {}
+    for close in closes:
+        profile = _expression_profile_from_close(close, symbol_profiles, underlying_profiles)
+        if profile:
+            by_profile.setdefault(profile, []).append(close)
+
+    call_closes = [c for c in closes if _option_type_from_close(c) == "call"]
+    put_closes = [c for c in closes if _option_type_from_close(c) == "put"]
+    short_call_closes = [
+        c for c in call_closes
+        if (_entry_dte_from_close(c) is not None and _entry_dte_from_close(c) <= 14)
+    ]
+    short_put_closes = [
+        c for c in put_closes
+        if (_entry_dte_from_close(c) is not None and _entry_dte_from_close(c) <= 14)
+    ]
+    stop_loss_closes = [
+        c for c in closes
+        if str(c.get("reason") or "").strip().lower() == "stop_loss"
+    ]
+
+    lines: list[str] = []
+    if by_profile:
+        ordered_profiles = sorted(
+            by_profile.items(),
+            key=lambda item: (len(item[1]), sum(float(row.get("pnl") or 0) for row in item[1])),
+            reverse=True,
+        )
+        parts = []
+        for profile, rows in ordered_profiles:
+            wins = sum(1 for row in rows if (row.get("pnl") or 0) > 0)
+            net = sum(float(row.get("pnl") or 0) for row in rows)
+            parts.append(f"{profile} {wins}/{len(rows)} wins net=${net:+,.0f}")
+        lines.append("  Expression profiles: " + " | ".join(parts))
+
+    expression_parts = []
+    call_summary = _summary("Calls", call_closes)
+    if call_summary:
+        expression_parts.append(call_summary.replace("Calls: ", "Calls "))
+    put_summary = _summary("Puts", put_closes)
+    if put_summary:
+        expression_parts.append(put_summary.replace("Puts: ", "Puts "))
+    if expression_parts:
+        lines.append("  Expression review: " + " | ".join(expression_parts))
+
+    short_call_summary = _summary("Short-dated calls (<=14 DTE)", short_call_closes)
+    if short_call_summary:
+        lines.append(f"  {short_call_summary}")
+    short_put_summary = _summary("Short-dated puts (<=14 DTE)", short_put_closes)
+    if short_put_summary:
+        lines.append(f"  {short_put_summary}")
+
+    if stop_loss_closes:
+        stop_call = sum(1 for c in stop_loss_closes if _option_type_from_close(c) == "call")
+        stop_put = sum(1 for c in stop_loss_closes if _option_type_from_close(c) == "put")
+        stop_net = sum(float(c.get("pnl") or 0) for c in stop_loss_closes)
+        lines.append(
+            "  Stop-loss cluster: "
+            f"{len(stop_loss_closes)} trades net=${stop_net:+,.0f}"
+            f" | calls={stop_call} puts={stop_put}"
+        )
+
     return lines
 
 
@@ -436,6 +645,53 @@ def format_trade_history(trades: list[dict], closes: list[dict]) -> str:
         cal_lines = _conviction_calibration(trades, closes)
         if cal_lines:
             lines.extend(cal_lines)
+
+        profile_lines = profile_calibration_lines(closes, trades)
+        if profile_lines:
+            lines.extend(profile_lines)
+
+        symbol_conviction: dict[str, float] = {}
+        underlying_conviction: dict[str, float] = {}
+        for t in trades:
+            action = str(t.get("action") or "")
+            if t.get("status") == "filled" and t.get("conviction") and action.startswith("buy_"):
+                symbol = t.get("symbol", "")
+                if symbol:
+                    symbol_conviction[symbol] = float(t["conviction"])
+                underlying = t.get("underlying", "")
+                if underlying:
+                    underlying_conviction[underlying] = float(t["conviction"])
+
+        high_conviction_pnls: list[float] = []
+        low_conviction_pnls: list[float] = []
+        for c in closes:
+            symbol = c.get("symbol", "")
+            underlying = c.get("underlying", "")
+            conviction = symbol_conviction.get(symbol)
+            if conviction is None:
+                conviction = underlying_conviction.get(underlying)
+            if conviction is None:
+                continue
+            pnl = c.get("pnl", 0) or 0
+            if conviction >= 0.65:
+                high_conviction_pnls.append(pnl)
+            else:
+                low_conviction_pnls.append(pnl)
+
+        if high_conviction_pnls:
+            high_wins = sum(1 for pnl in high_conviction_pnls if pnl > 0)
+            high_total = len(high_conviction_pnls)
+            high_net = sum(high_conviction_pnls)
+            lines.append(
+                f"  High-conviction review (>=0.65): {high_wins}/{high_total} wins net=${high_net:+,.0f}"
+            )
+        if low_conviction_pnls:
+            low_wins = sum(1 for pnl in low_conviction_pnls if pnl > 0)
+            low_total = len(low_conviction_pnls)
+            low_net = sum(low_conviction_pnls)
+            lines.append(
+                f"  Lower-conviction review (<0.65): {low_wins}/{low_total} wins net=${low_net:+,.0f}"
+            )
 
         # Repeat losers: tickers with 2+ losses and 0 wins in recent closes
         ticker_stats: dict[str, dict] = {}

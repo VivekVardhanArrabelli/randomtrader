@@ -1,5 +1,11 @@
 """Tests for provider-agnostic LLM adapter selection."""
 
+import json
+
+import requests
+
+from ai_trader import config
+from ai_trader.brain import TradingBrain
 from ai_trader.llm import create_adapter, infer_provider
 from ai_trader.llm.anthropic_adapter import AnthropicAdapter
 from ai_trader.llm.openai_adapter import OpenAIAdapter
@@ -35,3 +41,430 @@ def test_create_adapter_selects_anthropic_from_provider():
 
     assert isinstance(adapter, AnthropicAdapter)
     assert adapter.provider == "anthropic"
+
+
+def test_resolved_llm_model_prefers_env(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+
+    assert config.resolved_llm_model() == "gpt-5.4"
+    assert config.resolved_llm_model("o4-mini") == "o4-mini"
+
+
+def test_trading_brain_defaults_to_resolved_model(monkeypatch):
+    class DummyAdapter:
+        provider = "openai"
+
+    monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+
+    brain = TradingBrain(adapter=DummyAdapter())
+
+    assert brain.model == "gpt-5.4"
+    assert brain.provider == "openai"
+
+
+def test_openai_adapter_passes_reasoning_effort_from_env(monkeypatch):
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def __init__(self):
+            self.last_json = None
+            self.last_url = None
+            self.last_timeout = None
+
+        def post(self, url, headers, json, timeout):
+            self.last_url = url
+            self.last_json = json
+            self.last_timeout = timeout
+            return DummyResponse(
+                {
+                    "id": "resp_123",
+                    "model": json["model"],
+                    "usage": {"total_tokens": 123},
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json_module.dumps(
+                                        {
+                                            "market_analysis": "ok",
+                                            "thesis_updates": [],
+                                            "trades": [],
+                                        }
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    json_module = json
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "high")
+    session = DummySession()
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-5.4",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert session.last_url == "https://example.com/v1/responses"
+    assert session.last_json["reasoning"] == {"effort": "high"}
+    assert session.last_json["max_output_tokens"] == 8192
+    assert session.last_json["text"]["format"]["type"] == "json_schema"
+    assert session.last_json["text"]["format"]["name"] == "submit_trade_decisions"
+    assert session.last_json["text"]["format"]["strict"] is True
+    assert "tool_choice" not in session.last_json
+    assert session.last_timeout == 180.0
+    assert completion.model == "gpt-5.4"
+
+
+def test_openai_adapter_retries_request_exceptions(monkeypatch):
+    json_module = json
+
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FlakySession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, headers, json, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.Timeout("slow response")
+            return DummyResponse(
+                {
+                    "id": "resp_123",
+                    "model": json["model"],
+                    "usage": {"total_tokens": 123},
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json_module.dumps(
+                                        {
+                                            "market_analysis": "ok",
+                                            "thesis_updates": [],
+                                            "trades": [],
+                                        }
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    monkeypatch.setenv("LLM_HTTP_RETRIES", "2")
+    session = FlakySession()
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-5.4",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert session.calls == 2
+    assert completion.model == "gpt-5.4"
+
+
+def test_openai_adapter_retries_retryable_status_codes(monkeypatch):
+    json_module = json
+
+    class DummyResponse:
+        def __init__(self, status_code, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    class FlakySession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, headers, json, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                return DummyResponse(502, text="bad gateway")
+            return DummyResponse(
+                200,
+                {
+                    "id": "resp_123",
+                    "model": json["model"],
+                    "usage": {"total_tokens": 123},
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json_module.dumps(
+                                        {
+                                            "market_analysis": "ok",
+                                            "thesis_updates": [],
+                                            "trades": [],
+                                        }
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setenv("LLM_HTTP_RETRIES", "2")
+    session = FlakySession()
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-5.4",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert session.calls == 2
+    assert completion.model == "gpt-5.4"
+
+
+def test_openai_adapter_normalizes_schema_for_strict_structured_output():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def __init__(self):
+            self.last_json = None
+
+        def post(self, url, headers, json, timeout):
+            self.last_json = json
+            return DummyResponse(
+                {
+                    "id": "resp_123",
+                    "model": json["model"],
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"market_analysis":"ok","thesis_updates":[],"trades":[]}',
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    session = DummySession()
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        session=session,
+    )
+
+    adapter.complete_structured(
+        model="gpt-5.4",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "required_text": {"type": "string"},
+                    "optional_object": {
+                        "type": "object",
+                        "properties": {
+                            "min": {"type": "number"},
+                            "max": {"type": "number"},
+                        },
+                        "required": ["min", "max"],
+                    },
+                },
+                "required": ["required_text"],
+            },
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    schema = session.last_json["text"]["format"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["required_text", "optional_object"]
+    optional_object = schema["properties"]["optional_object"]
+    assert optional_object["type"] == ["object", "null"]
+    assert optional_object["properties"]["min"]["type"] == "number"
+    assert optional_object["additionalProperties"] is False
+
+
+def test_openai_adapter_joins_structured_output_chunks_without_newlines():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def post(self, url, headers, json, timeout):
+            return DummyResponse(
+                {
+                    "id": "resp_123",
+                    "model": json["model"],
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"market_analysis":"split',
+                                },
+                                {
+                                    "type": "output_text",
+                                    "text": ' value","thesis_updates":[],"trades":[]}',
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        session=DummySession(),
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-5.4",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert completion.tool_calls[0].input["market_analysis"] == "split value"
+
+
+def test_openai_adapter_recovers_json_inside_code_fence():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def post(self, url, headers, json, timeout):
+            return DummyResponse(
+                {
+                    "id": "resp_123",
+                    "model": json["model"],
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "```json\n"
+                                        '{"market_analysis":"ok","thesis_updates":[],"trades":[]}'
+                                        "\n```"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        session=DummySession(),
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-5.4",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert completion.tool_calls[0].input["market_analysis"] == "ok"

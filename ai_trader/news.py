@@ -36,6 +36,24 @@ _JUNK_TITLE_PATTERNS = [
 ]
 
 _JUNK_RE = re.compile("|".join(_JUNK_TITLE_PATTERNS), re.IGNORECASE)
+_OPINION_RECAP_PATTERNS = [
+    "analysis",
+    "commentary",
+    "opinion",
+    "editorial",
+    "roundup",
+    "recap",
+    "preview",
+    "what to know",
+    "what to watch",
+    "stocks to watch",
+    "week ahead",
+    "morning brief",
+    "closing bell",
+    "newsletter",
+    "watchlist",
+]
+_OPINION_RECAP_RE = re.compile("|".join(_OPINION_RECAP_PATTERNS), re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -73,12 +91,14 @@ class NewsEvent:
     supporting_sources: list[str]
     supporting_headlines: list[str]
     age_minutes: int = 0
+    catalyst_quality: str = "soft_catalyst"
 
     def to_context_str(self) -> str:
         symbols_str = ", ".join(self.symbols) if self.symbols else "general"
+        catalyst_quality = classify_catalyst_quality(self)
         lines = [
             (
-                f"[{self.freshness.upper()} | {self.event_type} | "
+                f"[{self.freshness.upper()} | {self.event_type} | {catalyst_quality} | "
                 f"{self.source_count} sources | {self.age_minutes}m ago] {symbols_str}"
             ),
             f"  Event: {self.headline}",
@@ -160,6 +180,8 @@ _RELATIONSHIP_WEIGHTS = {
     "ecosystem": 0.35,
     "sector_etfs": 0.25,
 }
+_HARD_CATALYST_EVENT_TYPES = {"earnings", "guidance", "merger", "fda"}
+_CONDITIONAL_HARD_EVENT_TYPES = {"partnership", "product", "macro"}
 
 _RELATIONSHIP_MAP: dict[str, SymbolRelationship] = {
     "AAPL": SymbolRelationship("AAPL", "consumer_tech", ["MSFT", "GOOGL", "META", "AMZN"], ["QCOM", "AVGO", "TSM"], ["XLK", "QQQ"]),
@@ -228,6 +250,23 @@ def _freshness_label(last_seen: datetime, reference_time: datetime | None = None
     return "stale"
 
 
+def _classify_catalyst_quality(
+    headline: str,
+    summary: str,
+    event_type: str,
+    source_count: int,
+    article_count: int,
+) -> str:
+    haystack = f"{headline} {summary}"
+    if _OPINION_RECAP_RE.search(haystack):
+        return "opinion_or_recap"
+    if event_type in _HARD_CATALYST_EVENT_TYPES:
+        return "hard_catalyst"
+    if event_type in _CONDITIONAL_HARD_EVENT_TYPES and (source_count >= 2 or article_count >= 2):
+        return "hard_catalyst"
+    return "soft_catalyst"
+
+
 def build_news_events(
     items: list[NewsItem],
     reference_time: datetime | None = None,
@@ -265,6 +304,13 @@ def build_news_events(
             supporting_sources=supporting_sources,
             supporting_headlines=[item.headline for item in grouped_items],
             age_minutes=age_minutes,
+            catalyst_quality=_classify_catalyst_quality(
+                latest.headline,
+                latest.summary,
+                _classify_event_type(latest.headline, latest.summary),
+                len(supporting_sources),
+                len(grouped_items),
+            ),
         )
         events.append(event)
 
@@ -290,6 +336,20 @@ def _event_signal_strength(event: NewsEvent) -> float:
 def score_news_event(event: NewsEvent) -> float:
     """Public scoring helper for candidate ranking and watchlist building."""
     return _event_signal_strength(event)
+
+
+def classify_catalyst_quality(event: NewsEvent) -> str:
+    """Public helper for prompt formatting and tests."""
+    derived = _classify_catalyst_quality(
+        event.headline,
+        event.summary,
+        event.event_type,
+        event.source_count,
+        event.article_count,
+    )
+    if event.catalyst_quality == derived:
+        return event.catalyst_quality
+    return derived
 
 
 def map_best_events_by_symbol(events: list[NewsEvent]) -> dict[str, NewsEvent]:
@@ -385,6 +445,40 @@ def classify_catalyst_reaction(
     return "active_move"
 
 
+def format_symbol_setup_context(
+    symbol: str,
+    metrics: dict | None,
+    event: NewsEvent | None = None,
+) -> str:
+    """Format a concise setup-support line for a symbol near the options menu."""
+    parts: list[str] = []
+    if event is None:
+        parts.append("catalyst=no_fresh_symbol_event")
+    else:
+        quality = classify_catalyst_quality(event)
+        parts.append(
+            "catalyst="
+            f"{quality}/{event.event_type}/{event.freshness}/{event.source_count}src"
+        )
+        parts.append(f"age={event.age_minutes}m")
+        if metrics is not None:
+            reaction = classify_catalyst_reaction(
+                event.age_minutes,
+                float(metrics.get("intraday_chg") or 0.0),
+                float(metrics.get("five_d_chg") or 0.0),
+            )
+            parts.append(f"reaction={reaction}")
+    if metrics is not None:
+        range_pos_pct = metrics.get("range_pos_pct")
+        range_label = metrics.get("range_label")
+        if range_pos_pct is not None and range_label:
+            parts.append(f"range={float(range_pos_pct):.0f}% {range_label}")
+        trend = str(metrics.get("trend") or "").strip()
+        if trend:
+            parts.append(f"trend={trend}")
+    return f"  Setup ({symbol.upper()}): " + " | ".join(parts)
+
+
 def expand_symbols_with_relationships(
     symbols: list[str],
     events: list[NewsEvent] | None = None,
@@ -463,7 +557,7 @@ def build_relationship_briefs(
         event = representative_events.get(normalized)
         if event is not None:
             parts.append(
-                f"catalyst={event.event_type}/{event.freshness}/{event.source_count} src"
+                f"catalyst={event.event_type}/{event.freshness}/{classify_catalyst_quality(event)}/{event.source_count} src"
             )
         parts.append(f"sector={relationship.sector}")
         if relationship.peers:
@@ -637,6 +731,12 @@ def format_news_for_llm(
         sections.append(
             "--- Suggested focus symbols ---\n" + "\n".join(suggested_lines)
         )
+
+    if events:
+        sections.append("--- Catalyst quality guide ---")
+        sections.append("hard_catalyst = reported event with direct fundamentals or policy impact")
+        sections.append("soft_catalyst = weaker, more interpretive, or thinly corroborated signal")
+        sections.append("opinion_or_recap = commentary or recap; needs stronger price confirmation")
 
     if relationship_briefs:
         sections.append("--- Relationship map for second-order ideas ---")

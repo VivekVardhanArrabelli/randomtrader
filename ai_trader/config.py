@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 # ---------------------------------------------------------------------------
 # Trading mode
 # ---------------------------------------------------------------------------
@@ -53,6 +55,9 @@ WATCHLIST_SIZE = 20                # top N tickers to watch
 CANDIDATE_TABLE_SIZE = 12          # broad triage rows shown to the LLM
 CANDIDATE_FINALISTS = 6            # finalists that get rich news/options context
 POSITION_CHECK_INTERVAL_SECONDS = 60
+PREPARE_PREFETCH_SYMBOLS = 8       # broader option-prefetch symbol cap for offline backtests
+PREPARE_PREFETCH_CONTRACTS_PER_SIDE = 8
+PREPARE_PREFETCH_STRIKE_BAND_PCT = 0.12
 
 # ---------------------------------------------------------------------------
 # Thesis journal limits
@@ -84,6 +89,7 @@ ALPACA_RATE_LIMIT_MAX_RETRIES = 3
 # Polygon API
 # ---------------------------------------------------------------------------
 POLYGON_BASE_URL = "https://api.polygon.io"
+POLYGON_MIN_REQUEST_INTERVAL_SECONDS = 1.1
 
 # ---------------------------------------------------------------------------
 # LLM
@@ -92,6 +98,14 @@ LLM_PROVIDER = ""                 # infer from model unless overridden
 LLM_MODEL = "claude-opus-4-6"
 LLM_MAX_TOKENS = 4096
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading
+LLM_MAX_ATTEMPTS = 3
+
+
+def resolved_llm_model(model: str | None = None) -> str:
+    """Resolve the active model at runtime so env/CLI overrides are honored."""
+    if model and model.strip():
+        return model.strip()
+    return os.environ.get("LLM_MODEL", "").strip() or LLM_MODEL
 
 # ---------------------------------------------------------------------------
 # Logging

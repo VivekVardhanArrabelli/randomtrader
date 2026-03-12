@@ -5,8 +5,10 @@ from ai_trader.news import (
     NewsItem,
     build_news_events,
     build_relationship_briefs,
+    classify_catalyst_quality,
     classify_catalyst_reaction,
     expand_symbols_with_relationships,
+    format_symbol_setup_context,
     format_news_for_llm,
     merge_news_items,
     rank_symbols_from_events,
@@ -140,8 +142,41 @@ def test_build_relationship_briefs_include_catalyst_metadata():
     ]
 
     briefs = build_relationship_briefs(["AAPL", "MSFT"], events=events)
-    assert any("AAPL: catalyst=partnership/fresh/2 src" in brief for brief in briefs)
+    assert any("AAPL: catalyst=partnership/fresh/hard_catalyst/2 src" in brief for brief in briefs)
     assert any("peers=" in brief for brief in briefs)
+
+
+def test_classify_catalyst_quality_distinguishes_hard_vs_opinion():
+    now = datetime(2025, 1, 10, 10, 0, tzinfo=EASTERN_TZ)
+    hard = NewsEvent(
+        headline="NVDA raises full-year AI revenue guidance",
+        summary="Company raised guidance after strong demand.",
+        source_count=2,
+        article_count=2,
+        symbols=["NVDA"],
+        event_type="guidance",
+        freshness="fresh",
+        first_seen=now - timedelta(minutes=30),
+        last_seen=now - timedelta(minutes=10),
+        supporting_sources=["Reuters", "Bloomberg"],
+        supporting_headlines=["NVDA raises full-year AI revenue guidance"],
+    )
+    opinion = NewsEvent(
+        headline="Analysis: Why software stocks could rally next quarter",
+        summary="Preview note ahead of earnings season.",
+        source_count=1,
+        article_count=1,
+        symbols=["MSFT"],
+        event_type="general",
+        freshness="fresh",
+        first_seen=now - timedelta(minutes=20),
+        last_seen=now - timedelta(minutes=5),
+        supporting_sources=["Blog"],
+        supporting_headlines=["Analysis: Why software stocks could rally next quarter"],
+    )
+
+    assert classify_catalyst_quality(hard) == "hard_catalyst"
+    assert classify_catalyst_quality(opinion) == "opinion_or_recap"
 
 
 def test_merge_news_items_dedupes_cross_query_duplicates():
@@ -177,6 +212,40 @@ def test_classify_catalyst_reaction_distinguishes_early_vs_extended():
     assert classify_catalyst_reaction(45, 0.2, 0.8) == "not_moving_yet"
 
 
+def test_format_symbol_setup_context_exposes_catalyst_and_range():
+    now = datetime(2025, 1, 10, 10, 0, tzinfo=EASTERN_TZ)
+    event = NewsEvent(
+        headline="NVDA raises AI guidance",
+        summary="Strong multi-source catalyst",
+        source_count=2,
+        article_count=2,
+        symbols=["NVDA"],
+        event_type="guidance",
+        freshness="fresh",
+        first_seen=now - timedelta(minutes=55),
+        last_seen=now - timedelta(minutes=25),
+        supporting_sources=["Reuters", "Bloomberg"],
+        supporting_headlines=["NVDA raises AI guidance"],
+        age_minutes=25,
+        catalyst_quality="hard_catalyst",
+    )
+    metrics = {
+        "intraday_chg": 1.1,
+        "five_d_chg": 3.4,
+        "range_pos_pct": 92.0,
+        "range_label": "near_10d_high",
+        "trend": "up",
+    }
+
+    text = format_symbol_setup_context("NVDA", metrics, event)
+
+    assert "Setup (NVDA):" in text
+    assert "catalyst=hard_catalyst/guidance/fresh/2src" in text
+    assert "reaction=early_move" in text
+    assert "range=92% near_10d_high" in text
+    assert "trend=up" in text
+
+
 def test_format_news_for_llm_outputs_structured_and_raw_sections(monkeypatch):
     now = datetime(2025, 1, 10, 10, 0, tzinfo=EASTERN_TZ)
     monkeypatch.setattr("ai_trader.news.now_eastern", lambda: now)
@@ -206,12 +275,14 @@ def test_format_news_for_llm_outputs_structured_and_raw_sections(monkeypatch):
 
     text = format_news_for_llm(items, focus_symbols=["AAPL"])
     assert "Suggested focus symbols" in text
+    assert "Catalyst quality guide" in text
     assert "Direct catalysts" in text
     assert "Relationship map for second-order ideas" in text
     assert "Structured event map" in text
     assert "Raw headlines for those tickers" in text
     assert "3 sources" not in text
     assert "2 sources" in text
+    assert "hard_catalyst" in text
     assert "AAPL signs major enterprise AI partnership" in text
 
 

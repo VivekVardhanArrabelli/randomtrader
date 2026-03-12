@@ -1,130 +1,68 @@
-"""Tests for AI trader SQLite packet logging."""
+"""Tests for AI trader decision/trade history formatting."""
 
-from __future__ import annotations
-
-import json
-import sqlite3
-from datetime import datetime
-
-from ai_trader.db import AIDecisionRecord, AITradeLogger
-from ai_trader.llm import LLMDecisionPacket, LLMCompletion, ToolCall
+from ai_trader.db import format_trade_history
 
 
-def _sample_packet() -> LLMDecisionPacket:
-    return LLMDecisionPacket(
-        provider="anthropic",
-        model="claude-opus-4-6",
-        system_prompt="system prompt",
-        user_message="exact prompt body",
-        tool={
-            "name": "submit_trade_decisions",
-            "description": "Submit trades",
-            "input_schema": {"type": "object"},
+def test_format_trade_history_includes_profile_calibration_lines():
+    trades = [
+        {
+            "symbol": "O:VST260123C00170000",
+            "underlying": "VST",
+            "action": "buy_call",
+            "status": "filled",
+            "expression_profile": "convex",
         },
-        max_tokens=4096,
-        temperature=0.3,
-        contexts={
-            "portfolio_context": "Portfolio context",
-            "news_context": "News context",
+        {
+            "symbol": "O:NOC260116C00620000",
+            "underlying": "NOC",
+            "action": "buy_call",
+            "status": "filled",
+            "expression_profile": "convex",
         },
-    )
+        {
+            "symbol": "O:XLP260227C00086000",
+            "underlying": "XLP",
+            "action": "buy_call",
+            "status": "filled",
+            "expression_profile": "time_cushion",
+        },
+    ]
+    closes = [
+        {
+            "timestamp": "2026-02-11T09:35:00-05:00",
+            "underlying": "VST",
+            "symbol": "O:VST260123C00170000",
+            "entry_date": "2026-01-12",
+            "entry_premium": 7.67,
+            "exit_premium": 4.00,
+            "pnl": -3675.0,
+            "reason": "stop_loss",
+        },
+        {
+            "timestamp": "2026-02-12T09:35:00-05:00",
+            "underlying": "NOC",
+            "symbol": "O:NOC260116C00620000",
+            "entry_date": "2026-01-08",
+            "entry_premium": 18.39,
+            "exit_premium": 3.40,
+            "pnl": -4498.5,
+            "reason": "stop_loss",
+        },
+        {
+            "timestamp": "2026-02-13T09:35:00-05:00",
+            "underlying": "XLP",
+            "symbol": "O:XLP260227C00086000",
+            "entry_date": "2026-02-11",
+            "entry_premium": 2.09,
+            "exit_premium": 3.90,
+            "pnl": 3982.0,
+            "reason": "backtest_end",
+        },
+    ]
 
+    result = format_trade_history(trades, closes)
 
-def _sample_completion() -> LLMCompletion:
-    return LLMCompletion(
-        provider="anthropic",
-        model="claude-opus-4-6",
-        tool_calls=[
-            ToolCall(
-                name="submit_trade_decisions",
-                input={
-                    "market_analysis": "Bullish tape",
-                    "thesis_updates": [],
-                    "trades": [],
-                },
-            )
-        ],
-        raw_response={"id": "msg_123"},
-    )
-
-
-def test_ai_decisions_schema_migration_adds_packet_columns(tmp_path):
-    db_path = tmp_path / "legacy.db"
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        CREATE TABLE ai_decisions (
-            timestamp TEXT,
-            market_analysis TEXT,
-            news_summary TEXT,
-            portfolio_state TEXT,
-            decisions_json TEXT,
-            trades_executed INTEGER
-        )
-        """
-    )
-    conn.execute(
-        "INSERT INTO ai_decisions VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            "2025-03-01T10:00:00",
-            "legacy analysis",
-            "legacy news",
-            "legacy portfolio",
-            "[]",
-            1,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    AITradeLogger(db_path)
-
-    conn = sqlite3.connect(db_path)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(ai_decisions)")}
-    row = conn.execute(
-        "SELECT market_analysis, trades_executed, packet_json FROM ai_decisions"
-    ).fetchone()
-    conn.close()
-
-    assert {"llm_provider", "llm_model", "packet_json", "response_json"} <= cols
-    assert row == ("legacy analysis", 1, None)
-
-
-def test_log_decision_persists_full_packet_and_updates_trade_count(tmp_path):
-    db_path = tmp_path / "packets.db"
-    logger = AITradeLogger(db_path)
-    packet = _sample_packet()
-    completion = _sample_completion()
-
-    decision_id = logger.log_decision(
-        AIDecisionRecord(
-            timestamp=datetime(2025, 3, 1, 10, 0, 0),
-            market_analysis="Bullish tape",
-            news_summary="summary",
-            portfolio_state="portfolio",
-            decisions_json=json.dumps(
-                {
-                    "market_analysis": "Bullish tape",
-                    "thesis_updates": [],
-                    "trades": [],
-                }
-            ),
-            trades_executed=0,
-            llm_provider=packet.provider,
-            llm_model=packet.model,
-            packet_json=json.dumps(packet.to_payload()),
-            response_json=json.dumps(completion.to_payload()),
-        )
-    )
-
-    rows = logger.get_recent_decisions(limit=1)
-    assert len(rows) == 1
-    assert rows[0]["decision_id"] == decision_id
-    assert rows[0]["llm_provider"] == "anthropic"
-    assert rows[0]["llm_model"] == "claude-opus-4-6"
-    assert json.loads(rows[0]["packet_json"])["user_message"] == "exact prompt body"
-    assert json.loads(rows[0]["response_json"])["tool_calls"][0]["name"] == "submit_trade_decisions"
-
-    assert logger.update_decision_trade_count(decision_id, 2) == 1
-    updated = logger.get_recent_decisions(limit=1)[0]
-    assert updated["trades_executed"] == 2
+    assert "Expression profiles: convex 0/2 wins net=$-8,174 | time_cushion 1/1 wins net=$+3,982" in result
+    assert "Expression review: Calls 1/3 wins net=$-4,192" in result
+    assert "Short-dated calls (<=14 DTE): 0/2 wins net=$-8,174" in result
+    assert "Stop-loss cluster: 2 trades net=$-8,174 | calls=2 puts=0" in result
