@@ -90,12 +90,14 @@ ALPACA_RATE_LIMIT_MAX_RETRIES = 3
 # ---------------------------------------------------------------------------
 POLYGON_BASE_URL = "https://api.polygon.io"
 POLYGON_MIN_REQUEST_INTERVAL_SECONDS = 1.1
+POLYGON_MAX_REQUEST_INTERVAL_SECONDS = 20.0
+POLYGON_429_RETRY_ATTEMPTS = 5
 
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
 LLM_PROVIDER = ""                 # infer from model unless overridden
-LLM_MODEL = "claude-opus-4-6"
+LLM_MODEL = "gpt-5.4"
 LLM_MAX_TOKENS = 4096
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading
 LLM_MAX_ATTEMPTS = 3

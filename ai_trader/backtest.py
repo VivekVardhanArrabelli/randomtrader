@@ -32,7 +32,15 @@ from .candidates import (
     format_candidate_table,
     select_candidate_finalists,
 )
-from .db import expression_guidance_lines, format_trade_history, profile_calibration_lines
+from .db import (
+    AIDecisionRecord,
+    AITradeLogger,
+    AITradeRecord,
+    PositionCloseRecord,
+    expression_guidance_lines,
+    format_trade_history,
+    profile_calibration_lines,
+)
 from .historical_cache import (
     DEFAULT_HISTORICAL_CACHE_DB_PATH,
     PolygonResponseStore,
@@ -70,11 +78,62 @@ from .utils import (
 # ---------------------------------------------------------------------------
 
 _LAST_POLYGON_REQUEST_AT = 0.0
+_POLYGON_REQUEST_INTERVAL_SECONDS = max(
+    float(config.POLYGON_MIN_REQUEST_INTERVAL_SECONDS),
+    0.0,
+)
+
+
+def _base_polygon_request_interval() -> float:
+    return max(float(config.POLYGON_MIN_REQUEST_INTERVAL_SECONDS), 0.0)
+
+
+def _max_polygon_request_interval() -> float:
+    return max(
+        float(getattr(config, "POLYGON_MAX_REQUEST_INTERVAL_SECONDS", _base_polygon_request_interval())),
+        _base_polygon_request_interval(),
+    )
+
+
+def _retry_after_seconds(headers: object) -> float | None:
+    if not isinstance(headers, dict):
+        return None
+    raw_value = headers.get("Retry-After")
+    if raw_value is None:
+        return None
+    try:
+        retry_after = float(str(raw_value).strip())
+    except ValueError:
+        return None
+    return retry_after if retry_after > 0 else None
+
+
+def _increase_polygon_request_interval(*, retry_after: float | None = None) -> float:
+    global _POLYGON_REQUEST_INTERVAL_SECONDS
+    base_interval = _base_polygon_request_interval()
+    current_interval = max(_POLYGON_REQUEST_INTERVAL_SECONDS, base_interval)
+    max_interval = _max_polygon_request_interval()
+    if retry_after is not None:
+        next_interval = max(current_interval, min(retry_after, max_interval))
+    else:
+        next_interval = min(max_interval, max(current_interval * 1.5, base_interval + 1.0))
+    _POLYGON_REQUEST_INTERVAL_SECONDS = next_interval
+    return next_interval
+
+
+def _decay_polygon_request_interval() -> None:
+    global _POLYGON_REQUEST_INTERVAL_SECONDS
+    base_interval = _base_polygon_request_interval()
+    current_interval = max(_POLYGON_REQUEST_INTERVAL_SECONDS, base_interval)
+    if current_interval <= base_interval:
+        _POLYGON_REQUEST_INTERVAL_SECONDS = base_interval
+        return
+    _POLYGON_REQUEST_INTERVAL_SECONDS = max(base_interval, current_interval * 0.95)
 
 
 def _respect_polygon_rate_limit() -> None:
     global _LAST_POLYGON_REQUEST_AT
-    min_interval = max(float(config.POLYGON_MIN_REQUEST_INTERVAL_SECONDS), 0.0)
+    min_interval = max(_POLYGON_REQUEST_INTERVAL_SECONDS, _base_polygon_request_interval())
     if min_interval <= 0:
         return
     now = time_module.monotonic()
@@ -103,14 +162,22 @@ def _polygon_request(
     request_params = dict(params)
     request_params["apiKey"] = api_key
     url = f"https://api.polygon.io{path}"
-    _respect_polygon_rate_limit()
-    response = requests.get(url, params=request_params, timeout=30)
-    for attempt in range(3):
-        if response.status_code != 429:
-            break
-        time_module.sleep(12 + attempt * 5)
+    max_attempts = max(int(getattr(config, "POLYGON_429_RETRY_ATTEMPTS", 5)), 1)
+
+    response = None
+    for attempt in range(max_attempts):
         _respect_polygon_rate_limit()
         response = requests.get(url, params=request_params, timeout=30)
+        if response.status_code != 429:
+            if response.status_code < 400:
+                _decay_polygon_request_interval()
+            break
+        retry_after = _retry_after_seconds(getattr(response, "headers", None))
+        backoff_interval = _increase_polygon_request_interval(retry_after=retry_after)
+        sleep_seconds = retry_after if retry_after is not None else backoff_interval
+        time_module.sleep(sleep_seconds)
+    if response is None:
+        raise RuntimeError(f"Polygon request failed without a response for {path}")
     if response.status_code >= 400:
         raise RuntimeError(f"Polygon {response.status_code}: {response.text[:200]}")
     data = response.json()
@@ -902,6 +969,7 @@ class BacktestConfig:
     offline: bool = False
     prepare_only: bool = False
     cache_db_path: Path | None = None
+    log_db_path: Path | None = None
     prepare_prefetch_symbols: int = config.PREPARE_PREFETCH_SYMBOLS
     prepare_prefetch_contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE
     prepare_prefetch_strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT
@@ -924,6 +992,9 @@ class BacktestResult:
     profit_factor: float | None = None
     avg_conviction: float = 0.0
     days_tested: int = 0
+    llm_error_cycles: int = 0
+    llm_failure_days: int = 0
+    log_db_path: str | None = None
     decision_log: list[dict] = field(default_factory=list)
 
 
@@ -965,6 +1036,113 @@ def _last_completed_trading_day(as_of: date | datetime) -> date:
     if as_of_dt < _market_close_dt(session_day):
         return _previous_trading_day(session_day)
     return session_day
+
+
+def _is_llm_error_message(message: str | None) -> bool:
+    if not isinstance(message, str):
+        return False
+    return message.strip().lower().startswith("llm error:")
+
+
+def _analysis_to_decisions_json(analysis: MarketAnalysis) -> str:
+    return json.dumps(
+        {
+            "market_analysis": analysis.analysis,
+            "thesis_updates": [
+                {
+                    "id": update.id,
+                    "underlying": update.underlying,
+                    "direction": update.direction,
+                    "thesis": update.thesis,
+                    "conviction": update.conviction,
+                    "status": update.status,
+                    "new_observation": update.new_observation,
+                }
+                for update in analysis.thesis_updates
+            ],
+            "trades": [
+                {
+                    "action": decision.action,
+                    "underlying": decision.underlying,
+                    "strike_preference": decision.strike_preference,
+                    "expiry_preference": decision.expiry_preference,
+                    "conviction": decision.conviction,
+                    "risk_pct": decision.risk_pct,
+                    "reasoning": decision.reasoning,
+                    "target_symbol": decision.target_symbol,
+                    "expression_profile": decision.expression_profile,
+                    "contract_symbol": decision.contract_symbol,
+                    "target_delta_range": decision.target_delta_range,
+                    "target_dte_range": decision.target_dte_range,
+                    "max_spread_pct": decision.max_spread_pct,
+                }
+                for decision in analysis.trades
+            ],
+        }
+    )
+
+
+def _log_backtest_open_trade(
+    logger: AITradeLogger | None,
+    *,
+    decision_time: datetime,
+    decision: TradeDecision,
+    market_analysis: str,
+    option_type: str,
+    strike: float,
+    expiry: date,
+    polygon_ticker: str,
+    qty: int,
+    premium: float,
+) -> None:
+    if logger is None:
+        return
+    logger.log_trade(
+        AITradeRecord(
+            timestamp=decision_time,
+            symbol=polygon_ticker,
+            underlying=decision.underlying,
+            option_type=option_type,
+            strike=strike,
+            expiration=expiry.isoformat(),
+            action=decision.action,
+            qty=qty,
+            premium=premium,
+            total_cost=premium * qty * 100,
+            conviction=decision.conviction,
+            reasoning=decision.reasoning,
+            market_analysis=market_analysis,
+            order_id=None,
+            status="filled",
+            expression_profile=decision.expression_profile or "",
+        )
+    )
+
+
+def _log_backtest_close(
+    logger: AITradeLogger | None,
+    *,
+    decision_time: datetime,
+    position: SimPosition,
+    exit_premium: float,
+    trade_pnl: float,
+    reason: str,
+) -> None:
+    if logger is None:
+        return
+    logger.log_position_close(
+        PositionCloseRecord(
+            timestamp=decision_time,
+            symbol=position.polygon_ticker,
+            underlying=position.underlying,
+            qty=position.qty,
+            entry_premium=position.entry_premium,
+            exit_premium=exit_premium,
+            pnl=trade_pnl,
+            reason=reason,
+            order_id=None,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1926,6 +2104,65 @@ def _prefetch_prepare_option_data(
     return len(prefetched)
 
 
+def _warm_prepare_option_metadata(
+    api_key: str,
+    tickers: list[str],
+    as_of: date | datetime,
+    cache: PolygonCache,
+    default_dte: int = 14,
+    bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
+    max_symbols: int = config.PREPARE_PREFETCH_SYMBOLS,
+    strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT,
+) -> int:
+    """Warm option chain metadata without hydrating contract bars.
+
+    Prepare mode should accelerate later runs, not define the option surface
+    the model is allowed to reason over.
+    """
+    if not tickers or max_symbols <= 0:
+        return 0
+
+    as_of_dt = _coerce_eastern_datetime(as_of)
+    trade_date = as_of_dt.date()
+    expiry_gte = trade_date + timedelta(days=max(config.PREFERRED_DTE_MIN, default_dte - 10))
+    expiry_lte = trade_date + timedelta(days=min(config.PREFERRED_DTE_MAX, default_dte + 21))
+    warmed_contracts: set[str] = set()
+
+    for ticker in tickers[:max_symbols]:
+        _, spot = _build_ticker_price_context(
+            api_key,
+            ticker,
+            as_of_dt,
+            cache=cache,
+            bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
+        )
+        if spot <= 0:
+            continue
+
+        strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
+        strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+        for option_type in ("call", "put"):
+            contracts = fetch_polygon_option_contracts(
+                api_key,
+                ticker,
+                option_type,
+                expiry_gte,
+                expiry_lte,
+                strike_gte,
+                strike_lte,
+                as_of=trade_date,
+                cache=cache,
+            )
+            for contract in contracts:
+                option_ticker = str(contract.get("ticker") or "")
+                if option_ticker:
+                    warmed_contracts.add(option_ticker)
+
+    return len(warmed_contracts)
+
+
 def _build_enriched_portfolio_context(
     equity: float,
     initial_equity: float,
@@ -2036,18 +2273,21 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     trading_days = _trading_days(bt_config.start_date, bt_config.end_date)
 
     result = BacktestResult(initial_equity=bt_config.initial_equity)
+    result.log_db_path = str(bt_config.log_db_path) if bt_config.log_db_path else None
     equity = bt_config.initial_equity
     positions: list[SimPosition] = []
     closed_trades: list[dict] = []
     peak_equity = equity
     max_dd = 0.0
     daily_returns: list[float] = []
+    llm_failure_dates: set[date] = set()
 
     # Polygon cache — avoids redundant API calls in-process and across runs.
     cache = PolygonCache(
         store=PolygonResponseStore(_historical_cache_path(bt_config)),
         offline=bt_config.offline,
     )
+    logger = AITradeLogger(bt_config.log_db_path) if bt_config.log_db_path and not bt_config.prepare_only else None
 
     log(f"backtest: {bt_config.start_date} to {bt_config.end_date} ({len(trading_days)} days)")
     log(f"initial equity: ${equity:,.2f}")
@@ -2140,6 +2380,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     log(
                         f"  {decision_time.strftime('%H:%M')} AUTO EXIT {pos.polygon_ticker} "
                         f"reason={exit_reason} pnl=${trade_pnl:+,.2f}"
+                    )
+                    _log_backtest_close(
+                        logger,
+                        decision_time=decision_time,
+                        position=pos,
+                        exit_premium=current_premium,
+                        trade_pnl=trade_pnl,
+                        reason=exit_reason,
                     )
                 else:
                     remaining.append(pos)
@@ -2253,6 +2501,42 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 ),
             )
 
+            if bt_config.prepare_only:
+                metadata_symbols = prioritized_symbol_watchlist(
+                    options_watchlist or deep_focus_symbols,
+                    deep_focus_symbols,
+                    limit=max(bt_config.prepare_prefetch_symbols, len(options_watchlist or deep_focus_symbols)),
+                )
+                warmed_contract_metadata = _warm_prepare_option_metadata(
+                    polygon_key,
+                    metadata_symbols,
+                    decision_time,
+                    cache,
+                    default_dte=bt_config.default_dte,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                    metrics_cache=metrics_cache,
+                    max_symbols=bt_config.prepare_prefetch_symbols,
+                    strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
+                )
+                cache_entries = cache.store.entry_count() if cache.store else 0
+                result.decision_log.append({
+                    "date": trade_date.isoformat(),
+                    "decision_time": decision_time.isoformat(),
+                    "news_window_start": news_window_start.isoformat(),
+                    "prepared_only": True,
+                    "finalists": finalist_symbols,
+                    "warmed_option_contract_metadata": warmed_contract_metadata,
+                    "cache_entries": cache_entries,
+                    "open_positions": len(positions),
+                })
+                log(
+                    f"  {decision_time.strftime('%H:%M')} PREPARED "
+                    f"finalists={len(finalist_symbols)} "
+                    f"warmed_contract_metadata={warmed_contract_metadata} "
+                    f"cache_entries={cache_entries}"
+                )
+                continue
+
             options_context = _build_options_context(
                 polygon_key,
                 options_watchlist or deep_focus_symbols,
@@ -2264,39 +2548,6 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 bar_minutes=bt_config.signal_bar_minutes,
                 metrics_cache=metrics_cache,
             )
-
-            if bt_config.prepare_only:
-                prefetch_symbols = list(dict.fromkeys(finalist_symbols + deep_focus_symbols))
-                prefetched_contracts = _prefetch_prepare_option_data(
-                    polygon_key,
-                    prefetch_symbols,
-                    decision_time,
-                    cache,
-                    default_dte=bt_config.default_dte,
-                    bar_minutes=bt_config.signal_bar_minutes,
-                    metrics_cache=metrics_cache,
-                    max_symbols=bt_config.prepare_prefetch_symbols,
-                    contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
-                    strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
-                )
-                cache_entries = cache.store.entry_count() if cache.store else 0
-                result.decision_log.append({
-                    "date": trade_date.isoformat(),
-                    "decision_time": decision_time.isoformat(),
-                    "news_window_start": news_window_start.isoformat(),
-                    "prepared_only": True,
-                    "finalists": finalist_symbols,
-                    "prefetched_option_contracts": prefetched_contracts,
-                    "cache_entries": cache_entries,
-                    "open_positions": len(positions),
-                })
-                log(
-                    f"  {decision_time.strftime('%H:%M')} PREPARED "
-                    f"finalists={len(finalist_symbols)} "
-                    f"prefetched_contracts={prefetched_contracts} "
-                    f"cache_entries={cache_entries}"
-                )
-                continue
 
             trade_results: list[dict] = []
             if bt_config.llm_delay_seconds > 0:
@@ -2312,6 +2563,10 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 trade_history_context=trade_history_context,
             )
             analysis = run_result.analysis
+            llm_error = _is_llm_error_message(analysis.analysis)
+            if llm_error:
+                result.llm_error_cycles += 1
+                llm_failure_dates.add(trade_date)
             log(f"  {decision_time.strftime('%H:%M')} LLM: {analysis.analysis}")
 
             if journal and analysis.thesis_updates:
@@ -2321,6 +2576,24 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     f"{len(journal.active_entries())} active"
                 )
 
+            decision_id = 0
+            if logger is not None:
+                decision_id = logger.log_decision(
+                    AIDecisionRecord(
+                        timestamp=decision_time,
+                        market_analysis=analysis.analysis,
+                        news_summary=news_context[:1000],
+                        portfolio_state=portfolio_context[:1000],
+                        decisions_json=_analysis_to_decisions_json(analysis),
+                        trades_executed=0,
+                        llm_provider=run_result.packet.provider,
+                        llm_model=run_result.packet.model,
+                        packet_json=json.dumps(run_result.packet.to_payload()),
+                        response_json=json.dumps(run_result.completion.to_payload()),
+                    )
+                )
+
+            trades_executed = 0
             for decision in analysis.trades:
                 trade_record = {
                     "underlying": decision.underlying,
@@ -2409,6 +2682,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_record["premium"] = exit_premium
                     trade_record["pnl"] = trade_pnl
                     trade_results.append(trade_record)
+                    trades_executed += 1
+                    _log_backtest_close(
+                        logger,
+                        decision_time=decision_time,
+                        position=matched_pos,
+                        exit_premium=exit_premium,
+                        trade_pnl=trade_pnl,
+                        reason="manual_close",
+                    )
                     account_equity, _ = _mark_to_market_equity(
                         equity,
                         positions,
@@ -2528,6 +2810,19 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 if decision.expression_profile:
                     trade_record["expression_profile"] = decision.expression_profile
                 trade_results.append(trade_record)
+                trades_executed += 1
+                _log_backtest_open_trade(
+                    logger,
+                    decision_time=decision_time,
+                    decision=decision,
+                    market_analysis=analysis.analysis,
+                    option_type=option_type,
+                    strike=strike,
+                    expiry=expiry,
+                    polygon_ticker=polygon_ticker,
+                    qty=qty,
+                    premium=premium,
+                )
                 account_equity, _ = _mark_to_market_equity(
                     equity,
                     positions,
@@ -2563,6 +2858,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 "news_window_start": news_window_start.isoformat(),
                 "llm_provider": run_result.packet.provider,
                 "llm_model": run_result.packet.model,
+                "llm_error": llm_error,
                 "market_analysis": analysis.analysis,
                 "thesis_updates": thesis_updates_serialized,
                 "trades_proposed": trade_results,
@@ -2571,6 +2867,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 "equity": marked_equity,
                 "open_positions": len(positions),
             })
+            if logger is not None and decision_id > 0:
+                logger.update_decision_trade_count(decision_id, trades_executed)
 
         day_close_equity, _ = _mark_to_market_equity(
             equity,
@@ -2637,6 +2935,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 reasoning=pos.reasoning,
             )
         )
+        _log_backtest_close(
+            logger,
+            decision_time=_market_close_dt(last_date),
+            position=pos,
+            exit_premium=exit_premium,
+            trade_pnl=trade_pnl,
+            reason="backtest_end",
+        )
 
     # Compute results
     result.final_equity = equity
@@ -2658,6 +2964,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
     convictions = [t.conviction for t in result.trades]
     result.avg_conviction = sum(convictions) / len(convictions) if convictions else 0
+    result.llm_failure_days = len(llm_failure_dates)
 
     # Sharpe
     if len(daily_returns) >= 2:
@@ -2715,6 +3022,10 @@ def print_backtest_result(r: BacktestResult) -> None:
         print(f"  Sharpe ratio:     {r.sharpe_ratio:.2f}")
     if r.profit_factor is not None:
         print(f"  Profit factor:    {r.profit_factor:.2f}")
+    print(f"  LLM failure days: {r.llm_failure_days}")
+    print(f"  LLM error cycles: {r.llm_error_cycles}")
+    if r.log_db_path:
+        print(f"  Log DB:           {r.log_db_path}")
     print(f"  Avg conviction:   {r.avg_conviction:.2f}")
 
     if r.trades:
@@ -2745,9 +3056,8 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print("=" * 60)
 
 
-def save_backtest_result(r: BacktestResult, path: Path) -> None:
-    """Save backtest results to a JSON file."""
-    out = {
+def backtest_result_to_dict(r: BacktestResult) -> dict:
+    return {
         "initial_equity": r.initial_equity,
         "final_equity": r.final_equity,
         "total_return_pct": r.total_return_pct,
@@ -2761,6 +3071,9 @@ def save_backtest_result(r: BacktestResult, path: Path) -> None:
         "profit_factor": r.profit_factor,
         "avg_conviction": r.avg_conviction,
         "days_tested": r.days_tested,
+        "llm_error_cycles": r.llm_error_cycles,
+        "llm_failure_days": r.llm_failure_days,
+        "log_db_path": r.log_db_path,
         "equity_curve": [{"date": d, "equity": e} for d, e in r.equity_curve],
         "trades": [
             {
@@ -2783,6 +3096,11 @@ def save_backtest_result(r: BacktestResult, path: Path) -> None:
         ],
         "decision_log": r.decision_log,
     }
+
+
+def save_backtest_result(r: BacktestResult, path: Path) -> None:
+    """Save backtest results to a JSON file."""
+    out = backtest_result_to_dict(r)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
     log(f"results saved to {path}")
@@ -2951,6 +3269,10 @@ def run() -> None:
         help="SQLite DB path for persistent historical Polygon cache",
     )
     parser.add_argument(
+        "--log-db", type=str, default=None,
+        help="SQLite DB path for streaming backtest trades/decisions during the run",
+    )
+    parser.add_argument(
         "--offline", action="store_true",
         help="Fail on historical Polygon cache misses instead of going to the network",
     )
@@ -2987,6 +3309,9 @@ def run() -> None:
         offline=args.offline,
         prepare_only=args.prepare_data,
         cache_db_path=Path(args.cache_db) if args.cache_db else None,
+        log_db_path=Path(args.log_db) if args.log_db else (
+            Path(args.output).with_suffix(".db") if args.output else None
+        ),
         prepare_prefetch_symbols=args.prepare_prefetch_symbols,
         prepare_prefetch_contracts_per_side=args.prepare_prefetch_contracts,
     )

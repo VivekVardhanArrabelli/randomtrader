@@ -1,9 +1,11 @@
 """Tests for the AI trader backtest module."""
 
+import sqlite3
 from datetime import date, datetime, timedelta
 
 import pytest
 
+from ai_trader.brain import AnalysisRun, MarketAnalysis, TradeDecision
 from ai_trader.backtest import (
     BacktestConfig,
     BacktestResult,
@@ -37,6 +39,7 @@ from ai_trader.backtest import (
     save_debug_log,
 )
 from ai_trader.historical_cache import PolygonResponseStore
+from ai_trader.llm import LLMCompletion, LLMDecisionPacket, ToolCall
 from ai_trader.news import NewsEvent
 from ai_trader.utils import EASTERN_TZ
 
@@ -190,6 +193,50 @@ def test_polygon_request_offline_cache_miss_raises(tmp_path):
     store = PolygonResponseStore(tmp_path / "historical.db")
     with pytest.raises(RuntimeError, match="offline Polygon cache miss"):
         bt_mod._polygon_request("", "/v2/missing", {"ticker": "AAPL"}, store=store, offline=True)
+
+
+def test_polygon_request_adapts_interval_after_429(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    sleeps: list[float] = []
+    calls = {"count": 0}
+    base_interval = bt_mod.config.POLYGON_MIN_REQUEST_INTERVAL_SECONDS
+
+    class DummyResponse:
+        def __init__(self, status_code: int, payload: dict, *, headers: dict | None = None, text: str = ""):
+            self.status_code = status_code
+            self._payload = payload
+            self.headers = headers or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    responses = [
+        DummyResponse(
+            429,
+            {"status": "ERROR"},
+            headers={"Retry-After": "4"},
+            text="rate limited",
+        ),
+        DummyResponse(200, {"results": [{"ticker": "AAPL"}]}),
+    ]
+
+    def mock_get(url, params=None, timeout=30):
+        calls["count"] += 1
+        return responses.pop(0)
+
+    monkeypatch.setattr("requests.get", mock_get)
+    monkeypatch.setattr(bt_mod.time_module, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(bt_mod, "_LAST_POLYGON_REQUEST_AT", 0.0)
+    monkeypatch.setattr(bt_mod, "_POLYGON_REQUEST_INTERVAL_SECONDS", base_interval)
+
+    result = bt_mod._polygon_request("live-key", "/v2/test", {"ticker": "AAPL"})
+
+    assert result == {"results": [{"ticker": "AAPL"}]}
+    assert calls["count"] == 2
+    assert 4.0 in sleeps
+    assert bt_mod._POLYGON_REQUEST_INTERVAL_SECONDS > base_interval
 
 
 def test_fetch_historical_daily_bars_range_offline_reraises(monkeypatch):
@@ -1937,3 +1984,118 @@ def test_save_debug_log_close_position(tmp_path):
     assert "pnl=$+500" in content
     # Should NOT say "Executed:" for close trades
     assert "Executed:" not in content
+
+
+def test_run_backtest_streams_trades_and_decisions_to_log_db(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_time = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+    log_db = tmp_path / "window.db"
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[
+                    ToolCall(
+                        name="submit_trade_decisions",
+                        input={
+                            "market_analysis": "Constructive tape",
+                            "thesis_updates": [],
+                            "trades": [{"action": "buy_call", "underlying": "AAPL"}],
+                        },
+                    )
+                ],
+                raw_response={"id": "resp_test"},
+            )
+            analysis = MarketAnalysis(
+                analysis="Constructive tape",
+                thesis_updates=[],
+                trades=[
+                    TradeDecision(
+                        action="buy_call",
+                        underlying="AAPL",
+                        strike_preference="atm",
+                        expiry_preference="next_week",
+                        conviction=0.7,
+                        risk_pct=0.001,
+                        reasoning="Fresh catalyst",
+                        target_symbol=None,
+                        expression_profile="balanced",
+                    )
+                ],
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: [decision_time])
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+    monkeypatch.setattr(
+        bt_mod,
+        "_select_real_contract",
+        lambda *args, **kwargs: {
+            "ticker": "O:AAPL250117C00100000",
+            "strike_price": 100.0,
+            "expiration_date": "2025-01-17",
+        },
+    )
+    monkeypatch.setattr(bt_mod, "_next_fill_option_bar", lambda *args, **kwargs: {"c": 1.0, "v": 100})
+    monkeypatch.setattr(bt_mod, "_current_option_bar", lambda *args, **kwargs: {"c": 1.5, "v": 100})
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            log_db_path=log_db,
+        )
+    )
+
+    assert result.log_db_path == str(log_db)
+
+    with sqlite3.connect(log_db) as conn:
+        decision = conn.execute(
+            "SELECT llm_provider, llm_model, trades_executed FROM ai_decisions"
+        ).fetchone()
+        trade = conn.execute(
+            "SELECT symbol, underlying, action, status, expression_profile FROM ai_trades"
+        ).fetchone()
+        close = conn.execute(
+            "SELECT symbol, underlying, pnl, reason FROM position_closes"
+        ).fetchone()
+
+    assert decision == ("openai", "gpt-5.4", 1)
+    assert trade == ("O:AAPL250117C00100000", "AAPL", "buy_call", "filled", "balanced")
+    assert close == ("O:AAPL250117C00100000", "AAPL", 50.0, "backtest_end")

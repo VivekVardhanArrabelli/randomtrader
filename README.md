@@ -272,6 +272,10 @@ Configure the keys you actually use:
 - `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`
 - `POLYGON_API_KEY` for historical backtests
 
+The default provider/model path in this repo is now `openai/gpt-5.4`. Override
+`LLM_MODEL` or `LLM_PROVIDER` only when you intentionally want a different
+comparison target.
+
 ## Basic Commands
 
 Run AI tests:
@@ -292,6 +296,16 @@ Run a backtest:
 python -m ai_trader.backtest --start 2026-01-20 --end 2026-02-13
 ```
 
+Add `--log-db path/to/run.db` if you want streaming SQLite trade/decision logs
+during the backtest. If `--output` is set, the CLI will default the log DB to a
+matching `.db` path.
+
+Run the rolling 3-month experiment harness:
+
+```bash
+python -m ai_trader.experiments --label current-idea
+```
+
 Prepare historical cache:
 
 ```bash
@@ -303,6 +317,11 @@ Replay logged packets:
 ```bash
 python -m ai_trader.replay --limit 25 --provider openai --model gpt-5.4 --json
 ```
+
+Experiment suite outputs land under `ai_trader/logs/experiments/` by default and
+record the rolling-window metrics plus per-window backtest artifacts. Each
+window now also gets a dedicated SQLite run log next to its JSON/debug files so
+you can inspect decisions, fills, and closes before the suite finishes.
 
 ## Final Note For Future Iterations
 

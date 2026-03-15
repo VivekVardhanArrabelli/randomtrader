@@ -50,6 +50,12 @@ def test_resolved_llm_model_prefers_env(monkeypatch):
     assert config.resolved_llm_model("o4-mini") == "o4-mini"
 
 
+def test_default_llm_model_is_openai_family(monkeypatch):
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    assert config.resolved_llm_model() == "gpt-5.4"
+
+
 def test_trading_brain_defaults_to_resolved_model(monkeypatch):
     class DummyAdapter:
         provider = "openai"
