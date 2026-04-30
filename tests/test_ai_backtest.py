@@ -409,6 +409,50 @@ def test_fetch_option_daily_bar_uses_theta_quote_only_row(monkeypatch):
     assert bar["ask"] == pytest.approx(1.5)
 
 
+def test_theta_request_caches_expected_empty_response(tmp_path, monkeypatch):
+    import requests
+    import ai_trader.backtest as bt_mod
+    from ai_trader.historical_cache import PolygonResponseStore
+
+    calls: list[tuple[str, dict | None]] = []
+
+    class FakeResponse:
+        status_code = 472
+        text = ":No data for the specified timeframe & contract."
+
+        def json(self):
+            raise AssertionError("expected-empty Theta responses should not parse JSON")
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append((url, params))
+        return FakeResponse()
+
+    monkeypatch.setenv("THETA_BASE_URL", "http://theta.test")
+    monkeypatch.setattr(requests, "get", fake_get)
+    store = PolygonResponseStore(tmp_path / "cache.db")
+    params = {
+        "root": "AAPL",
+        "exp": "20250117",
+        "right": "C",
+        "strike": "150000",
+        "start_date": "20250110",
+        "end_date": "20250110",
+    }
+
+    first = bt_mod._theta_request("/v2/hist/option/ohlc", params=params, store=store)
+    second = bt_mod._theta_request(
+        "/v2/hist/option/ohlc",
+        params=params,
+        store=store,
+        offline=True,
+    )
+
+    assert first["response"] == []
+    assert first["theta_empty"] is True
+    assert second == first
+    assert len(calls) == 1
+
+
 def test_fetch_historical_intraday_bars_uses_theta_symbol(monkeypatch):
     import ai_trader.backtest as bt_mod
 

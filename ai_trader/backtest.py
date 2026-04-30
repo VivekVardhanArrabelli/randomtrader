@@ -218,7 +218,19 @@ def _theta_request(
     url = f"{base_url}{path}"
     response = requests.get(url, params=request_params, timeout=30)
     if response.status_code >= 400:
-        raise RuntimeError(f"Theta {response.status_code}: {response.text[:200]}")
+        message = f"Theta {response.status_code}: {response.text[:200]}"
+        if _theta_is_expected_empty_message(message):
+            data = {
+                "header": {"format": []},
+                "response": [],
+                "theta_empty": True,
+                "theta_status": response.status_code,
+                "theta_message": response.text[:200],
+            }
+            if store is not None:
+                store.put(cache_path, request_params, data)
+            return data
+        raise RuntimeError(message)
     data = response.json()
     if store is not None:
         store.put(cache_path, request_params, data)
@@ -392,7 +404,10 @@ def _theta_bar_to_polygon_bar(row: dict, *, fallback_date: date) -> dict | None:
 
 
 def _theta_is_expected_empty_error(exc: Exception) -> bool:
-    message = str(exc)
+    return _theta_is_expected_empty_message(str(exc))
+
+
+def _theta_is_expected_empty_message(message: str) -> bool:
     if not message.startswith("Theta 472:"):
         return False
     return any(
