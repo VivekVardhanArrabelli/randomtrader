@@ -1,6 +1,9 @@
 """Tests for AI trader decision/trade history formatting."""
 
-from ai_trader.db import format_trade_history
+from datetime import datetime
+import sqlite3
+
+from ai_trader.db import AITradeLogger, PositionCloseRecord, format_trade_history
 
 
 def test_format_trade_history_includes_profile_calibration_lines():
@@ -66,3 +69,35 @@ def test_format_trade_history_includes_profile_calibration_lines():
     assert "Expression review: Calls 1/3 wins net=$-4,192" in result
     assert "Short-dated calls (<=14 DTE): 0/2 wins net=$-8,174" in result
     assert "Stop-loss cluster: 2 trades net=$-8,174 | calls=2 puts=0" in result
+
+
+def test_position_close_logger_persists_expression_metadata(tmp_path):
+    db_path = tmp_path / "trades.db"
+    logger = AITradeLogger(db_path)
+
+    logger.log_position_close(
+        PositionCloseRecord(
+            timestamp=datetime(2026, 2, 13, 15, 45),
+            symbol="O:AAPL260220C00200000",
+            underlying="AAPL",
+            qty=2,
+            entry_premium=4.0,
+            exit_premium=6.0,
+            pnl=400.0,
+            reason="profit_target",
+            expression_profile="balanced",
+            option_type="call",
+            expiration="2026-02-20",
+            entry_date="2026-02-10",
+        )
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT expression_profile, option_type, expiration, entry_date
+            FROM position_closes
+            """
+        ).fetchone()
+
+    assert row == ("balanced", "call", "2026-02-20", "2026-02-10")

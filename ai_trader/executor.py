@@ -507,6 +507,9 @@ def _execute_close_option(
                 pnl=pnl,
                 reason=decision.reasoning,
                 order_id=order_id,
+                expression_profile=decision.expression_profile or "",
+                option_type=position.option_type,
+                expiration=position.expiration,
             )
         )
         log(f"position closed: {position.symbol} pnl=${pnl:.2f}")
@@ -609,6 +612,8 @@ def _execute_close_stock(
                 pnl=pnl,
                 reason=decision.reasoning,
                 order_id=order_id,
+                expression_profile=decision.expression_profile or "",
+                option_type="stock",
             )
         )
         log(f"stock position closed: {position.symbol} pnl=${pnl:.2f}")
@@ -834,6 +839,9 @@ def reconcile_pending_orders(
                 pnl=pnl,
                 reason=str(trade.get("reasoning") or "async close fill reconciliation"),
                 order_id=order_id,
+                expression_profile=str(trade.get("expression_profile") or ""),
+                option_type=option_type,
+                expiration=str(trade.get("expiration") or ""),
             )
         )
         closes_backfilled += 1

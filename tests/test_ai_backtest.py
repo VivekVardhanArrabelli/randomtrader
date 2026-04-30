@@ -2532,12 +2532,25 @@ def test_run_backtest_streams_trades_and_decisions_to_log_db(tmp_path, monkeypat
             "SELECT symbol, underlying, action, status, expression_profile FROM ai_trades"
         ).fetchone()
         close = conn.execute(
-            "SELECT symbol, underlying, pnl, reason FROM position_closes"
+            """
+            SELECT symbol, underlying, pnl, reason, expression_profile,
+                   option_type, expiration, entry_date
+            FROM position_closes
+            """
         ).fetchone()
 
     assert decision == ("openai", "gpt-5.4", 1)
     assert trade == ("O:AAPL250117C00100000", "AAPL", "buy_call", "filled", "balanced")
-    assert close == ("O:AAPL250117C00100000", "AAPL", 50.0, "backtest_end")
+    assert close == (
+        "O:AAPL250117C00100000",
+        "AAPL",
+        50.0,
+        "backtest_end",
+        "balanced",
+        "call",
+        "2025-01-17",
+        "2025-01-06",
+    )
 
 
 def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):

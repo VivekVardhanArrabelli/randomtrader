@@ -1873,6 +1873,10 @@ def _log_backtest_close(
             pnl=trade_pnl,
             reason=reason,
             order_id=None,
+            expression_profile=position.expression_profile,
+            option_type=position.option_type,
+            expiration=position.expiry_date.isoformat(),
+            entry_date=position.entry_date.isoformat(),
         )
     )
 

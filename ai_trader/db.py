@@ -68,6 +68,10 @@ class PositionCloseRecord:
     pnl: float
     reason: str
     order_id: str | None = None
+    expression_profile: str = ""
+    option_type: str = ""
+    expiration: str = ""
+    entry_date: str = ""
 
 
 class AITradeLogger:
@@ -130,7 +134,11 @@ class AITradeLogger:
                     exit_premium REAL,
                     pnl REAL,
                     reason TEXT,
-                    order_id TEXT
+                    order_id TEXT,
+                    expression_profile TEXT,
+                    option_type TEXT,
+                    expiration TEXT,
+                    entry_date TEXT
                 )
                 """
             )
@@ -140,6 +148,14 @@ class AITradeLogger:
             }
             if "order_id" not in close_cols:
                 conn.execute("ALTER TABLE position_closes ADD COLUMN order_id TEXT")
+            if "expression_profile" not in close_cols:
+                conn.execute("ALTER TABLE position_closes ADD COLUMN expression_profile TEXT")
+            if "option_type" not in close_cols:
+                conn.execute("ALTER TABLE position_closes ADD COLUMN option_type TEXT")
+            if "expiration" not in close_cols:
+                conn.execute("ALTER TABLE position_closes ADD COLUMN expiration TEXT")
+            if "entry_date" not in close_cols:
+                conn.execute("ALTER TABLE position_closes ADD COLUMN entry_date TEXT")
 
             decision_cols = {
                 str(row[1])
@@ -232,8 +248,9 @@ class AITradeLogger:
                 """
                 INSERT INTO position_closes (
                     timestamp, symbol, underlying, qty, entry_premium,
-                    exit_premium, pnl, reason, order_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_premium, pnl, reason, order_id, expression_profile,
+                    option_type, expiration, entry_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.timestamp.isoformat(),
@@ -245,6 +262,10 @@ class AITradeLogger:
                     record.pnl,
                     record.reason,
                     record.order_id,
+                    record.expression_profile,
+                    record.option_type,
+                    record.expiration,
+                    record.entry_date,
                 ),
             )
 
