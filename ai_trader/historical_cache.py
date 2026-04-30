@@ -1,4 +1,4 @@
-"""Persistent cache for historical Polygon responses used by backtests."""
+"""Persistent cache for historical provider responses used by backtests."""
 
 from __future__ import annotations
 

@@ -1,5 +1,8 @@
+import json
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from ai_trader.backtest import BacktestResult, backtest_result_to_dict
 from ai_trader.experiments import (
@@ -8,6 +11,7 @@ from ai_trader.experiments import (
     ExperimentWindowResult,
     _shift_months,
     build_rolling_windows,
+    compare_experiment_runs,
     compare_to_readme_baseline,
     summarize_experiment_suite,
     summarize_window_result,
@@ -27,6 +31,7 @@ def _window_result(
     total_trades: int,
     llm_failure_days: int = 0,
     log_db_path: str | None = None,
+    historical_options_provider: str = "polygon",
 ) -> ExperimentWindowResult:
     initial_equity = 100_000.0
     final_equity = initial_equity * (1 + total_return_pct)
@@ -50,6 +55,7 @@ def _window_result(
             profit_factor=profit_factor,
             days_tested=63,
             llm_failure_days=llm_failure_days,
+            historical_options_provider=historical_options_provider,
             log_db_path=log_db_path,
         ),
         result_path=Path("/tmp/result.json"),
@@ -237,6 +243,93 @@ def test_summarize_window_result_stays_lightweight():
     assert "decision_log" not in summary
     assert "trades" not in summary
     assert summary["log_db_path"] == "/tmp/window.db"
+    assert summary["historical_options_provider"] == "polygon"
+
+
+def test_compare_experiment_runs_reports_menu_fill_and_metric_overlap(tmp_path):
+    left_result = {
+        "historical_options_provider": "polygon",
+        "total_return_pct": 0.08,
+        "net_pnl": 8_000.0,
+        "total_trades": 2,
+        "max_drawdown": 5_000.0,
+        "sharpe_ratio": 0.9,
+        "decision_log": [
+            {
+                "decision_time": "2025-11-13T09:35:00-05:00",
+                "finalists": ["ONON", "TMUS"],
+                "trades_proposed": [{"underlying": "ONON"}, {"underlying": "TMUS"}],
+            }
+        ],
+        "trades": [
+            {
+                "entry_date": "2025-11-13",
+                "exit_date": "2025-11-14",
+                "underlying": "ONON",
+                "option_type": "call",
+                "strike": 30.0,
+                "entry_premium": 2.0,
+                "exit_premium": 3.0,
+                "qty": 10,
+                "pnl": 1_000.0,
+                "exit_reason": "profit_target",
+                "conviction": 0.7,
+                "expression_profile": "balanced",
+                "polygon_ticker": "O:ONON251121C00030000",
+                "reasoning": "test",
+            }
+        ],
+    }
+    right_result = {
+        "historical_options_provider": "theta",
+        "total_return_pct": 0.06,
+        "net_pnl": 6_000.0,
+        "total_trades": 2,
+        "max_drawdown": 5_500.0,
+        "sharpe_ratio": 0.8,
+        "decision_log": [
+            {
+                "decision_time": "2025-11-13T09:35:00-05:00",
+                "finalists": ["ONON", "XLV"],
+                "trades_proposed": [{"underlying": "ONON"}],
+            }
+        ],
+        "trades": [
+            {
+                "entry_date": "2025-11-13",
+                "exit_date": "2025-11-14",
+                "underlying": "ONON",
+                "option_type": "call",
+                "strike": 30.0,
+                "entry_premium": 2.2,
+                "exit_premium": 2.8,
+                "qty": 10,
+                "pnl": 600.0,
+                "exit_reason": "manual_close",
+                "conviction": 0.7,
+                "expression_profile": "balanced",
+                "polygon_ticker": "THETA:ONON:2025-11-21:call:30.000",
+                "reasoning": "test",
+            }
+        ],
+    }
+
+    left_path = tmp_path / "left.json"
+    right_path = tmp_path / "right.json"
+    left_path.write_text(json.dumps(left_result))
+    right_path.write_text(json.dumps(right_result))
+
+    comparison = compare_experiment_runs(left_path, right_path)
+
+    assert comparison["left"]["historical_options_provider"] == "polygon"
+    assert comparison["right"]["historical_options_provider"] == "theta"
+    assert comparison["metrics"]["return_delta_pct"] == pytest.approx(0.02)
+    assert comparison["menus"]["decision_times_compared"] == 1
+    assert comparison["menus"]["avg_finalist_overlap"] == pytest.approx(1 / 3)
+    assert comparison["menus"]["avg_proposed_symbol_overlap"] == pytest.approx(0.5)
+    assert comparison["fills"]["shared_trade_signatures"] == 1
+    assert comparison["fills"]["avg_entry_premium_delta"] == pytest.approx(0.2)
+    assert comparison["fills"]["avg_exit_premium_delta"] == pytest.approx(0.2)
 
 
 def test_summarize_experiment_suite_deduplicates_failure_days_across_overlapping_windows():
@@ -306,10 +399,12 @@ def test_backtest_result_to_dict_includes_llm_reliability_fields():
         BacktestResult(
             llm_error_cycles=2,
             llm_failure_days=1,
+            historical_options_provider="theta",
             log_db_path="/tmp/backtest.db",
         )
     )
 
     assert payload["llm_error_cycles"] == 2
     assert payload["llm_failure_days"] == 1
+    assert payload["historical_options_provider"] == "theta"
     assert payload["log_db_path"] == "/tmp/backtest.db"

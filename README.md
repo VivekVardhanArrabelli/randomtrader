@@ -47,7 +47,8 @@ intelligence shows up in the trades it chooses.
 The repo has moved materially beyond the original prototype.
 
 - live trading uses Alpaca
-- historical options backtesting uses Polygon
+- historical options backtesting now defaults to Theta Data
+- historical news and equity backfill still use Polygon
 - LLM access is provider-agnostic
 - decision packets can be logged and replayed
 - the backtester is causal and timestamp-aware
@@ -70,7 +71,8 @@ This is a credible positive baseline, not proof of robust production alpha.
 
 ```text
 Alpaca News / Market Data / Options Chain
-Polygon Historical Options Data (backtests only)
+Theta Historical Options Data (backtests)
+Polygon Historical News / Equity Data
         │
         ▼
 Deterministic Retrieval + Enrichment + Candidate Triage
@@ -98,7 +100,7 @@ SQLite logs / backtest outputs / replay analysis
 - `llm/` - provider adapters and packet abstractions
 - `loop.py` - live trading loop
 - `backtest.py` - causal historical backtester
-- `historical_cache.py` - persistent Polygon cache for repeatable backtests
+- `historical_cache.py` - persistent historical response cache for repeatable backtests
 - `news.py` - news/event normalization, enrichment, and setup context
 - `candidates.py` - candidate triage and finalist selection
 - `options.py` - option menu construction and contract ranking
@@ -241,10 +243,11 @@ Promotion rule:
 
 ### Historical Backtesting
 
-- Polygon is used for historical options data
-- the repo now supports persistent historical caching and offline backtest mode
-- the first cold historical materialization can be slow because unique option
-  requests must be fetched once
+- Theta Data is the default historical options provider for backtests
+- Polygon is still used for historical news and equity bars
+- the repo supports persistent historical caching and offline backtest mode
+- the first cold historical materialization can still be slow because unique
+  option requests must be fetched once
 
 ## Logging And Replay
 
@@ -270,7 +273,8 @@ Configure the keys you actually use:
 - `ALPACA_API_KEY`
 - `ALPACA_API_SECRET`
 - `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`
-- `POLYGON_API_KEY` for historical backtests
+- `POLYGON_API_KEY` for historical news/equity backfills used by backtests
+- a local Theta Terminal for historical options backtests
 
 The default provider/model path in this repo is now `openai/gpt-5.4`. Override
 `LLM_MODEL` or `LLM_PROVIDER` only when you intentionally want a different

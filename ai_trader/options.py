@@ -81,6 +81,26 @@ def target_dte_for_expiry_preference(expiry_preference: str) -> int:
     return 9
 
 
+def filter_contracts_by_expiry_preference(
+    contracts: list["OptionContract"],
+    preference: str,
+    *,
+    as_of: date | None = None,
+) -> list["OptionContract"]:
+    """Apply the live expiry-preference window using an explicit as-of date."""
+    today = as_of or now_eastern().date()
+    if preference == "this_week":
+        cutoff = today + timedelta(days=7)
+        return [c for c in contracts if c.expiration <= cutoff]
+    if preference == "next_week":
+        start = today + timedelta(days=5)
+        cutoff = today + timedelta(days=14)
+        return [c for c in contracts if start <= c.expiration <= cutoff] or [
+            c for c in contracts if c.expiration <= cutoff
+        ]
+    return [c for c in contracts if c.dte >= 14]
+
+
 def absolute_delta(contract: "OptionContract", underlying_price: float) -> float:
     if contract.delta is not None:
         return abs(contract.delta)

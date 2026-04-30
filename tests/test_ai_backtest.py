@@ -34,11 +34,15 @@ from ai_trader.backtest import (
     _ticker_price_metrics_as_of,
     _select_real_contract,
     _trading_days,
+    fetch_historical_intraday_bars,
     fetch_historical_daily_bars_range,
+    fetch_option_daily_bar,
+    fetch_polygon_option_contracts,
     print_backtest_result,
     save_debug_log,
 )
 from ai_trader.historical_cache import PolygonResponseStore
+from ai_trader.journal import ThesisUpdate
 from ai_trader.llm import LLMCompletion, LLMDecisionPacket, ToolCall
 from ai_trader.news import NewsEvent
 from ai_trader.utils import EASTERN_TZ
@@ -253,6 +257,348 @@ def test_fetch_historical_daily_bars_range_offline_reraises(monkeypatch):
             "fake", "AAPL", date(2025, 1, 1), date(2025, 1, 3), cache=cache,
         )
 
+
+def test_fetch_polygon_option_contracts_uses_theta_when_configured(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setenv("HISTORICAL_OPTIONS_PROVIDER", "theta")
+    captured: dict[str, object] = {}
+
+    def mock_theta_request(path, params=None, **kwargs):
+        captured["path"] = path
+        captured["params"] = params
+        return {
+            "header": {"format": ["root", "expiration", "strike", "right"]},
+            "response": [
+                ["AAPL", 20250117, 150000, "C"],
+                ["AAPL", 20250124, 155000, "P"],
+            ],
+        }
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_theta_request",
+        mock_theta_request,
+    )
+
+    contracts = fetch_polygon_option_contracts(
+        "unused",
+        "AAPL",
+        "call",
+        date(2025, 1, 10),
+        date(2025, 1, 20),
+        145.0,
+        151.0,
+        as_of=date(2025, 1, 10),
+        cache=PolygonCache(),
+    )
+
+    assert len(contracts) == 1
+    assert contracts[0]["ticker"].startswith("THETA:AAPL:2025-01-17:call:")
+    assert contracts[0]["strike_price"] == 150.0
+    assert captured["path"] == "/v2/list/contracts/option/quote"
+    assert captured["params"] == {"root": "AAPL", "start_date": "20250110"}
+
+
+def test_fetch_option_daily_bar_uses_theta_symbol(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    captured: dict[str, object] = {}
+
+    def mock_theta_request(path, params=None, **kwargs):
+        captured["path"] = path
+        captured["params"] = params
+        return {
+            "header": {
+                "format": [
+                    "ms_of_day",
+                    "ms_of_day2",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "count",
+                    "bid_size",
+                    "bid_exchange",
+                    "bid",
+                    "bid_condition",
+                    "ask_size",
+                    "ask_exchange",
+                    "ask",
+                    "ask_condition",
+                    "date",
+                ]
+            },
+            "response": [
+                [34200000, 57600000, 1.0, 1.6, 0.9, 1.4, 123, 9, 10, 1, 1.3, 50, 12, 1, 1.5, 50, 20250110]
+            ],
+        }
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_theta_request",
+        mock_theta_request,
+    )
+
+    bar = fetch_option_daily_bar(
+        "unused",
+        "THETA:AAPL:2025-01-17:call:150.000",
+        date(2025, 1, 10),
+        cache=PolygonCache(),
+    )
+
+    assert bar is not None
+    assert bar["c"] == 1.4
+    assert bar["v"] == 123
+    assert captured["path"] == "/v2/hist/option/eod"
+    assert captured["params"] == {
+        "root": "AAPL",
+        "exp": "20250117",
+        "right": "C",
+        "strike": "150000",
+        "start_date": "20250110",
+        "end_date": "20250110",
+    }
+
+
+def test_fetch_option_daily_bar_uses_theta_quote_only_row(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_theta_request",
+        lambda *args, **kwargs: {
+            "header": {
+                "format": [
+                    "ms_of_day",
+                    "ms_of_day2",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "count",
+                    "bid_size",
+                    "bid_exchange",
+                    "bid",
+                    "bid_condition",
+                    "ask_size",
+                    "ask_exchange",
+                    "ask",
+                    "ask_condition",
+                    "date",
+                ]
+            },
+            "response": [
+                [34200000, 57600000, 0.0, 0.0, 0.0, 0.0, 0, 0, 10, 1, 1.3, 50, 12, 1, 1.5, 50, 20250110]
+            ],
+        },
+    )
+
+    bar = fetch_option_daily_bar(
+        "unused",
+        "THETA:AAPL:2025-01-17:call:150.000",
+        date(2025, 1, 10),
+        cache=PolygonCache(),
+    )
+
+    assert bar is not None
+    assert bar["c"] == pytest.approx(1.4)
+    assert bar["bid"] == pytest.approx(1.3)
+    assert bar["ask"] == pytest.approx(1.5)
+
+
+def test_fetch_historical_intraday_bars_uses_theta_symbol(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    captured: dict[str, object] = {}
+
+    def mock_theta_request(path, params=None, **kwargs):
+        captured["path"] = path
+        captured["params"] = params
+        return {
+            "header": {
+                "format": ["ms_of_day", "open", "high", "low", "close", "volume", "count", "date"]
+            },
+            "response": [
+                [34500000, 1.0, 1.3, 0.95, 1.2, 50, 4, 20250110]
+            ],
+        }
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_theta_request",
+        mock_theta_request,
+    )
+
+    bars = fetch_historical_intraday_bars(
+        "unused",
+        "THETA:AAPL:2025-01-17:call:150.000",
+        date(2025, 1, 10),
+        multiplier=5,
+        cache=PolygonCache(),
+    )
+
+    assert len(bars) == 1
+    assert bars[0]["c"] == 1.2
+    assert bars[0]["v"] == 50
+    assert captured["path"] == "/v2/hist/option/ohlc"
+    assert captured["params"] == {
+        "root": "AAPL",
+        "exp": "20250117",
+        "right": "C",
+        "strike": "150000",
+        "start_date": "20250110",
+        "end_date": "20250110",
+        "ivl": "300000",
+    }
+
+
+def test_fetch_historical_intraday_bars_uses_theta_quote_fallback(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    calls: list[tuple[str, dict | None]] = []
+
+    def mock_theta_request(path, params=None, **kwargs):
+        calls.append((path, params))
+        if path == "/v2/hist/option/ohlc":
+            raise RuntimeError("Theta 472: :No data for the specified timeframe & contract.")
+        if path == "/v2/hist/option/quote":
+            return {
+                "header": {
+                    "format": [
+                        "ms_of_day",
+                        "bid_size",
+                        "bid_exchange",
+                        "bid",
+                        "bid_condition",
+                        "ask_size",
+                        "ask_exchange",
+                        "ask",
+                        "ask_condition",
+                        "date",
+                    ]
+                },
+                "response": [
+                    [34200000, 1, 1, 1.0, 50, 1, 1, 1.4, 50, 20250110],
+                    [34500000, 1, 1, 1.1, 50, 1, 1, 1.5, 50, 20250110],
+                ],
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bt_mod, "_theta_request", mock_theta_request)
+
+    bars = fetch_historical_intraday_bars(
+        "unused",
+        "THETA:AAPL:2025-01-17:call:150.000",
+        date(2025, 1, 10),
+        multiplier=5,
+        cache=PolygonCache(),
+    )
+
+    assert [path for path, _ in calls] == ["/v2/hist/option/ohlc", "/v2/hist/option/quote"]
+    assert calls[1][1] == {
+        "root": "AAPL",
+        "exp": "20250117",
+        "right": "C",
+        "strike": "150000",
+        "start_date": "20250110",
+        "end_date": "20250110",
+        "ivl": "300000",
+    }
+    assert len(bars) == 2
+    assert bars[0]["quote_only"] is True
+    assert bars[0]["bid"] == pytest.approx(1.0)
+    assert bars[0]["ask"] == pytest.approx(1.4)
+    assert bars[0]["c"] == pytest.approx(1.2)
+    assert bars[0]["v"] == 0
+
+
+def test_fetch_polygon_option_contracts_theta_expected_empty_returns_no_log(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    logged: list[str] = []
+
+    monkeypatch.setenv("HISTORICAL_OPTIONS_PROVIDER", "theta")
+    monkeypatch.setattr(
+        bt_mod,
+        "_theta_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("Theta 472: :No listed contracts for the date: 20250110")
+        ),
+    )
+    monkeypatch.setattr(bt_mod, "log", logged.append)
+
+    contracts = fetch_polygon_option_contracts(
+        "unused",
+        "AAPL",
+        "call",
+        date(2025, 1, 10),
+        date(2025, 1, 20),
+        145.0,
+        151.0,
+        as_of=date(2025, 1, 10),
+        cache=PolygonCache(),
+    )
+
+    assert contracts == []
+    assert logged == []
+
+
+def test_select_real_contract_hydrates_theta_quote_surface(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setenv("HISTORICAL_OPTIONS_PROVIDER", "theta")
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: [
+            {
+                "ticker": "THETA:AAPL:2025-01-17:call:150.000",
+                "strike_price": 150.0,
+                "expiration_date": "2025-01-17",
+                "contract_type": "call",
+                "bid": 0.0,
+                "ask": 0.0,
+                "mid": 0.0,
+                "open_interest": 0,
+                "volume": 0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "_current_option_bar",
+        lambda *args, **kwargs: {
+            "t": int(datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ).timestamp() * 1000),
+            "c": 1.2,
+            "vw": 1.2,
+            "bid": 1.1,
+            "ask": 1.3,
+            "quote_only": True,
+            "v": 0,
+        },
+    )
+    monkeypatch.setattr(bt_mod, "_historical_option_session_volume", lambda *args, **kwargs: 0)
+
+    contract = _select_real_contract(
+        "unused",
+        "AAPL",
+        "call",
+        151.0,
+        date(2025, 1, 10),
+        "atm",
+        "next_week",
+        default_dte=14,
+        decision_time=datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        cache=PolygonCache(),
+    )
+
+    assert contract is not None
+    assert contract["bid"] == pytest.approx(1.1)
+    assert contract["ask"] == pytest.approx(1.3)
+    assert contract["mid"] == pytest.approx(1.2)
 
 def test_session_intraday_bars_before_uses_filtered_cache(monkeypatch):
     import ai_trader.backtest as bt_mod
@@ -530,12 +876,33 @@ def test_exit_premium_for_position_forces_expired_position_to_zero_without_bar()
 # _select_real_contract (with mocked cache)
 # ---------------------------------------------------------------------------
 
+def _contract(
+    ticker: str,
+    strike_price: float,
+    expiration_date: str,
+    *,
+    bid: float = 1.0,
+    ask: float = 1.0,
+    open_interest: int = 100,
+    volume: int = 25,
+):
+    return {
+        "ticker": ticker,
+        "strike_price": strike_price,
+        "expiration_date": expiration_date,
+        "bid": bid,
+        "ask": ask,
+        "open_interest": open_interest,
+        "volume": volume,
+    }
+
+
 def test_select_real_contract_atm(monkeypatch):
     """ATM strike preference should pick the contract closest to spot."""
     contracts = [
-        {"ticker": "O:AAPL250117C00145000", "strike_price": 145, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117C00155000", "strike_price": 155, "expiration_date": "2025-01-17"},
+        _contract("O:AAPL250117C00145000", 145, "2025-01-17"),
+        _contract("O:AAPL250117C00150000", 150, "2025-01-17"),
+        _contract("O:AAPL250117C00155000", 155, "2025-01-17"),
     ]
 
     # Mock fetch_polygon_option_contracts to return our contracts
@@ -562,9 +929,9 @@ def test_select_real_contract_atm(monkeypatch):
 def test_select_real_contract_otm_call(monkeypatch):
     """OTM call should pick strike above spot (3% OTM)."""
     contracts = [
-        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117C00155000", "strike_price": 155, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117C00160000", "strike_price": 160, "expiration_date": "2025-01-17"},
+        _contract("O:AAPL250117C00150000", 150, "2025-01-17"),
+        _contract("O:AAPL250117C00155000", 155, "2025-01-17"),
+        _contract("O:AAPL250117C00160000", 160, "2025-01-17"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -590,9 +957,9 @@ def test_select_real_contract_otm_call(monkeypatch):
 def test_select_real_contract_otm_put(monkeypatch):
     """OTM put should pick strike below spot (3% OTM)."""
     contracts = [
-        {"ticker": "O:AAPL250117P00140000", "strike_price": 140, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117P00145000", "strike_price": 145, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117P00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
+        _contract("O:AAPL250117P00140000", 140, "2025-01-17"),
+        _contract("O:AAPL250117P00145000", 145, "2025-01-17"),
+        _contract("O:AAPL250117P00150000", 150, "2025-01-17"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -618,9 +985,9 @@ def test_select_real_contract_otm_put(monkeypatch):
 def test_select_real_contract_itm_call(monkeypatch):
     """ITM call should pick strike below spot."""
     contracts = [
-        {"ticker": "O:AAPL250117C00140000", "strike_price": 140, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117C00145000", "strike_price": 145, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
+        _contract("O:AAPL250117C00140000", 140, "2025-01-17"),
+        _contract("O:AAPL250117C00145000", 145, "2025-01-17"),
+        _contract("O:AAPL250117C00150000", 150, "2025-01-17"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -666,8 +1033,8 @@ def test_select_real_contract_no_contracts(monkeypatch):
 
 def test_select_real_contract_monthly_prefers_target_dte(monkeypatch):
     contracts = [
-        {"ticker": "O:AAPL250124C00150000", "strike_price": 150, "expiration_date": "2025-01-24"},
-        {"ticker": "O:AAPL250207C00150000", "strike_price": 150, "expiration_date": "2025-02-07"},
+        _contract("O:AAPL250124C00150000", 150, "2025-01-24"),
+        _contract("O:AAPL250207C00150000", 150, "2025-02-07"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -691,8 +1058,8 @@ def test_select_real_contract_monthly_prefers_target_dte(monkeypatch):
 
 def test_select_real_contract_exact_symbol(monkeypatch):
     contracts = [
-        {"ticker": "O:AAPL250124C00150000", "strike_price": 150, "expiration_date": "2025-01-24"},
-        {"ticker": "O:AAPL250207C00155000", "strike_price": 155, "expiration_date": "2025-02-07"},
+        _contract("O:AAPL250124C00150000", 150, "2025-01-24"),
+        _contract("O:AAPL250207C00155000", 155, "2025-02-07"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -717,8 +1084,8 @@ def test_select_real_contract_exact_symbol(monkeypatch):
 
 def test_select_real_contract_respects_target_dte_range(monkeypatch):
     contracts = [
-        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250131C00150000", "strike_price": 150, "expiration_date": "2025-01-31"},
+        _contract("O:AAPL250117C00150000", 150, "2025-01-17"),
+        _contract("O:AAPL250131C00150000", 150, "2025-01-31"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -743,8 +1110,8 @@ def test_select_real_contract_respects_target_dte_range(monkeypatch):
 
 def test_select_real_contract_respects_expression_profile(monkeypatch):
     contracts = [
-        {"ticker": "O:AAPL250117C00150000", "strike_price": 150, "expiration_date": "2025-01-17"},
-        {"ticker": "O:AAPL250131C00145000", "strike_price": 145, "expiration_date": "2025-01-31"},
+        _contract("O:AAPL250117C00150000", 150, "2025-01-17"),
+        _contract("O:AAPL250131C00145000", 145, "2025-01-31"),
     ]
     import ai_trader.backtest as bt_mod
     monkeypatch.setattr(
@@ -1076,7 +1443,7 @@ def test_enriched_portfolio_losing_position():
     cache = PolygonCache()
     ticker = "O:TSLA250117P00200000"
     cache.option_bars[ticker] = {
-        "2025-01-10": {"c": 3.0, "vw": 3.0, "v": 50},
+        "2025-01-10": {"c": 2.0, "vw": 2.0, "v": 50},
     }
     pos = SimPosition(
         underlying="TSLA", option_type="put", strike=200.0,
@@ -1091,8 +1458,29 @@ def test_enriched_portfolio_losing_position():
         profit_target_pct=0.50, stop_loss_pct=0.40, time_stop_dte=2,
     )
     assert "-5.0%" in result  # return vs start
-    assert "-40.0%" in result  # unrealized
+    assert "-60.0%" in result  # unrealized
     assert "approaching stop loss" in result
+
+
+def test_enriched_portfolio_renders_risk_alert():
+    cache = PolygonCache()
+    ticker = "O:AAPL250117C00150000"
+    cache.option_bars[ticker] = {
+        "2025-01-10": {"c": 7.5, "vw": 7.5, "v": 100},
+    }
+    pos = SimPosition(
+        underlying="AAPL", option_type="call", strike=150.0,
+        entry_date=date(2025, 1, 6), expiry_date=date(2025, 1, 17),
+        entry_premium=5.0, qty=2, conviction=0.85, reasoning="test",
+        polygon_ticker=ticker, risk_alert="PROFIT TARGET: +50.0% gain",
+    )
+    result = _build_enriched_portfolio_context(
+        equity=100_000, initial_equity=100_000,
+        positions=[pos], trade_date=date(2025, 1, 10),
+        api_key="fake", cache=cache,
+        profit_target_pct=0.50, stop_loss_pct=0.40, time_stop_dte=2,
+    )
+    assert "** RISK ALERT: PROFIT TARGET: +50.0% gain" in result
 
 
 def test_enriched_portfolio_no_bar_in_cache():
@@ -2071,7 +2459,14 @@ def test_run_backtest_streams_trades_and_decisions_to_log_db(tmp_path, monkeypat
         },
     )
     monkeypatch.setattr(bt_mod, "_next_fill_option_bar", lambda *args, **kwargs: {"c": 1.0, "v": 100})
-    monkeypatch.setattr(bt_mod, "_current_option_bar", lambda *args, **kwargs: {"c": 1.5, "v": 100})
+
+    def current_option_bar(*args, **kwargs):
+        as_of = args[2]
+        if isinstance(as_of, datetime) and as_of.hour == 9 and as_of.minute == 35:
+            return {"c": 1.0, "v": 100}
+        return {"c": 1.5, "v": 100}
+
+    monkeypatch.setattr(bt_mod, "_current_option_bar", current_option_bar)
 
     result = bt_mod.run_backtest(
         BacktestConfig(
@@ -2099,3 +2494,463 @@ def test_run_backtest_streams_trades_and_decisions_to_log_db(tmp_path, monkeypat
     assert decision == ("openai", "gpt-5.4", 1)
     assert trade == ("O:AAPL250117C00100000", "AAPL", "buy_call", "filled", "balanced")
     assert close == ("O:AAPL250117C00100000", "AAPL", 50.0, "backtest_end")
+
+
+def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_time = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+    log_db = tmp_path / "window.db"
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            analysis = MarketAnalysis(
+                analysis="Tracking a thesis only",
+                thesis_updates=[
+                    ThesisUpdate(
+                        id=None,
+                        underlying="AAPL",
+                        direction="bullish",
+                        thesis="Product catalyst building",
+                        conviction=0.72,
+                        status="developing",
+                        new_observation="Strength held through the open",
+                    )
+                ],
+                trades=[],
+            )
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[
+                    ToolCall(
+                        name="submit_trade_decisions",
+                        input={
+                            "market_analysis": analysis.analysis,
+                            "thesis_updates": [],
+                            "trades": [],
+                        },
+                    )
+                ],
+                raw_response={"id": "resp_journal"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: [decision_time])
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+
+    bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            log_db_path=log_db,
+        )
+    )
+
+    with sqlite3.connect(log_db) as conn:
+        row = conn.execute(
+            "SELECT underlying, direction, conviction, status FROM thesis_journal"
+        ).fetchone()
+
+    assert row == ("AAPL", "bullish", 0.72, "developing")
+
+
+def test_run_backtest_open_respects_live_limit_fill(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_time = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            analysis = MarketAnalysis(
+                analysis="Open the idea",
+                thesis_updates=[],
+                trades=[
+                    TradeDecision(
+                        action="buy_call",
+                        underlying="AAPL",
+                        strike_preference="atm",
+                        expiry_preference="next_week",
+                        conviction=0.8,
+                        risk_pct=0.001,
+                        reasoning="Fresh catalyst",
+                        target_symbol=None,
+                        expression_profile="balanced",
+                    )
+                ],
+            )
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[
+                    ToolCall(
+                        name="submit_trade_decisions",
+                        input={
+                            "market_analysis": analysis.analysis,
+                            "thesis_updates": [],
+                            "trades": [
+                                {
+                                    "action": "buy_call",
+                                    "underlying": "AAPL",
+                                    "strike_preference": "atm",
+                                    "expiry_preference": "next_week",
+                                    "conviction": 0.8,
+                                    "risk_pct": 0.001,
+                                    "reasoning": "Fresh catalyst",
+                                    "expression_profile": "balanced",
+                                }
+                            ],
+                        },
+                    )
+                ],
+                raw_response={"id": "resp_limit"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: [decision_time])
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+    monkeypatch.setattr(
+        bt_mod,
+        "_select_real_contract",
+        lambda *args, **kwargs: {
+            "ticker": "O:AAPL250117C00100000",
+            "strike_price": 100.0,
+            "expiration_date": "2025-01-17",
+            "bid": 1.0,
+            "ask": 1.2,
+        },
+    )
+    monkeypatch.setattr(bt_mod, "_current_option_bar", lambda *args, **kwargs: {"c": 1.0, "v": 100})
+    monkeypatch.setattr(
+        bt_mod,
+        "_next_fill_option_bar",
+        lambda *args, **kwargs: {"o": 1.25, "l": 1.21, "h": 1.30, "c": 1.28, "v": 100},
+    )
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert result.trades == []
+
+
+def test_run_backtest_auto_closes_profit_target(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+    ]
+    analyses = [
+        MarketAnalysis(
+            analysis="Open the idea",
+            thesis_updates=[],
+            trades=[
+                TradeDecision(
+                    action="buy_call",
+                    underlying="AAPL",
+                    strike_preference="atm",
+                    expiry_preference="next_week",
+                    conviction=0.8,
+                    risk_pct=0.001,
+                    reasoning="Fresh catalyst",
+                    target_symbol=None,
+                    expression_profile="balanced",
+                )
+            ],
+        ),
+        MarketAnalysis(
+            analysis="No additional action.",
+            thesis_updates=[],
+            trades=[],
+        ),
+    ]
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            self.idx = 0
+
+        def run(self, **kwargs):
+            analysis = analyses[self.idx]
+            self.idx += 1
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[
+                    ToolCall(
+                        name="submit_trade_decisions",
+                        input={
+                            "market_analysis": analysis.analysis,
+                            "thesis_updates": [],
+                            "trades": [
+                                {
+                                    "action": trade.action,
+                                    "underlying": trade.underlying,
+                                    "strike_preference": trade.strike_preference,
+                                    "expiry_preference": trade.expiry_preference,
+                                    "conviction": trade.conviction,
+                                    "risk_pct": trade.risk_pct,
+                                    "reasoning": trade.reasoning,
+                                    "expression_profile": trade.expression_profile,
+                                }
+                                for trade in analysis.trades
+                            ],
+                        },
+                    )
+                ],
+                raw_response={"id": f"resp_{self.idx}"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+    monkeypatch.setattr(
+        bt_mod,
+        "_select_real_contract",
+        lambda *args, **kwargs: {
+            "ticker": "O:AAPL250117C00100000",
+            "strike_price": 100.0,
+            "expiration_date": "2025-01-17",
+        },
+    )
+    monkeypatch.setattr(bt_mod, "_next_fill_option_bar", lambda *args, **kwargs: {"c": 1.0, "v": 100})
+
+    def current_option_bar(*args, **kwargs):
+        as_of = args[2]
+        if isinstance(as_of, datetime) and as_of.hour == 9 and as_of.minute == 35:
+            return {"c": 1.0, "v": 100}
+        return {"c": 1.6, "v": 100}
+
+    monkeypatch.setattr(bt_mod, "_current_option_bar", current_option_bar)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert any(trade.exit_reason == "profit_target" for trade in result.trades)
+
+
+def test_run_backtest_auto_closes_catastrophic_loss(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+    ]
+    analyses = [
+        MarketAnalysis(
+            analysis="Open the idea",
+            thesis_updates=[],
+            trades=[
+                TradeDecision(
+                    action="buy_call",
+                    underlying="AAPL",
+                    strike_preference="atm",
+                    expiry_preference="next_week",
+                    conviction=0.8,
+                    risk_pct=0.001,
+                    reasoning="Fresh catalyst",
+                    target_symbol=None,
+                    expression_profile="balanced",
+                )
+            ],
+        ),
+        MarketAnalysis(
+            analysis="No additional action",
+            thesis_updates=[],
+            trades=[],
+        ),
+    ]
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            self.idx = 0
+
+        def run(self, **kwargs):
+            analysis = analyses[self.idx]
+            self.idx += 1
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[
+                    ToolCall(
+                        name="submit_trade_decisions",
+                        input={
+                            "market_analysis": analysis.analysis,
+                            "thesis_updates": [],
+                            "trades": [
+                                {
+                                    "action": trade.action,
+                                    "underlying": trade.underlying,
+                                    "strike_preference": trade.strike_preference,
+                                    "expiry_preference": trade.expiry_preference,
+                                    "conviction": trade.conviction,
+                                    "risk_pct": trade.risk_pct,
+                                    "reasoning": trade.reasoning,
+                                    "expression_profile": trade.expression_profile,
+                                }
+                                for trade in analysis.trades
+                            ],
+                        },
+                    )
+                ],
+                raw_response={"id": f"resp_{self.idx}"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+    monkeypatch.setattr(
+        bt_mod,
+        "_select_real_contract",
+        lambda *args, **kwargs: {
+            "ticker": "O:AAPL250117C00100000",
+            "strike_price": 100.0,
+            "expiration_date": "2025-01-17",
+        },
+    )
+    monkeypatch.setattr(bt_mod, "_next_fill_option_bar", lambda *args, **kwargs: {"c": 1.0, "v": 100})
+
+    def current_option_bar(*args, **kwargs):
+        as_of = args[2]
+        if isinstance(as_of, datetime) and as_of.hour == 9 and as_of.minute == 35:
+            return {"c": 1.0, "v": 100}
+        return {"c": 0.1, "v": 100}
+
+    monkeypatch.setattr(bt_mod, "_current_option_bar", current_option_bar)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert any(trade.exit_reason == "catastrophic_stop" for trade in result.trades)

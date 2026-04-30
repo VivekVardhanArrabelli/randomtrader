@@ -227,6 +227,7 @@ def summarize_window_result(window_result: ExperimentWindowResult) -> dict:
         "kind": window_result.window.kind,
         "start_date": window_result.window.start_date.isoformat(),
         "end_date": window_result.window.end_date.isoformat(),
+        "historical_options_provider": result.historical_options_provider or "unknown",
         "initial_equity": result.initial_equity,
         "final_equity": result.final_equity,
         "total_return_pct": result.total_return_pct,
@@ -550,6 +551,225 @@ def _summary_to_dict(summary: ExperimentSummary) -> dict:
     }
 
 
+def _resolve_backtest_result_path(path: Path) -> Path:
+    if path.is_file():
+        return path
+    summary_path = path / "summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        windows = summary.get("windows") or []
+        if len(windows) != 1:
+            raise ValueError(
+                f"expected exactly one window in {summary_path}, found {len(windows)}"
+            )
+        result_path = windows[0].get("result_path")
+        if not result_path:
+            raise ValueError(f"window result path missing in {summary_path}")
+        return Path(result_path)
+    window_files = sorted(path.glob("rolling_*.json"))
+    if len(window_files) == 1:
+        return window_files[0]
+    raise ValueError(f"could not resolve a single backtest result from {path}")
+
+
+def _load_backtest_artifact(path: Path) -> dict:
+    result_path = _resolve_backtest_result_path(path)
+    payload = json.loads(result_path.read_text())
+    payload["_result_path"] = str(result_path)
+    payload["_source_path"] = str(path)
+    return payload
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float | None:
+    if not left and not right:
+        return None
+    union = left | right
+    if not union:
+        return None
+    return len(left & right) / len(union)
+
+
+def _decision_symbol_map(entries: list[dict], field: str) -> dict[str, set[str]]:
+    mapping: dict[str, set[str]] = {}
+    for entry in entries:
+        decision_time = str(entry.get("decision_time") or "")
+        if not decision_time:
+            continue
+        symbols = {
+            str(symbol)
+            for symbol in entry.get(field, [])
+            if isinstance(symbol, str) and symbol
+        }
+        mapping[decision_time] = symbols
+    return mapping
+
+
+def _proposal_symbol_map(entries: list[dict]) -> dict[str, set[str]]:
+    mapping: dict[str, set[str]] = {}
+    for entry in entries:
+        decision_time = str(entry.get("decision_time") or "")
+        if not decision_time:
+            continue
+        symbols = {
+            str(trade.get("underlying"))
+            for trade in entry.get("trades_proposed", [])
+            if isinstance(trade, dict) and trade.get("underlying")
+        }
+        mapping[decision_time] = symbols
+    return mapping
+
+
+def _trade_signature(trade: dict) -> tuple[str, str, str, str]:
+    return (
+        str(trade.get("entry_date") or trade.get("timestamp") or ""),
+        str(trade.get("underlying") or ""),
+        str(trade.get("option_type") or trade.get("action") or ""),
+        str(trade.get("expression_profile") or ""),
+    )
+
+
+def compare_experiment_runs(left_path: Path, right_path: Path) -> dict:
+    left = _load_backtest_artifact(left_path)
+    right = _load_backtest_artifact(right_path)
+
+    left_provider = str(left.get("historical_options_provider") or "unknown")
+    right_provider = str(right.get("historical_options_provider") or "unknown")
+
+    left_decisions = list(left.get("decision_log") or [])
+    right_decisions = list(right.get("decision_log") or [])
+    left_finalists = _decision_symbol_map(left_decisions, "finalists")
+    right_finalists = _decision_symbol_map(right_decisions, "finalists")
+    left_proposals = _proposal_symbol_map(left_decisions)
+    right_proposals = _proposal_symbol_map(right_decisions)
+
+    shared_decision_times = sorted(set(left_finalists) & set(right_finalists))
+    finalist_overlaps = [
+        value
+        for decision_time in shared_decision_times
+        if (value := _jaccard_similarity(left_finalists[decision_time], right_finalists[decision_time])) is not None
+    ]
+    shared_proposal_times = sorted(set(left_proposals) & set(right_proposals))
+    proposal_overlaps = [
+        value
+        for decision_time in shared_proposal_times
+        if (value := _jaccard_similarity(left_proposals[decision_time], right_proposals[decision_time])) is not None
+    ]
+
+    left_trades = list(left.get("trades") or [])
+    right_trades = list(right.get("trades") or [])
+    left_trade_map = {_trade_signature(trade): trade for trade in left_trades}
+    right_trade_map = {_trade_signature(trade): trade for trade in right_trades}
+    shared_trade_signatures = sorted(set(left_trade_map) & set(right_trade_map))
+    entry_price_deltas = [
+        abs(float(left_trade_map[key].get("entry_premium") or 0.0) - float(right_trade_map[key].get("entry_premium") or 0.0))
+        for key in shared_trade_signatures
+    ]
+    exit_price_deltas = [
+        abs(float(left_trade_map[key].get("exit_premium") or 0.0) - float(right_trade_map[key].get("exit_premium") or 0.0))
+        for key in shared_trade_signatures
+    ]
+
+    left_underlyings = {str(trade.get("underlying")) for trade in left_trades if trade.get("underlying")}
+    right_underlyings = {str(trade.get("underlying")) for trade in right_trades if trade.get("underlying")}
+
+    return {
+        "generated_at": now_eastern().isoformat(),
+        "left": {
+            "source_path": str(left_path),
+            "result_path": left["_result_path"],
+            "historical_options_provider": left_provider,
+            "total_return_pct": left.get("total_return_pct"),
+            "net_pnl": left.get("net_pnl"),
+            "total_trades": left.get("total_trades"),
+            "max_drawdown": left.get("max_drawdown"),
+            "sharpe_ratio": left.get("sharpe_ratio"),
+        },
+        "right": {
+            "source_path": str(right_path),
+            "result_path": right["_result_path"],
+            "historical_options_provider": right_provider,
+            "total_return_pct": right.get("total_return_pct"),
+            "net_pnl": right.get("net_pnl"),
+            "total_trades": right.get("total_trades"),
+            "max_drawdown": right.get("max_drawdown"),
+            "sharpe_ratio": right.get("sharpe_ratio"),
+        },
+        "metrics": {
+            "return_delta_pct": (left.get("total_return_pct") or 0.0) - (right.get("total_return_pct") or 0.0),
+            "net_pnl_delta": (left.get("net_pnl") or 0.0) - (right.get("net_pnl") or 0.0),
+            "trade_count_delta": int(left.get("total_trades") or 0) - int(right.get("total_trades") or 0),
+            "max_drawdown_delta": (left.get("max_drawdown") or 0.0) - (right.get("max_drawdown") or 0.0),
+            "sharpe_delta": (
+                (left.get("sharpe_ratio") or 0.0) - (right.get("sharpe_ratio") or 0.0)
+                if left.get("sharpe_ratio") is not None and right.get("sharpe_ratio") is not None
+                else None
+            ),
+        },
+        "menus": {
+            "decision_times_compared": len(shared_decision_times),
+            "avg_finalist_overlap": _mean(finalist_overlaps),
+            "decision_times_with_identical_finalists": sum(
+                1 for decision_time in shared_decision_times
+                if left_finalists[decision_time] == right_finalists[decision_time]
+            ),
+            "avg_proposed_symbol_overlap": _mean(proposal_overlaps),
+            "decision_times_with_identical_proposals": sum(
+                1 for decision_time in shared_proposal_times
+                if left_proposals[decision_time] == right_proposals[decision_time]
+            ),
+        },
+        "fills": {
+            "shared_trade_signatures": len(shared_trade_signatures),
+            "left_only_trade_signatures": len(set(left_trade_map) - set(right_trade_map)),
+            "right_only_trade_signatures": len(set(right_trade_map) - set(left_trade_map)),
+            "avg_entry_premium_delta": _mean(entry_price_deltas),
+            "avg_exit_premium_delta": _mean(exit_price_deltas),
+            "underlying_overlap_ratio": _jaccard_similarity(left_underlyings, right_underlyings),
+        },
+    }
+
+
+def _comparison_markdown(comparison: dict) -> str:
+    left = comparison["left"]
+    right = comparison["right"]
+    metrics = comparison["metrics"]
+    menus = comparison["menus"]
+    fills = comparison["fills"]
+    lines = [
+        "# Provider Comparison",
+        "",
+        f"- Generated: {comparison['generated_at']}",
+        f"- Left: `{left['historical_options_provider']}` | `{left['result_path']}`",
+        f"- Right: `{right['historical_options_provider']}` | `{right['result_path']}`",
+        "",
+        "## Headline Metrics",
+        "",
+        f"- Return delta (left-right): {_fmt_pct(metrics['return_delta_pct'])}",
+        f"- Net PnL delta (left-right): {_fmt_money(metrics['net_pnl_delta'])}",
+        f"- Trade count delta (left-right): {metrics['trade_count_delta']:+d}",
+        f"- Max drawdown delta (left-right): {_fmt_money(metrics['max_drawdown_delta'])}",
+        f"- Sharpe delta (left-right): {_fmt_float(metrics['sharpe_delta'])}",
+        "",
+        "## Menu Parity",
+        "",
+        f"- Decision times compared: {menus['decision_times_compared']}",
+        f"- Avg finalist overlap: {_fmt_float(menus['avg_finalist_overlap'])}",
+        f"- Identical finalist menus: {menus['decision_times_with_identical_finalists']}",
+        f"- Avg proposed-symbol overlap: {_fmt_float(menus['avg_proposed_symbol_overlap'])}",
+        f"- Identical proposed-symbol sets: {menus['decision_times_with_identical_proposals']}",
+        "",
+        "## Fill Parity",
+        "",
+        f"- Shared trade signatures: {fills['shared_trade_signatures']}",
+        f"- Left-only trade signatures: {fills['left_only_trade_signatures']}",
+        f"- Right-only trade signatures: {fills['right_only_trade_signatures']}",
+        f"- Avg entry premium delta: {_fmt_float(fills['avg_entry_premium_delta'])}",
+        f"- Avg exit premium delta: {_fmt_float(fills['avg_exit_premium_delta'])}",
+        f"- Underlying overlap ratio: {_fmt_float(fills['underlying_overlap_ratio'])}",
+    ]
+    return "\n".join(lines)
+
+
 def _summary_markdown(
     *,
     label: str,
@@ -562,6 +782,9 @@ def _summary_markdown(
     lines = [f"# Experiment: {label}", ""]
     lines.append(f"- Generated: {now_eastern().isoformat()}")
     lines.append(f"- Git commit: `{git_commit or 'unknown'}`")
+    lines.append(
+        f"- Historical options provider: `{config.resolved_historical_options_provider()}`"
+    )
     lines.append(
         f"- README baseline: {baseline.start_date} to {baseline.end_date} | "
         f"return {_fmt_pct(baseline.total_return_pct)} | "
@@ -583,6 +806,7 @@ def _summary_markdown(
         lines.append(
             f"- `{window_result.window.label}` ({window_result.window.kind}) "
             f"{window_result.window.start_date} -> {window_result.window.end_date} | "
+            f"provider `{result.historical_options_provider or 'unknown'}` | "
             f"return {_fmt_pct(result.total_return_pct)} | "
             f"PnL {_fmt_money(result.net_pnl)} | "
             f"Sharpe {_fmt_float(result.sharpe_ratio)} | "
@@ -644,6 +868,10 @@ def _print_summary(
     print(f"  Label:              {label}")
     print(f"  Output dir:         {output_dir}")
     print(
+        "  Hist. provider:    "
+        f"{config.resolved_historical_options_provider()}"
+    )
+    print(
         "  README baseline:    "
         f"{baseline.start_date} -> {baseline.end_date} | "
         f"return {_fmt_pct(baseline.total_return_pct)} | "
@@ -657,6 +885,7 @@ def _print_summary(
         print(
             f"    {window_result.window.label} ({window_result.window.kind}) "
             f"{window_result.window.start_date} -> {window_result.window.end_date} | "
+            f"provider {result.historical_options_provider or 'unknown'} | "
             f"return {_fmt_pct(result.total_return_pct)} | "
             f"Sharpe {_fmt_float(result.sharpe_ratio)} | "
             f"PF {_fmt_float(result.profit_factor)} | "
@@ -741,6 +970,7 @@ def _suite_config_to_dict(
         "prepare_prefetch_symbols": base_config.prepare_prefetch_symbols,
         "prepare_prefetch_contracts_per_side": base_config.prepare_prefetch_contracts_per_side,
         "resolved_model": config.resolved_llm_model(),
+        "historical_options_provider": config.resolved_historical_options_provider(),
     }
 
 
@@ -783,6 +1013,18 @@ def run() -> None:
         type=str,
         default=None,
         help="Directory for experiment outputs (default: ai_trader/logs/experiments/<timestamp>-<label>)",
+    )
+    parser.add_argument(
+        "--compare-left",
+        type=str,
+        default=None,
+        help="Compare mode: left experiment dir or backtest result JSON",
+    )
+    parser.add_argument(
+        "--compare-right",
+        type=str,
+        default=None,
+        help="Compare mode: right experiment dir or backtest result JSON",
     )
     parser.add_argument(
         "--equity",
@@ -835,17 +1077,17 @@ def run() -> None:
         "--cache-db",
         type=str,
         default=None,
-        help="SQLite DB path for the persistent historical Polygon cache",
+        help="SQLite DB path for the persistent historical data cache",
     )
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Fail on historical Polygon cache misses instead of using the network",
+        help="Fail on historical cache misses instead of using the network",
     )
     parser.add_argument(
         "--prepare-data",
         action="store_true",
-        help="Warm the historical Polygon cache for the full suite span before window runs",
+        help="Warm the historical data cache for the full suite span before window runs",
     )
     parser.add_argument(
         "--prepare-only",
@@ -870,6 +1112,43 @@ def run() -> None:
     if not env_path.exists():
         env_path = Path(__file__).parent.parent / "momentum_trader" / ".env"
     load_dotenv(env_path, override=True)
+
+    if bool(args.compare_left) != bool(args.compare_right):
+        raise ValueError("--compare-left and --compare-right must be used together")
+    if args.compare_left and args.compare_right:
+        left_path = Path(args.compare_left)
+        right_path = Path(args.compare_right)
+        comparison = compare_experiment_runs(left_path, right_path)
+        output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir(args.label)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "provider_compare.json").write_text(json.dumps(comparison, indent=2))
+        (output_dir / "provider_compare.md").write_text(_comparison_markdown(comparison))
+        print("=" * 72)
+        print("  AI TRADER PROVIDER COMPARISON")
+        print("=" * 72)
+        print(f"  Left:               {comparison['left']['historical_options_provider']}")
+        print(f"  Right:              {comparison['right']['historical_options_provider']}")
+        print(f"  Output dir:         {output_dir}")
+        print(
+            "  Menu parity:        "
+            f"{comparison['menus']['decision_times_compared']} shared decision times | "
+            f"avg finalist overlap {_fmt_float(comparison['menus']['avg_finalist_overlap'])} | "
+            f"avg proposal overlap {_fmt_float(comparison['menus']['avg_proposed_symbol_overlap'])}"
+        )
+        print(
+            "  Fill parity:        "
+            f"{comparison['fills']['shared_trade_signatures']} shared trades | "
+            f"entry delta {_fmt_float(comparison['fills']['avg_entry_premium_delta'])} | "
+            f"exit delta {_fmt_float(comparison['fills']['avg_exit_premium_delta'])}"
+        )
+        print(
+            "  Metrics delta:      "
+            f"return {_fmt_pct(comparison['metrics']['return_delta_pct'])} | "
+            f"PnL {_fmt_money(comparison['metrics']['net_pnl_delta'])} | "
+            f"max DD {_fmt_money(comparison['metrics']['max_drawdown_delta'])}"
+        )
+        print("=" * 72)
+        return
 
     anchor_end = date.fromisoformat(args.anchor_end)
     base_config = _base_backtest_config(args)

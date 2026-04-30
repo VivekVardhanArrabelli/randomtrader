@@ -86,9 +86,9 @@ def evaluate_trade_risk(
 
     actual_premium = max_contracts * cost_per_contract
     log(
-        f"risk check PASS: max_contracts={max_contracts} "
-        f"premium=${actual_premium:.2f} "
-        f"({actual_premium / equity * 100:.1f}% of equity)"
+        f"risk rails PASS: max_contracts={max_contracts} "
+        f"max_premium_allowed=${actual_premium:.2f} "
+        f"({actual_premium / equity * 100:.1f}% of equity cap)"
     )
     return RiskCheck(True, "approved", max_contracts, actual_premium)
 

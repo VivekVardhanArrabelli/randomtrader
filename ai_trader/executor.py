@@ -5,13 +5,17 @@ from __future__ import annotations
 import re
 import time as time_module
 from dataclasses import dataclass
-from datetime import timedelta
 
 from . import config
 from .alpaca_client import AlpacaClient
 from .brain import TradeDecision
 from .db import AITradeLogger, AITradeRecord, PositionCloseRecord
-from .options import OptionContract, fetch_option_chain, select_contract
+from .options import (
+    OptionContract,
+    fetch_option_chain,
+    filter_contracts_by_expiry_preference,
+    select_contract,
+)
 from .portfolio import EquityPosition, PortfolioState
 from .risk import evaluate_stock_trade_risk, evaluate_trade_risk, size_for_risk_budget
 from .utils import log, now_eastern
@@ -917,17 +921,7 @@ def _get_stock_quote(alpaca: AlpacaClient, symbol: str) -> dict[str, float]:
 def _filter_by_expiry(
     contracts: list[OptionContract], preference: str
 ) -> list[OptionContract]:
-    today = now_eastern().date()
-    if preference == "this_week":
-        cutoff = today + timedelta(days=7)
-        return [c for c in contracts if c.expiration <= cutoff]
-    if preference == "next_week":
-        start = today + timedelta(days=5)
-        cutoff = today + timedelta(days=14)
-        return [c for c in contracts if start <= c.expiration <= cutoff] or [
-            c for c in contracts if c.expiration <= cutoff
-        ]
-    return [c for c in contracts if c.dte >= 14]
+    return filter_contracts_by_expiry_preference(contracts, preference)
 
 
 def _await_fill(alpaca: AlpacaClient, order_id: str, timeout_seconds: int = 30) -> dict:

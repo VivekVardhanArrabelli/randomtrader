@@ -94,6 +94,12 @@ POLYGON_MAX_REQUEST_INTERVAL_SECONDS = 20.0
 POLYGON_429_RETRY_ATTEMPTS = 5
 
 # ---------------------------------------------------------------------------
+# Theta Data API (historical options backtests)
+# ---------------------------------------------------------------------------
+THETA_BASE_URL = "http://127.0.0.1:25510"
+HISTORICAL_OPTIONS_PROVIDER = "theta"  # theta / polygon
+
+# ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
 LLM_PROVIDER = ""                 # infer from model unless overridden
@@ -108,6 +114,26 @@ def resolved_llm_model(model: str | None = None) -> str:
     if model and model.strip():
         return model.strip()
     return os.environ.get("LLM_MODEL", "").strip() or LLM_MODEL
+
+
+def resolved_historical_options_provider(provider: str | None = None) -> str:
+    """Resolve the historical options provider at runtime."""
+    if provider and provider.strip():
+        return provider.strip().lower()
+    return (
+        os.environ.get("HISTORICAL_OPTIONS_PROVIDER", "").strip().lower()
+        or HISTORICAL_OPTIONS_PROVIDER
+    )
+
+
+def resolved_theta_base_url(base_url: str | None = None) -> str:
+    """Resolve the Theta Terminal base URL at runtime."""
+    if base_url and base_url.strip():
+        return base_url.strip().rstrip("/")
+    return (
+        os.environ.get("THETA_BASE_URL", "").strip().rstrip("/")
+        or THETA_BASE_URL
+    )
 
 # ---------------------------------------------------------------------------
 # Logging

@@ -1,7 +1,7 @@
 """Historical backtester for the AI options trader.
 
 Replays historical news and market data through the LLM brain,
-uses real Polygon options market data for pricing, and tracks P&L.
+uses real historical options market data for pricing, and tracks P&L.
 
 Run:  python -m ai_trader.backtest --start 2025-01-02 --end 2025-01-31
 
@@ -59,12 +59,18 @@ from .news import (
     score_news_event,
 )
 from .options import (
+    OptionContract,
     approx_delta,
+    filter_contracts_by_expiry_preference,
     resolve_expression_profile,
-    target_dte_for_expiry_preference,
-    target_strike_for_preference,
+    select_contract,
 )
-from .risk import size_for_risk_budget
+from .risk import (
+    evaluate_trade_risk,
+    evaluate_position_risk,
+    size_for_risk_budget,
+    stop_loss_for_dte,
+)
 from .utils import (
     EASTERN_TZ,
     log,
@@ -82,6 +88,7 @@ _POLYGON_REQUEST_INTERVAL_SECONDS = max(
     float(config.POLYGON_MIN_REQUEST_INTERVAL_SECONDS),
     0.0,
 )
+_THETA_TICKER_PREFIX = "THETA:"
 
 
 def _base_polygon_request_interval() -> float:
@@ -184,6 +191,336 @@ def _polygon_request(
     if store is not None:
         store.put(path, params, data)
     return data
+
+
+def _theta_request(
+    path: str,
+    params: dict | None = None,
+    *,
+    store: PolygonResponseStore | None = None,
+    offline: bool = False,
+) -> dict:
+    import requests
+
+    request_params = dict(params or {})
+    if path.startswith("/v3/"):
+        request_params.setdefault("format", "json")
+    cache_path = f"theta:{path}"
+    cached = store.get(cache_path, request_params) if store is not None else None
+    if cached is not None:
+        return cached
+    if offline:
+        raise RuntimeError(f"offline Theta cache miss for {path}")
+
+    base_url = config.resolved_theta_base_url()
+    if not base_url:
+        raise RuntimeError("THETA_BASE_URL is not configured")
+    url = f"{base_url}{path}"
+    response = requests.get(url, params=request_params, timeout=30)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Theta {response.status_code}: {response.text[:200]}")
+    data = response.json()
+    if store is not None:
+        store.put(cache_path, request_params, data)
+    return data
+
+
+def _historical_options_provider() -> str:
+    return config.resolved_historical_options_provider()
+
+
+def _is_theta_option_ticker(ticker: str) -> bool:
+    return str(ticker).startswith(_THETA_TICKER_PREFIX)
+
+
+def _theta_contract_ticker(
+    underlying: str,
+    expiration: date,
+    option_type: str,
+    strike: float,
+) -> str:
+    return (
+        f"{_THETA_TICKER_PREFIX}{underlying.upper()}:{expiration.isoformat()}:"
+        f"{option_type.lower()}:{strike:.3f}"
+    )
+
+
+def _parse_theta_contract_ticker(option_ticker: str) -> tuple[str, date, str, float]:
+    if not _is_theta_option_ticker(option_ticker):
+        raise ValueError(f"not a theta option ticker: {option_ticker}")
+    parts = option_ticker.split(":")
+    if len(parts) != 5:
+        raise ValueError(f"invalid theta option ticker: {option_ticker}")
+    _, underlying, expiration_raw, option_type, strike_raw = parts
+    return (
+        underlying,
+        date.fromisoformat(expiration_raw),
+        option_type.lower(),
+        float(strike_raw),
+    )
+
+
+def _theta_date(value: date) -> str:
+    return value.strftime("%Y%m%d")
+
+
+def _theta_strike_param(value: float) -> str:
+    return str(int(round(value * 1000)))
+
+
+def _theta_right_param(option_type: str) -> str:
+    normalized = str(option_type).strip().lower()
+    if normalized in {"c", "call"}:
+        return "C"
+    if normalized in {"p", "put"}:
+        return "P"
+    return normalized.upper()
+
+
+def _theta_ohlc_interval(multiplier: int) -> str:
+    return str(max(int(multiplier), 1) * 60_000)
+
+
+def _theta_table_rows(data: dict) -> list[dict]:
+    response = data.get("response", data.get("results", []))
+    if not isinstance(response, list) or not response:
+        return []
+    if isinstance(response[0], dict):
+        return [dict(row) for row in response]
+    header = data.get("header", {})
+    columns = header.get("format", [])
+    if not isinstance(columns, list) or not columns:
+        return []
+    rows: list[dict] = []
+    for raw_row in response:
+        if not isinstance(raw_row, list):
+            continue
+        rows.append(
+            {
+                str(column): raw_row[index] if index < len(raw_row) else None
+                for index, column in enumerate(columns)
+            }
+        )
+    return rows
+
+
+def _theta_parse_expiration(value: object) -> date | None:
+    if isinstance(value, date):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) == 8 and raw.isdigit():
+            return datetime.strptime(raw, "%Y%m%d").date()
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _theta_parse_strike(value: object) -> float:
+    strike = _float_or_zero(value)
+    if strike <= 0:
+        return 0.0
+    return strike / 1000.0 if strike >= 1000 else strike
+
+
+def _theta_row_timestamp(value: object, *, fallback_date: date) -> int | None:
+    if isinstance(value, (int, float)):
+        numeric = int(float(value))
+        if 0 <= numeric <= 86_400_000:
+            return _to_epoch_ms(
+                datetime.combine(fallback_date, time(0, 0), tzinfo=EASTERN_TZ)
+                + timedelta(milliseconds=numeric)
+            )
+    if isinstance(value, str) and value.strip():
+        normalized = value.strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=EASTERN_TZ)
+            return _to_epoch_ms(parsed.astimezone(EASTERN_TZ))
+    return _to_epoch_ms(_market_close_dt(fallback_date))
+
+
+def _theta_bar_to_polygon_bar(row: dict, *, fallback_date: date) -> dict | None:
+    trade_date = _theta_parse_expiration(row.get("date")) or fallback_date
+    timestamp_ms = _theta_row_timestamp(
+        row.get("timestamp")
+        or row.get("last_trade")
+        or row.get("created")
+        or row.get("ms_of_day2")
+        or row.get("ms_of_day"),
+        fallback_date=trade_date,
+    )
+    if timestamp_ms is None:
+        return None
+    bid = float(row.get("bid") or 0.0)
+    ask = float(row.get("ask") or 0.0)
+    mid_quote = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask, 0.0)
+    close_price = float(row.get("close") or 0.0)
+    if close_price <= 0 and mid_quote > 0:
+        close_price = mid_quote
+    if close_price <= 0:
+        return None
+    open_price = float(row.get("open") or 0.0)
+    high_price = float(row.get("high") or 0.0)
+    low_price = float(row.get("low") or 0.0)
+    if open_price <= 0:
+        open_price = close_price
+    if high_price <= 0:
+        high_price = max(open_price, close_price)
+    if low_price <= 0:
+        low_price = min(open_price, close_price)
+    bar = {
+        "t": timestamp_ms,
+        "o": open_price,
+        "h": high_price,
+        "l": low_price,
+        "c": close_price,
+        "v": int(float(row.get("volume") or 0)),
+        "vw": float(row.get("vwap") or mid_quote or close_price),
+    }
+    if bid > 0:
+        bar["bid"] = bid
+    if ask > 0:
+        bar["ask"] = ask
+    return bar
+
+
+def _theta_is_expected_empty_error(exc: Exception) -> bool:
+    message = str(exc)
+    if not message.startswith("Theta 472:"):
+        return False
+    return any(
+        phrase in message
+        for phrase in (
+            "No listed contracts for the date",
+            "No data for the specified timeframe & contract",
+            "No data for contract",
+        )
+    )
+
+
+def _theta_quote_rows_to_bars(
+    data: dict,
+    *,
+    trading_day: date,
+    multiplier: int,
+) -> list[dict]:
+    interval_ms = max(int(multiplier), 1) * 60_000
+    session_start_ms = (9 * 60 + 30) * 60_000
+    session_end_ms = 16 * 60 * 60_000
+    buckets: dict[int, dict[str, float | int]] = {}
+
+    for row in _theta_table_rows(data):
+        ms_of_day = _int_or_zero(row.get("ms_of_day"))
+        if ms_of_day < session_start_ms or ms_of_day > session_end_ms:
+            continue
+        bid = _float_or_zero(row.get("bid"))
+        ask = _float_or_zero(row.get("ask"))
+        price = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask, 0.0)
+        if price <= 0:
+            continue
+        bucket_ms = session_start_ms + ((ms_of_day - session_start_ms) // interval_ms) * interval_ms
+        bucket = buckets.setdefault(
+            bucket_ms,
+            {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "bid": bid,
+                "ask": ask,
+                "mid_total": 0.0,
+                "count": 0,
+            },
+        )
+        bucket["high"] = max(float(bucket["high"]), price)
+        bucket["low"] = min(float(bucket["low"]), price)
+        bucket["close"] = price
+        bucket["mid_total"] = float(bucket["mid_total"]) + price
+        bucket["count"] = int(bucket["count"]) + 1
+        if bid > 0:
+            bucket["bid"] = bid
+        if ask > 0:
+            bucket["ask"] = ask
+
+    bars: list[dict] = []
+    for bucket_ms in sorted(buckets):
+        bucket = buckets[bucket_ms]
+        count = int(bucket["count"])
+        if count <= 0:
+            continue
+        timestamp_ms = _to_epoch_ms(
+            datetime.combine(trading_day, time(0, 0), tzinfo=EASTERN_TZ)
+            + timedelta(milliseconds=bucket_ms)
+        )
+        bar = {
+            "t": timestamp_ms,
+            "o": float(bucket["open"]),
+            "h": float(bucket["high"]),
+            "l": float(bucket["low"]),
+            "c": float(bucket["close"]),
+            "v": 0,
+            "vw": float(bucket["mid_total"]) / count,
+            "quote_count": count,
+            "quote_only": True,
+        }
+        bid = float(bucket["bid"])
+        ask = float(bucket["ask"])
+        if bid > 0:
+            bar["bid"] = bid
+        if ask > 0:
+            bar["ask"] = ask
+        bars.append(bar)
+    return bars
+
+
+def _theta_contracts_from_response(
+    underlying: str,
+    contract_type: str,
+    *,
+    expiry_gte: date,
+    expiry_lte: date,
+    strike_gte: float,
+    strike_lte: float,
+    data: dict,
+) -> list[dict]:
+    results: list[dict] = []
+    for row in _theta_table_rows(data):
+        expiration = _theta_parse_expiration(row.get("expiration"))
+        if expiration is None:
+            continue
+        strike = _theta_parse_strike(row.get("strike"))
+        option_type = str(row.get("right") or "").strip().lower()
+        if option_type == "c":
+            option_type = "call"
+        elif option_type == "p":
+            option_type = "put"
+        if option_type != contract_type:
+            continue
+        if not (expiry_gte <= expiration <= expiry_lte):
+            continue
+        if not (strike_gte <= strike <= strike_lte):
+            continue
+        results.append(
+            {
+                "ticker": _theta_contract_ticker(underlying, expiration, option_type, strike),
+                "strike_price": strike,
+                "expiration_date": expiration.isoformat(),
+                "contract_type": option_type,
+                "bid": _float_or_zero(row.get("bid")),
+                "ask": _float_or_zero(row.get("ask")),
+                "mid": _float_or_zero(row.get("mid")),
+                "open_interest": _int_or_zero(row.get("open_interest")),
+                "volume": _int_or_zero(row.get("volume")),
+            }
+        )
+    return results
 
 
 def _raise_if_offline(cache: PolygonCache | None, exc: Exception) -> None:
@@ -299,6 +636,65 @@ def fetch_historical_intraday_bars(
     cache_key = (ticker, trading_day.isoformat(), multiplier)
     if cache and cache_key in cache.intraday_bars:
         return cache.intraday_bars[cache_key]
+
+    if _is_theta_option_ticker(ticker):
+        data: dict | None = None
+        try:
+            underlying, expiration, option_type, strike = _parse_theta_contract_ticker(ticker)
+            data = _theta_request(
+                "/v2/hist/option/ohlc",
+                params={
+                    "root": underlying,
+                    "exp": _theta_date(expiration),
+                    "right": _theta_right_param(option_type),
+                    "strike": _theta_strike_param(strike),
+                    "start_date": _theta_date(trading_day),
+                    "end_date": _theta_date(trading_day),
+                    "ivl": _theta_ohlc_interval(multiplier),
+                },
+                store=cache.store if cache else None,
+                offline=cache.offline if cache else False,
+            )
+        except Exception as exc:
+            if not _theta_is_expected_empty_error(exc):
+                log(f"theta intraday bars fetch error for {ticker} on {trading_day}: {exc}")
+                _raise_if_offline(cache, exc)
+                return []
+
+        results = [
+            bar
+            for row in _theta_table_rows(data or {})
+            if (bar := _theta_bar_to_polygon_bar(row, fallback_date=trading_day)) is not None
+        ]
+        if not results:
+            try:
+                quote_data = _theta_request(
+                    "/v2/hist/option/quote",
+                    params={
+                        "root": underlying,
+                        "exp": _theta_date(expiration),
+                        "right": _theta_right_param(option_type),
+                        "strike": _theta_strike_param(strike),
+                        "start_date": _theta_date(trading_day),
+                        "end_date": _theta_date(trading_day),
+                        "ivl": _theta_ohlc_interval(multiplier),
+                    },
+                    store=cache.store if cache else None,
+                    offline=cache.offline if cache else False,
+                )
+            except Exception as exc:
+                if not _theta_is_expected_empty_error(exc):
+                    log(f"theta intraday quote fallback error for {ticker} on {trading_day}: {exc}")
+                    _raise_if_offline(cache, exc)
+                quote_data = {}
+            results = _theta_quote_rows_to_bars(
+                quote_data,
+                trading_day=trading_day,
+                multiplier=multiplier,
+            )
+        if cache is not None:
+            cache.intraday_bars[cache_key] = results
+        return results
 
     start_ms = _to_epoch_ms(_market_open_dt(trading_day))
     end_ms = _to_epoch_ms(_market_close_dt(trading_day))
@@ -495,9 +891,9 @@ def fetch_polygon_option_contracts(
     as_of: date | None = None,
     cache: PolygonCache | None = None,
 ) -> list[dict]:
-    """Query Polygon for available option contracts matching criteria.
+    """Query the configured historical provider for available option contracts.
 
-    For backtesting past dates, pass as_of=trade_date so Polygon returns
+    For backtesting past dates, pass as_of=trade_date so the provider returns
     contracts that existed at that time (even if they've since expired).
     """
     cache_key = (underlying, contract_type, expiry_gte.isoformat(),
@@ -506,34 +902,55 @@ def fetch_polygon_option_contracts(
     if cache and cache_key in cache.contracts:
         return cache.contracts[cache_key]
 
-    params = {
-        "underlying_ticker": underlying,
-        "contract_type": contract_type,
-        "expiration_date.gte": expiry_gte.isoformat(),
-        "expiration_date.lte": expiry_lte.isoformat(),
-        "strike_price.gte": str(strike_gte),
-        "strike_price.lte": str(strike_lte),
-        "limit": "100",
-        "sort": "strike_price",
-        "order": "asc",
-    }
-    if as_of:
-        params["as_of"] = as_of.isoformat()
-
     try:
-        data = _polygon_request(
-            api_key,
-            "/v3/reference/options/contracts",
-            params=params,
-            store=cache.store if cache else None,
-            offline=cache.offline if cache else False,
-        )
+        provider = _historical_options_provider()
+        if provider == "theta":
+            data = _theta_request(
+                "/v2/list/contracts/option/quote",
+                params={
+                    "root": underlying,
+                    "start_date": _theta_date(as_of or expiry_gte),
+                },
+                store=cache.store if cache else None,
+                offline=cache.offline if cache else False,
+            )
+            results = _theta_contracts_from_response(
+                underlying,
+                contract_type,
+                expiry_gte=expiry_gte,
+                expiry_lte=expiry_lte,
+                strike_gte=strike_gte,
+                strike_lte=strike_lte,
+                data=data,
+            )
+        else:
+            params = {
+                "underlying_ticker": underlying,
+                "contract_type": contract_type,
+                "expiration_date.gte": expiry_gte.isoformat(),
+                "expiration_date.lte": expiry_lte.isoformat(),
+                "strike_price.gte": str(strike_gte),
+                "strike_price.lte": str(strike_lte),
+                "limit": "100",
+                "sort": "strike_price",
+                "order": "asc",
+            }
+            if as_of:
+                params["as_of"] = as_of.isoformat()
+            data = _polygon_request(
+                api_key,
+                "/v3/reference/options/contracts",
+                params=params,
+                store=cache.store if cache else None,
+                offline=cache.offline if cache else False,
+            )
+            results = data.get("results", [])
     except Exception as exc:
-        log(f"option contracts fetch error for {underlying}: {exc}")
+        if not (provider == "theta" and _theta_is_expected_empty_error(exc)):
+            log(f"option contracts fetch error for {underlying}: {exc}")
         _raise_if_offline(cache, exc)
         return []
 
-    results = data.get("results", [])
     if cache:
         cache.contracts[cache_key] = results
     return results
@@ -551,6 +968,37 @@ def fetch_option_daily_bar(
         bar = cache.option_bars[option_ticker].get(date_key)
         if bar is not None:
             return bar
+
+    if _is_theta_option_ticker(option_ticker):
+        try:
+            underlying, expiration, option_type, strike = _parse_theta_contract_ticker(option_ticker)
+            data = _theta_request(
+                "/v2/hist/option/eod",
+                params={
+                    "root": underlying,
+                    "exp": _theta_date(expiration),
+                    "right": _theta_right_param(option_type),
+                    "strike": _theta_strike_param(strike),
+                    "start_date": _theta_date(trade_date),
+                    "end_date": _theta_date(trade_date),
+                },
+                store=cache.store if cache else None,
+                offline=cache.offline if cache else False,
+            )
+        except Exception as exc:
+            log(f"theta option bar fetch error for {option_ticker} on {trade_date}: {exc}")
+            _raise_if_offline(cache, exc)
+            return None
+
+        results = _theta_table_rows(data)
+        if not results:
+            return None
+        bar = _theta_bar_to_polygon_bar(results[0], fallback_date=trade_date)
+        if bar is None:
+            return None
+        if cache:
+            cache.option_bars.setdefault(option_ticker, {})[date_key] = bar
+        return bar
 
     # Fetch just this one day
     try:
@@ -585,6 +1033,41 @@ def fetch_option_daily_bars_range(
     cache: PolygonCache | None = None,
 ) -> list[dict]:
     """Bulk fetch daily bars for an option contract and populate cache."""
+    if _is_theta_option_ticker(option_ticker):
+        try:
+            underlying, expiration, option_type, strike = _parse_theta_contract_ticker(option_ticker)
+            data = _theta_request(
+                "/v2/hist/option/eod",
+                params={
+                    "root": underlying,
+                    "exp": _theta_date(expiration),
+                    "right": _theta_right_param(option_type),
+                    "strike": _theta_strike_param(strike),
+                    "start_date": _theta_date(start),
+                    "end_date": _theta_date(end),
+                },
+                store=cache.store if cache else None,
+                offline=cache.offline if cache else False,
+            )
+        except Exception as exc:
+            log(f"theta option bars range fetch error for {option_ticker}: {exc}")
+            _raise_if_offline(cache, exc)
+            return []
+
+        results = [
+            bar
+            for row in _theta_table_rows(data)
+            if (bar := _theta_bar_to_polygon_bar(row, fallback_date=start)) is not None
+        ]
+        if cache and results:
+            bars_by_date = cache.option_bars.setdefault(option_ticker, {})
+            for bar in results:
+                ts_ms = bar.get("t", 0)
+                if ts_ms:
+                    bar_date = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+                    bars_by_date[bar_date.isoformat()] = bar
+        return results
+
     try:
         data = _polygon_request(
             api_key,
@@ -618,6 +1101,38 @@ def _option_bar_price(bar: dict) -> float:
         return float(vwap)
     close = bar.get("c", 0)
     return float(close) if close else 0.0
+
+
+def _option_bar_bid(bar: dict | None) -> float:
+    if not bar:
+        return 0.0
+    bid = _float_or_zero(bar.get("bid"))
+    return bid if bid > 0 else 0.0
+
+
+def _option_bar_ask(bar: dict | None) -> float:
+    if not bar:
+        return 0.0
+    ask = _float_or_zero(bar.get("ask"))
+    return ask if ask > 0 else 0.0
+
+
+def _option_bar_quote_only(bar: dict | None) -> bool:
+    return bool(bar and bar.get("quote_only"))
+
+
+def _option_bar_entry_price(bar: dict | None) -> float:
+    ask = _option_bar_ask(bar)
+    if ask > 0:
+        return ask
+    return _option_bar_price(bar or {})
+
+
+def _option_bar_exit_price(bar: dict | None) -> float:
+    bid = _option_bar_bid(bar)
+    if bid > 0:
+        return bid
+    return _option_bar_price(bar or {})
 
 
 def _equity_bar_price(bar: dict) -> float:
@@ -742,6 +1257,192 @@ def _current_underlying_price(
     return _equity_bar_price(bar)
 
 
+def _float_or_zero(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int_or_zero(value: object) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _option_bar_open_price(bar: dict | None) -> float:
+    if not bar:
+        return 0.0
+    open_price = _float_or_zero(bar.get("o"))
+    if open_price > 0:
+        return open_price
+    return _option_bar_price(bar)
+
+
+def _option_bar_low_price(bar: dict | None) -> float:
+    if not bar:
+        return 0.0
+    low_price = _float_or_zero(bar.get("l"))
+    if low_price > 0:
+        return low_price
+    return _option_bar_price(bar)
+
+
+def _option_bar_high_price(bar: dict | None) -> float:
+    if not bar:
+        return 0.0
+    high_price = _float_or_zero(bar.get("h"))
+    if high_price > 0:
+        return high_price
+    return _option_bar_price(bar)
+
+
+def _historical_option_session_volume(
+    api_key: str,
+    option_ticker: str,
+    as_of: date | datetime,
+    cache: PolygonCache | None,
+    *,
+    bar_minutes: int = 5,
+) -> int:
+    if cache is None:
+        return 0
+    if isinstance(as_of, datetime):
+        return sum(
+            _int_or_zero(bar.get("v"))
+            for bar in _session_intraday_bars_before(
+                api_key,
+                option_ticker,
+                as_of,
+                cache=cache,
+                multiplier=bar_minutes,
+            )
+        )
+    day_bar = fetch_option_daily_bar(api_key, option_ticker, as_of, cache=cache)
+    return _int_or_zero(day_bar.get("v")) if day_bar else 0
+
+
+def _historical_option_quote(
+    contract: dict,
+    observed_price: float,
+    *,
+    observed_bid: float = 0.0,
+    observed_ask: float = 0.0,
+) -> tuple[float, float, float]:
+    bid = _float_or_zero(contract.get("bid")) or max(observed_bid, 0.0)
+    ask = _float_or_zero(contract.get("ask")) or max(observed_ask, 0.0)
+    mid = _float_or_zero(contract.get("mid"))
+    if mid <= 0 and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2
+    if mid <= 0 and observed_price > 0:
+        mid = observed_price
+    if ask <= 0 and mid > 0:
+        ask = mid
+    if bid <= 0 and mid > 0:
+        bid = mid
+    if mid <= 0 and bid > 0 and ask > 0:
+        mid = (bid + ask) / 2
+    return bid, ask, mid
+
+
+def _polygon_contract_to_option_contract(
+    contract: dict,
+    *,
+    api_key: str,
+    underlying: str,
+    option_type: str,
+    trade_date: date,
+    as_of: date | datetime,
+    cache: PolygonCache | None,
+    bar_minutes: int = 5,
+) -> OptionContract | None:
+    symbol = str(contract.get("ticker") or "").strip()
+    strike = _float_or_zero(contract.get("strike_price"))
+    expiry_raw = str(contract.get("expiration_date") or "").strip()
+    if not symbol or strike <= 0 or not expiry_raw:
+        return None
+    try:
+        expiration = date.fromisoformat(expiry_raw)
+    except ValueError:
+        return None
+    dte = max((expiration - trade_date).days, 0)
+    current_bar = (
+        _current_option_bar(api_key, symbol, as_of, cache=cache, bar_minutes=bar_minutes)
+        if cache is not None
+        else None
+    )
+    observed_price = _option_bar_price(current_bar) if current_bar else 0.0
+    observed_bid = _option_bar_bid(current_bar)
+    observed_ask = _option_bar_ask(current_bar)
+    bid, ask, mid = _historical_option_quote(
+        contract,
+        observed_price,
+        observed_bid=observed_bid,
+        observed_ask=observed_ask,
+    )
+    session_volume = _historical_option_session_volume(
+        api_key,
+        symbol,
+        as_of,
+        cache,
+        bar_minutes=bar_minutes,
+    )
+    volume = max(_int_or_zero(contract.get("volume")), session_volume)
+    quote_timestamp = None
+    if current_bar and current_bar.get("t"):
+        quote_timestamp = _bar_timestamp_eastern(current_bar)
+    return OptionContract(
+        symbol=symbol,
+        underlying=underlying,
+        option_type=option_type,
+        strike=strike,
+        expiration=expiration,
+        bid=bid,
+        ask=ask,
+        mid=mid,
+        volume=volume,
+        open_interest=_int_or_zero(contract.get("open_interest")),
+        dte=dte,
+        quote_timestamp=quote_timestamp,
+    )
+
+
+def _entry_limit_price(contract: dict, observed_bar: dict | None) -> float:
+    observed_price = _option_bar_price(observed_bar or {})
+    bid, ask, mid = _historical_option_quote(
+        contract,
+        observed_price,
+        observed_bid=_option_bar_bid(observed_bar),
+        observed_ask=_option_bar_ask(observed_bar),
+    )
+    if ask <= 0:
+        return 0.0
+    if mid <= 0:
+        mid = ask
+    return min(
+        round(mid + (ask - mid) * config.OPEN_ORDER_SPREAD_FRACTION, 2),
+        ask,
+    )
+
+
+def _limit_buy_fill_price(limit_price: float, fill_bar: dict | None) -> float | None:
+    if limit_price <= 0 or fill_bar is None:
+        return None
+    if _option_bar_quote_only(fill_bar):
+        ask_price = _option_bar_ask(fill_bar)
+        if ask_price <= 0 or ask_price > limit_price:
+            return None
+        return ask_price
+    low_price = _option_bar_low_price(fill_bar)
+    if low_price <= 0 or low_price > limit_price:
+        return None
+    open_price = _option_bar_open_price(fill_bar)
+    if 0 < open_price <= limit_price:
+        return open_price
+    return limit_price
+
+
 def _next_fill_option_bar(
     api_key: str,
     option_ticker: str,
@@ -763,12 +1464,14 @@ def _select_real_contract(
     strike_preference: str,
     expiry_preference: str,
     default_dte: int,
+    decision_time: datetime | None = None,
     expression_profile: str | None = None,
     contract_symbol: str | None = None,
     target_delta_range: tuple[float, float] | None = None,
     target_dte_range: tuple[int, int] | None = None,
     max_spread_pct: float | None = None,
     cache: PolygonCache | None = None,
+    bar_minutes: int = 5,
 ) -> dict | None:
     """Select a real Polygon option contract based on LLM preferences.
 
@@ -827,56 +1530,67 @@ def _select_real_contract(
     )
     if not contracts:
         return None
+    as_of = decision_time or trade_date
+    historical_contracts: list[OptionContract] = []
+    raw_by_symbol: dict[str, dict] = {}
+    for contract in contracts:
+        option_contract = _polygon_contract_to_option_contract(
+            contract,
+            api_key=api_key,
+            underlying=underlying,
+            option_type=option_type,
+            trade_date=trade_date,
+            as_of=as_of,
+            cache=cache,
+            bar_minutes=bar_minutes,
+        )
+        if option_contract is None or option_contract.ask <= 0:
+            continue
+        theta_backed = _is_theta_option_ticker(option_contract.symbol)
+        if (
+            not theta_backed
+            and option_contract.open_interest < config.MIN_OPEN_INTEREST
+            and option_contract.volume < config.MIN_OPTION_VOLUME
+        ):
+            continue
+        historical_contracts.append(option_contract)
+        enriched_contract = dict(contract)
+        enriched_contract.update(
+            {
+                "bid": option_contract.bid,
+                "ask": option_contract.ask,
+                "mid": option_contract.mid,
+                "volume": option_contract.volume,
+                "open_interest": option_contract.open_interest,
+            }
+        )
+        raw_by_symbol[option_contract.symbol] = enriched_contract
 
-    if contract_symbol:
-        exact = [c for c in contracts if str(c.get("ticker", "")).upper() == contract_symbol.upper()]
-        return exact[0] if exact else None
-
-    if max_spread_pct is not None:
-        spread_filtered = []
-        for contract in contracts:
-            bid = float(contract.get("bid") or 0.0)
-            ask = float(contract.get("ask") or 0.0)
-            if ask <= 0 or bid < 0:
-                spread_filtered.append(contract)
-                continue
-            spread_pct = (ask - bid) / ask
-            if spread_pct <= max_spread_pct:
-                spread_filtered.append(contract)
-        if not spread_filtered:
+    if not historical_contracts:
+        return None
+    if not contract_symbol and target_dte_range is None:
+        historical_contracts = filter_contracts_by_expiry_preference(
+            historical_contracts,
+            expiry_preference,
+            as_of=trade_date,
+        )
+        if not historical_contracts:
             return None
-        contracts = spread_filtered
 
-    target_strike = target_strike_for_preference(spot, option_type, strike_preference)
-    if target_dte_range is not None:
-        lower = min(target_dte_range)
-        upper = max(target_dte_range)
-        target_dte = int((lower + upper) / 2)
-    else:
-        target_dte = target_dte_for_expiry_preference(expiry_preference)
-
-    def _contract_score(contract: dict) -> tuple[float, float, int, float]:
-        strike = float(contract.get("strike_price", 0) or 0)
-        expiry_raw = str(contract.get("expiration_date") or "")
-        try:
-            expiry = date.fromisoformat(expiry_raw)
-            dte = max((expiry - trade_date).days, 0)
-        except ValueError:
-            dte = target_dte
-        strike_penalty = abs(strike - target_strike) / spot * 100 if spot > 0 else 0.0
-        dte_penalty = abs(dte - target_dte)
-        delta_penalty = 0.0
-        if target_delta_range is not None and strike > 0 and spot > 0:
-            delta = abs(approx_delta(strike, spot, max(dte, 1), option_type))
-            low, high = (min(target_delta_range), max(target_delta_range))
-            if delta < low:
-                delta_penalty = low - delta
-            elif delta > high:
-                delta_penalty = delta - high
-        return (delta_penalty, strike_penalty, dte_penalty, dte)
-
-    best = min(contracts, key=_contract_score)
-    return best
+    selected = select_contract(
+        historical_contracts,
+        spot,
+        strike_preference=strike_preference,
+        expiry_preference=expiry_preference,
+        expression_profile=expression_profile,
+        contract_symbol=contract_symbol,
+        target_delta_range=target_delta_range,
+        target_dte_range=target_dte_range,
+        max_spread_pct=max_spread_pct,
+    )
+    if selected is None:
+        return None
+    return raw_by_symbol.get(selected.symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +1610,7 @@ class SimPosition:
     reasoning: str
     expression_profile: str = ""
     polygon_ticker: str = ""
+    risk_alert: str = ""
 
     @property
     def dte_from(self) -> int:
@@ -932,7 +1647,7 @@ def _exit_premium_for_position(
     alive indefinitely.
     """
     if option_bar is not None:
-        premium = _option_bar_price(option_bar)
+        premium = _option_bar_exit_price(option_bar)
         if premium > 0:
             return premium
     if decision_time.date() >= pos.expiry_date:
@@ -949,12 +1664,12 @@ class BacktestConfig:
     start_date: date
     end_date: date
     initial_equity: float = 100_000.0
-    max_risk_per_trade: float = 0.40
-    profit_target_pct: float = 0.50
-    stop_loss_pct: float = 0.40
-    time_stop_dte: int = 2
+    max_risk_per_trade: float = config.MAX_RISK_PER_TRADE
+    profit_target_pct: float = config.PROFIT_TARGET_PCT
+    stop_loss_pct: float = config.STOP_LOSS_PCT
+    time_stop_dte: int = config.TIME_STOP_DTE
     default_dte: int = 14
-    max_positions: int = 5
+    max_positions: int = config.MAX_OPEN_POSITIONS
     llm_delay_seconds: float = 1.0
     decision_interval_minutes: int = config.SCAN_INTERVAL_MINUTES
     signal_bar_minutes: int = 5
@@ -962,10 +1677,10 @@ class BacktestConfig:
     no_trade_minutes_after_open: int = config.NO_TRADE_MINUTES_AFTER_OPEN
     no_trade_minutes_before_close: int = config.NO_TRADE_MINUTES_BEFORE_CLOSE
     use_journal: bool = True
-    journal_max_active: int = 8
-    journal_max_full_display: int = 5
-    journal_stale_cycles: int = 8
-    journal_stale_conviction: float = 0.4
+    journal_max_active: int = config.JOURNAL_MAX_ACTIVE
+    journal_max_full_display: int = config.JOURNAL_MAX_FULL_DISPLAY
+    journal_stale_cycles: int = config.JOURNAL_STALE_CYCLES
+    journal_stale_conviction: float = config.JOURNAL_STALE_CONVICTION
     offline: bool = False
     prepare_only: bool = False
     cache_db_path: Path | None = None
@@ -994,6 +1709,7 @@ class BacktestResult:
     days_tested: int = 0
     llm_error_cycles: int = 0
     llm_failure_days: int = 0
+    historical_options_provider: str = ""
     log_db_path: str | None = None
     decision_log: list[dict] = field(default_factory=list)
 
@@ -1831,7 +2547,7 @@ def _build_options_context(
     and show the latest premium available before as_of.
     """
     if not tickers:
-        return "(Backtest mode: real Polygon options data used for pricing)"
+        return "(Backtest mode: real historical options data used for pricing)"
 
     as_of_dt = _coerce_eastern_datetime(as_of)
     trade_date = as_of_dt.date()
@@ -1962,7 +2678,7 @@ def _build_options_context(
                 found_any = True
 
     if not found_any:
-        return "(Backtest mode: real Polygon options data used for pricing)"
+        return "(Backtest mode: real historical options data used for pricing)"
 
     return "\n".join(lines)
 
@@ -2222,16 +2938,23 @@ def _build_enriched_portfolio_context(
             flags = []
             if pnl_pct >= profit_target_pct * 100 * 0.8:
                 flags.append(f"approaching profit target of {profit_target_pct:.0%}")
-            if pnl_pct <= -stop_loss_pct * 100 * 0.8:
-                flags.append(f"approaching stop loss of {stop_loss_pct:.0%}")
+            scaled_stop_loss_pct = stop_loss_for_dte(dte)
+            if pnl_pct <= -scaled_stop_loss_pct * 100 * 0.8:
+                flags.append(
+                    f"approaching stop loss of {scaled_stop_loss_pct:.0%} ({dte} DTE)"
+                )
             if dte <= time_stop_dte + 1:
                 flags.append(f"approaching time stop ({time_stop_dte} DTE)")
             if flags:
                 lines.append(f"    [{'; '.join(flags)}]")
+            if pos.risk_alert:
+                lines.append(f"    ** RISK ALERT: {pos.risk_alert}")
         else:
             lines.append(
                 f"    entry=${pos.entry_premium:.2f} qty={pos.qty}"
             )
+            if pos.risk_alert:
+                lines.append(f"    ** RISK ALERT: {pos.risk_alert}")
 
     if positions:
         lines.append(f"Total unrealized P&L: ${total_unrealized:+,.2f}")
@@ -2243,9 +2966,53 @@ def _historical_cache_path(bt_config: BacktestConfig) -> Path:
     return Path(bt_config.cache_db_path or DEFAULT_HISTORICAL_CACHE_DB_PATH)
 
 
+def _simulated_position_market_value(
+    pos: SimPosition,
+    as_of: date | datetime,
+    api_key: str,
+    cache: PolygonCache,
+    *,
+    bar_minutes: int = 5,
+) -> float:
+    premium = pos.entry_premium
+    if pos.polygon_ticker:
+        option_bar = _current_option_bar(
+            api_key,
+            pos.polygon_ticker,
+            as_of,
+            cache=cache,
+            bar_minutes=bar_minutes,
+        )
+        observed_premium = _option_bar_price(option_bar) if option_bar else 0.0
+        if observed_premium > 0:
+            premium = observed_premium
+    return max(premium, 0.0) * pos.qty * 100
+
+
+def _simulated_current_exposure(
+    positions: list[SimPosition],
+    as_of: date | datetime,
+    api_key: str,
+    cache: PolygonCache,
+    *,
+    bar_minutes: int = 5,
+) -> float:
+    return sum(
+        _simulated_position_market_value(
+            pos,
+            as_of,
+            api_key,
+            cache,
+            bar_minutes=bar_minutes,
+        )
+        for pos in positions
+    )
+
+
 def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
-    """Run the full backtest using real Polygon options data."""
+    """Run the full backtest using real historical options data."""
     llm_provider = ""
+    historical_options_provider = _historical_options_provider()
     brain: TradingBrain | None = None
     if not bt_config.prepare_only:
         llm_model = config.resolved_llm_model()
@@ -2265,6 +3032,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     if not polygon_key and not bt_config.offline:
         raise ValueError("POLYGON_API_KEY required for backtesting")
     journal = ThesisJournal(
+        db_path=bt_config.log_db_path if bt_config.log_db_path and not bt_config.prepare_only else None,
         max_active=bt_config.journal_max_active,
         max_full_display=bt_config.journal_max_full_display,
         stale_cycles=bt_config.journal_stale_cycles,
@@ -2272,7 +3040,10 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     ) if bt_config.use_journal else None
     trading_days = _trading_days(bt_config.start_date, bt_config.end_date)
 
-    result = BacktestResult(initial_equity=bt_config.initial_equity)
+    result = BacktestResult(
+        initial_equity=bt_config.initial_equity,
+        historical_options_provider=historical_options_provider,
+    )
     result.log_db_path = str(bt_config.log_db_path) if bt_config.log_db_path else None
     equity = bt_config.initial_equity
     positions: list[SimPosition] = []
@@ -2291,6 +3062,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
     log(f"backtest: {bt_config.start_date} to {bt_config.end_date} ({len(trading_days)} days)")
     log(f"initial equity: ${equity:,.2f}")
+    log(f"historical options provider: {historical_options_provider}")
     if bt_config.prepare_only:
         log(f"mode: prepare-only cache warm ({cache.store.db_path})")
     elif bt_config.offline:
@@ -2311,6 +3083,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
         for decision_time in decision_times:
             remaining: list[SimPosition] = []
             for pos in positions:
+                pos = replace(pos, risk_alert="")
                 dte = (pos.expiry_date - decision_time.date()).days
                 if not pos.polygon_ticker:
                     remaining.append(pos)
@@ -2328,19 +3101,33 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     remaining.append(pos)
                     continue
 
-                pnl_pct = (
-                    (current_premium - pos.entry_premium) / pos.entry_premium
-                    if pos.entry_premium > 0 else 0
-                )
                 exit_reason = None
-                if pnl_pct >= bt_config.profit_target_pct:
-                    exit_reason = "profit_target"
-                elif pnl_pct <= -bt_config.stop_loss_pct:
-                    exit_reason = "stop_loss"
-                elif dte <= bt_config.time_stop_dte:
-                    exit_reason = "time_stop"
-                elif decision_time.date() >= pos.expiry_date:
+                if decision_time.date() >= pos.expiry_date:
                     exit_reason = "expiry"
+                else:
+                    pnl_pct = (
+                        (current_premium - pos.entry_premium) / pos.entry_premium
+                        if pos.entry_premium > 0
+                        else 0.0
+                    )
+                    if pnl_pct <= -config.CATASTROPHIC_STOP_PCT:
+                        exit_reason = "catastrophic_stop"
+                    else:
+                        risk_state = evaluate_position_risk(
+                            entry_premium=pos.entry_premium,
+                            current_premium=current_premium,
+                            dte=dte,
+                        )
+                        if risk_state.should_close:
+                            reason_text = risk_state.reason.lower()
+                            if reason_text.startswith("profit target"):
+                                exit_reason = "profit_target"
+                            elif reason_text.startswith("stop loss"):
+                                exit_reason = "stop_loss"
+                            elif reason_text.startswith("time stop"):
+                                exit_reason = "time_stop"
+                            else:
+                                exit_reason = "risk_exit"
 
                 if exit_reason:
                     trade_pnl = (current_premium - pos.entry_premium) * pos.qty * 100
@@ -2524,7 +3311,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "decision_time": decision_time.isoformat(),
                     "news_window_start": news_window_start.isoformat(),
                     "prepared_only": True,
+                    "historical_options_provider": historical_options_provider,
                     "finalists": finalist_symbols,
+                    "options_watchlist": options_watchlist or deep_focus_symbols,
                     "warmed_option_contract_metadata": warmed_contract_metadata,
                     "cache_entries": cache_entries,
                     "open_positions": len(positions),
@@ -2623,7 +3412,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         trade_results.append(trade_record)
                         continue
 
-                    exit_bar = _next_fill_option_bar(
+                    exit_bar = _current_option_bar(
                         polygon_key,
                         matched_pos.polygon_ticker,
                         decision_time,
@@ -2631,11 +3420,11 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         bar_minutes=bt_config.signal_bar_minutes,
                     )
                     if exit_bar is None:
-                        trade_record["skip_reason"] = "no fill bar after decision time"
+                        trade_record["skip_reason"] = "no price data before close"
                         trade_results.append(trade_record)
                         continue
 
-                    exit_premium = _option_bar_price(exit_bar)
+                    exit_premium = _option_bar_exit_price(exit_bar)
                     if exit_premium <= 0:
                         trade_record["skip_reason"] = "invalid exit price"
                         trade_results.append(trade_record)
@@ -2734,12 +3523,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     decision.strike_preference or "atm",
                     decision.expiry_preference or "next_week",
                     bt_config.default_dte,
+                    decision_time=decision_time,
                     expression_profile=decision.expression_profile,
                     contract_symbol=decision.contract_symbol,
                     target_delta_range=decision.target_delta_range,
                     target_dte_range=decision.target_dte_range,
                     max_spread_pct=decision.max_spread_pct,
                     cache=cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
                 )
                 if contract is None:
                     trade_record["skip_reason"] = "no contract found"
@@ -2754,6 +3545,18 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_results.append(trade_record)
                     continue
                 expiry = date.fromisoformat(expiry_str)
+                quote_bar = _current_option_bar(
+                    polygon_key,
+                    polygon_ticker,
+                    decision_time,
+                    cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                )
+                limit_price = _entry_limit_price(contract, quote_bar)
+                if limit_price < 0.01:
+                    trade_record["skip_reason"] = "no tradable quote"
+                    trade_results.append(trade_record)
+                    continue
 
                 entry_bar = _next_fill_option_bar(
                     polygon_key,
@@ -2768,21 +3571,43 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     continue
 
                 volume = int(entry_bar.get("v", 0) or 0)
-                if volume <= 0:
+                if volume <= 0 and not _option_bar_quote_only(entry_bar):
                     trade_record["skip_reason"] = "zero volume"
                     trade_results.append(trade_record)
                     continue
 
-                premium = _option_bar_price(entry_bar)
-                if premium < 0.01:
-                    trade_record["skip_reason"] = "premium too low"
+                premium = _limit_buy_fill_price(limit_price, entry_bar)
+                if premium is None:
+                    trade_record["skip_reason"] = "entry order not filled"
                     trade_results.append(trade_record)
                     continue
 
                 requested_risk_pct = min(max(decision.risk_pct, 0.0), bt_config.max_risk_per_trade)
+                current_exposure = _simulated_current_exposure(
+                    positions,
+                    decision_time,
+                    polygon_key,
+                    cache,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                )
+                cash = max(account_equity - current_exposure, 0.0)
+                day_pl = account_equity - prior_day_equity
+                risk_check = evaluate_trade_risk(
+                    equity=account_equity,
+                    cash=cash,
+                    current_exposure=current_exposure,
+                    open_positions=len(positions),
+                    option_ask=limit_price,
+                    day_pl=day_pl,
+                )
+                if not risk_check.approved:
+                    trade_record["skip_reason"] = f"risk: {risk_check.reason}"
+                    trade_results.append(trade_record)
+                    continue
                 max_cost = account_equity * requested_risk_pct
-                cost_per_contract = premium * 100
-                qty = size_for_risk_budget(max_cost, cost_per_contract)
+                cost_per_contract = limit_price * 100
+                max_by_risk = size_for_risk_budget(max_cost, cost_per_contract)
+                qty = min(risk_check.max_contracts, max_by_risk)
                 if qty <= 0:
                     trade_record["skip_reason"] = "risk budget too small for 1 contract"
                     trade_results.append(trade_record)
@@ -2856,10 +3681,13 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 "date": trade_date.isoformat(),
                 "decision_time": decision_time.isoformat(),
                 "news_window_start": news_window_start.isoformat(),
+                "historical_options_provider": historical_options_provider,
                 "llm_provider": run_result.packet.provider,
                 "llm_model": run_result.packet.model,
                 "llm_error": llm_error,
                 "market_analysis": analysis.analysis,
+                "finalists": finalist_symbols,
+                "options_watchlist": options_watchlist or deep_focus_symbols,
                 "thesis_updates": thesis_updates_serialized,
                 "trades_proposed": trade_results,
                 "trades_executed": sum(1 for t in trade_results if t["status"] == "executed"),
@@ -2903,7 +3731,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 bar_minutes=bt_config.signal_bar_minutes,
             )
             if option_bar is not None:
-                exit_premium = _option_bar_price(option_bar)
+                exit_premium = _option_bar_exit_price(option_bar)
             if exit_premium <= 0:
                 for lookback in range(1, 4):
                     check_date = last_date - timedelta(days=lookback)
@@ -2911,7 +3739,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         polygon_key, pos.polygon_ticker, check_date, cache=cache,
                     )
                     if option_bar is not None:
-                        exit_premium = _option_bar_price(option_bar)
+                        exit_premium = _option_bar_exit_price(option_bar)
                         if exit_premium > 0:
                             break
 
@@ -3073,6 +3901,7 @@ def backtest_result_to_dict(r: BacktestResult) -> dict:
         "days_tested": r.days_tested,
         "llm_error_cycles": r.llm_error_cycles,
         "llm_failure_days": r.llm_failure_days,
+        "historical_options_provider": r.historical_options_provider,
         "log_db_path": r.log_db_path,
         "equity_curve": [{"date": d, "equity": e} for d, e in r.equity_curve],
         "trades": [
@@ -3266,7 +4095,7 @@ def run() -> None:
     )
     parser.add_argument(
         "--cache-db", type=str, default=None,
-        help="SQLite DB path for persistent historical Polygon cache",
+        help="SQLite DB path for persistent historical data cache",
     )
     parser.add_argument(
         "--log-db", type=str, default=None,
@@ -3274,11 +4103,11 @@ def run() -> None:
     )
     parser.add_argument(
         "--offline", action="store_true",
-        help="Fail on historical Polygon cache misses instead of going to the network",
+        help="Fail on historical cache misses instead of going to the network",
     )
     parser.add_argument(
         "--prepare-data", action="store_true",
-        help="Warm historical Polygon cache without invoking the LLM",
+        help="Warm the historical data cache without invoking the LLM",
     )
     parser.add_argument(
         "--prepare-prefetch-symbols", type=int, default=config.PREPARE_PREFETCH_SYMBOLS,
