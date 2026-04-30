@@ -1688,6 +1688,7 @@ class BacktestConfig:
     prepare_prefetch_symbols: int = config.PREPARE_PREFETCH_SYMBOLS
     prepare_prefetch_contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE
     prepare_prefetch_strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT
+    max_consecutive_llm_errors: int = config.MAX_CONSECUTIVE_LLM_ERROR_CYCLES
 
 
 @dataclass
@@ -3052,6 +3053,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     max_dd = 0.0
     daily_returns: list[float] = []
     llm_failure_dates: set[date] = set()
+    consecutive_llm_errors = 0
 
     # Polygon cache — avoids redundant API calls in-process and across runs.
     cache = PolygonCache(
@@ -3356,6 +3358,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             if llm_error:
                 result.llm_error_cycles += 1
                 llm_failure_dates.add(trade_date)
+                consecutive_llm_errors += 1
+            else:
+                consecutive_llm_errors = 0
             log(f"  {decision_time.strftime('%H:%M')} LLM: {analysis.analysis}")
 
             if journal and analysis.thesis_updates:
@@ -3697,6 +3702,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             })
             if logger is not None and decision_id > 0:
                 logger.update_decision_trade_count(decision_id, trades_executed)
+            if (
+                bt_config.max_consecutive_llm_errors > 0
+                and consecutive_llm_errors >= bt_config.max_consecutive_llm_errors
+            ):
+                raise RuntimeError(
+                    "aborting backtest after "
+                    f"{consecutive_llm_errors} consecutive LLM error cycles"
+                )
 
         day_close_equity, _ = _mark_to_market_equity(
             equity,
@@ -4117,6 +4130,12 @@ def run() -> None:
         "--prepare-prefetch-contracts", type=int, default=config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE,
         help="In prepare-data mode, contracts per side to prefetch for each symbol",
     )
+    parser.add_argument(
+        "--max-consecutive-llm-errors",
+        type=int,
+        default=None,
+        help="Abort after this many consecutive LLM error cycles (0 disables)",
+    )
     args = parser.parse_args()
 
     env_path = Path(__file__).with_name(".env")
@@ -4143,6 +4162,9 @@ def run() -> None:
         ),
         prepare_prefetch_symbols=args.prepare_prefetch_symbols,
         prepare_prefetch_contracts_per_side=args.prepare_prefetch_contracts,
+        max_consecutive_llm_errors=config.resolved_max_consecutive_llm_error_cycles(
+            args.max_consecutive_llm_errors
+        ),
     )
 
     if args.prepare_data:

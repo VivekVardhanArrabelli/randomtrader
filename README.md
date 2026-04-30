@@ -304,6 +304,11 @@ Add `--log-db path/to/run.db` if you want streaming SQLite trade/decision logs
 during the backtest. If `--output` is set, the CLI will default the log DB to a
 matching `.db` path.
 
+Backtests abort after 3 consecutive LLM error cycles by default. This prevents
+quota, DNS, or provider outage runs from silently producing contaminated
+research artifacts. Use `--max-consecutive-llm-errors 0` only when deliberately
+debugging provider failures.
+
 Run the rolling 3-month experiment harness:
 
 ```bash

@@ -941,6 +941,7 @@ def _base_backtest_config(args: argparse.Namespace) -> BacktestConfig:
         cache_db_path=Path(args.cache_db) if args.cache_db else None,
         prepare_prefetch_symbols=args.prepare_prefetch_symbols,
         prepare_prefetch_contracts_per_side=args.prepare_prefetch_contracts,
+        max_consecutive_llm_errors=args.max_consecutive_llm_errors,
     )
 
 
@@ -969,6 +970,7 @@ def _suite_config_to_dict(
         "cache_db_path": str(base_config.cache_db_path) if base_config.cache_db_path else None,
         "prepare_prefetch_symbols": base_config.prepare_prefetch_symbols,
         "prepare_prefetch_contracts_per_side": base_config.prepare_prefetch_contracts_per_side,
+        "max_consecutive_llm_errors": base_config.max_consecutive_llm_errors,
         "resolved_model": config.resolved_llm_model(),
         "historical_options_provider": config.resolved_historical_options_provider(),
     }
@@ -1106,12 +1108,21 @@ def run() -> None:
         default=config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE,
         help="In cache prep mode, contracts per side to prefetch for each symbol",
     )
+    parser.add_argument(
+        "--max-consecutive-llm-errors",
+        type=int,
+        default=None,
+        help="Abort a window after this many consecutive LLM error cycles (0 disables)",
+    )
     args = parser.parse_args()
 
     env_path = Path(__file__).with_name(".env")
     if not env_path.exists():
         env_path = Path(__file__).parent.parent / "momentum_trader" / ".env"
     load_dotenv(env_path, override=True)
+    args.max_consecutive_llm_errors = config.resolved_max_consecutive_llm_error_cycles(
+        args.max_consecutive_llm_errors
+    )
 
     if bool(args.compare_left) != bool(args.compare_right):
         raise ValueError("--compare-left and --compare-right must be used together")

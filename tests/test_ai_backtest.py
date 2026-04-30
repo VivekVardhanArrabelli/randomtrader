@@ -2587,6 +2587,74 @@ def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):
     assert row == ("AAPL", "bullish", 0.72, "developing")
 
 
+def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+    ]
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            analysis = MarketAnalysis(
+                analysis="LLM error: OpenAI 429 insufficient_quota",
+                thesis_updates=[],
+                trades=[],
+            )
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[],
+                raw_response={"id": "resp_error"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+
+    with pytest.raises(RuntimeError, match="2 consecutive LLM error cycles"):
+        bt_mod.run_backtest(
+            BacktestConfig(
+                start_date=trade_day,
+                end_date=trade_day,
+                llm_delay_seconds=0.0,
+                cache_db_path=tmp_path / "cache.db",
+                max_consecutive_llm_errors=2,
+            )
+        )
+
+
 def test_run_backtest_open_respects_live_limit_fill(tmp_path, monkeypatch):
     import ai_trader.backtest as bt_mod
 

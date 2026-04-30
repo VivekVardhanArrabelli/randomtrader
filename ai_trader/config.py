@@ -107,6 +107,9 @@ LLM_MODEL = "gpt-5.4"
 LLM_MAX_TOKENS = 4096
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading
 LLM_MAX_ATTEMPTS = 3
+MAX_CONSECUTIVE_LLM_ERROR_CYCLES = int(
+    os.environ.get("MAX_CONSECUTIVE_LLM_ERROR_CYCLES", "3") or "0"
+)
 
 
 def resolved_llm_model(model: str | None = None) -> str:
@@ -114,6 +117,16 @@ def resolved_llm_model(model: str | None = None) -> str:
     if model and model.strip():
         return model.strip()
     return os.environ.get("LLM_MODEL", "").strip() or LLM_MODEL
+
+
+def resolved_max_consecutive_llm_error_cycles(value: int | None = None) -> int:
+    """Resolve the LLM error fail-fast threshold after .env loading."""
+    if value is not None:
+        return max(int(value), 0)
+    raw = os.environ.get("MAX_CONSECUTIVE_LLM_ERROR_CYCLES", "").strip()
+    if raw:
+        return max(int(raw), 0)
+    return max(int(MAX_CONSECUTIVE_LLM_ERROR_CYCLES), 0)
 
 
 def resolved_historical_options_provider(provider: str | None = None) -> str:
