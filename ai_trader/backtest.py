@@ -68,6 +68,7 @@ from .options import (
 from .risk import (
     evaluate_trade_risk,
     evaluate_position_risk,
+    scale_risk_pct_for_conviction,
     size_for_risk_budget,
     stop_loss_for_dte,
 )
@@ -3606,7 +3607,10 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_results.append(trade_record)
                     continue
 
-                requested_risk_pct = min(max(decision.risk_pct, 0.0), bt_config.max_risk_per_trade)
+                requested_risk_pct = min(
+                    scale_risk_pct_for_conviction(decision.risk_pct, decision.conviction),
+                    bt_config.max_risk_per_trade,
+                )
                 current_exposure = _simulated_current_exposure(
                     positions,
                     decision_time,
@@ -3656,6 +3660,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 trade_record["contract"] = polygon_ticker
                 trade_record["qty"] = qty
                 trade_record["premium"] = premium
+                trade_record["effective_risk_pct"] = requested_risk_pct
                 if decision.expression_profile:
                     trade_record["expression_profile"] = decision.expression_profile
                 trade_results.append(trade_record)

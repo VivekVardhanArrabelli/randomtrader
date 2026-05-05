@@ -17,7 +17,12 @@ from .options import (
     select_contract,
 )
 from .portfolio import EquityPosition, PortfolioState
-from .risk import evaluate_stock_trade_risk, evaluate_trade_risk, size_for_risk_budget
+from .risk import (
+    evaluate_stock_trade_risk,
+    evaluate_trade_risk,
+    scale_risk_pct_for_conviction,
+    size_for_risk_budget,
+)
 from .utils import log, now_eastern
 
 _TERMINAL_ORDER_STATUSES = {
@@ -190,7 +195,10 @@ def _execute_open_option(
         round(contract.mid + (contract.ask - contract.mid) * config.OPEN_ORDER_SPREAD_FRACTION, 2),
         contract.ask,
     )
-    requested_budget = portfolio.account.equity * max(decision.risk_pct, 0.0)
+    effective_risk_pct = scale_risk_pct_for_conviction(
+        decision.risk_pct, decision.conviction,
+    )
+    requested_budget = portfolio.account.equity * effective_risk_pct
     max_by_risk = size_for_risk_budget(requested_budget, limit_price * 100)
     if max_by_risk <= 0:
         reason = (
@@ -209,7 +217,8 @@ def _execute_open_option(
     log(
         f"executing: BUY {qty}x {contract.symbol} "
         f"@ ${limit_price:.2f} (mid=${contract.mid:.2f} ask=${contract.ask:.2f}) "
-        f"(${total_premium:.2f} total) conviction={decision.conviction:.2f}"
+        f"(${total_premium:.2f} total) conviction={decision.conviction:.2f} "
+        f"risk={effective_risk_pct:.1%}"
     )
 
     try:
@@ -320,7 +329,10 @@ def _execute_open_stock(
         )
         return ExecutionResult(False, symbol, None, 0, 0.0, f"risk: {risk.reason}")
 
-    requested_budget = portfolio.account.equity * max(decision.risk_pct, 0.0)
+    effective_risk_pct = scale_risk_pct_for_conviction(
+        decision.risk_pct, decision.conviction,
+    )
+    requested_budget = portfolio.account.equity * effective_risk_pct
     max_by_risk = size_for_risk_budget(requested_budget, limit_price)
     if max_by_risk <= 0:
         reason = (
@@ -346,7 +358,8 @@ def _execute_open_stock(
 
     log(
         f"executing: BUY {qty}x {symbol} @ ${limit_price:.2f} "
-        f"(${total_notional:.2f} total) conviction={decision.conviction:.2f}"
+        f"(${total_notional:.2f} total) conviction={decision.conviction:.2f} "
+        f"risk={effective_risk_pct:.1%}"
     )
 
     try:

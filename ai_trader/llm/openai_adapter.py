@@ -225,6 +225,44 @@ def _extract_response_text_tool_call(
     return [ToolCall(name=tool_name, input=dict(parsed_arguments))]
 
 
+def _extract_chat_text_tool_call(text_parts: list[str], tool_name: str) -> list[ToolCall]:
+    if not text_parts:
+        return []
+    return _extract_response_text_tool_call(
+        [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "".join(text_parts),
+                    }
+                ],
+            }
+        ],
+        tool_name,
+    )
+
+
+def _deepseek_json_mode_enabled() -> bool:
+    return os.environ.get("DEEPSEEK_JSON_MODE", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _json_mode_user_message(user_message: str, tool: dict[str, Any]) -> str:
+    schema_keys = ", ".join((tool.get("input_schema", {}).get("properties") or {}).keys())
+    return (
+        f"{user_message}\n\n"
+        "IMPORTANT: Return ONLY a valid JSON object for submit_trade_decisions. "
+        f"Top-level keys: {schema_keys}. "
+        "Use empty arrays when there are no thesis updates or trades. "
+        "Keep all strings short, plain text, and single-line."
+    )
+
+
 def _request_timeout_seconds() -> float:
     raw_value = (
         os.environ.get("LLM_HTTP_TIMEOUT_SECONDS")
@@ -250,16 +288,16 @@ def _should_retry_status(status_code: int) -> bool:
 
 
 class OpenAIAdapter:
-    provider = "openai"
-
     def __init__(
         self,
         api_key: str,
         *,
         base_url: str = "https://api.openai.com/v1",
+        provider: str = "openai",
         session: requests.Session | None = None,
     ) -> None:
         self.api_key = api_key
+        self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
 
@@ -299,19 +337,29 @@ class OpenAIAdapter:
         max_tokens: int,
         temperature: float,
     ) -> LLMCompletion:
+        json_content_mode = self.provider == "deepseek" and _deepseek_json_mode_enabled()
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
+                {
+                    "role": "user",
+                    "content": (
+                        _json_mode_user_message(user_message, tool)
+                        if json_content_mode else user_message
+                    ),
+                },
             ],
             "temperature": temperature,
-            "tools": [_to_openai_tool(tool)],
-            "tool_choice": {
+        }
+        if json_content_mode:
+            payload["response_format"] = {"type": "json_object"}
+        else:
+            payload["tools"] = [_to_openai_tool(tool)]
+            payload["tool_choice"] = {
                 "type": "function",
                 "function": {"name": tool["name"]},
-            },
-        }
+            }
         if _uses_max_completion_tokens(model):
             payload["max_completion_tokens"] = max_tokens
         else:
@@ -378,10 +426,14 @@ class OpenAIAdapter:
                 )
             )
 
+        text_blocks = _extract_text_parts(message.get("content"))
+        if not tool_calls and json_content_mode:
+            tool_calls = _extract_chat_text_tool_call(text_blocks, tool["name"])
+
         return LLMCompletion(
             provider=self.provider,
             model=str(data.get("model") or model),
-            text_blocks=_extract_text_parts(message.get("content")),
+            text_blocks=text_blocks,
             tool_calls=tool_calls,
             raw_response={
                 "id": data.get("id"),

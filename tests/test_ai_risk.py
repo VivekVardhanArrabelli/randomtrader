@@ -4,6 +4,7 @@ from ai_trader.risk import (
     evaluate_position_risk,
     evaluate_stock_trade_risk,
     evaluate_trade_risk,
+    scale_risk_pct_for_conviction,
     size_for_risk_budget,
 )
 
@@ -148,3 +149,20 @@ def test_size_for_risk_budget_returns_zero_when_unit_is_too_expensive():
 
 def test_size_for_risk_budget_floors_to_whole_units():
     assert size_for_risk_budget(1_250.0, 500.0) == 2
+
+
+def test_scale_risk_pct_for_conviction_preserves_high_conviction():
+    assert scale_risk_pct_for_conviction(0.12, 0.85) == 0.12
+
+
+def test_scale_risk_pct_for_conviction_reduces_marginal_trades():
+    assert scale_risk_pct_for_conviction(0.10, 0.65) == 0.05
+    assert abs(scale_risk_pct_for_conviction(0.10, 0.60) - 0.035) < 0.0001
+
+
+def test_scale_risk_pct_for_conviction_preserves_tiny_probe_budget():
+    assert scale_risk_pct_for_conviction(0.001, 0.70) == 0.001
+
+
+def test_scale_risk_pct_for_conviction_handles_zero_budget():
+    assert scale_risk_pct_for_conviction(0.0, 0.90) == 0.0

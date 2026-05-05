@@ -66,6 +66,13 @@ monthlies for thesis-driven trades.
 9. Your conviction score (0-1) should reflect how strongly the news/data \
 supports the trade. Only trades with conviction >= 0.6 will be executed.
 10. Think about risk/reward. A great trade has asymmetric upside.
+11. Avoid chasing extended long entries. If the underlying is described as \
+overbought, near all-time highs, surging/gapping, or up more than 20% over \
+10 days, only buy if you can name the pullback/reclaim/consolidation level \
+that makes the entry valid. Otherwise keep the thesis developing.
+12. Every buy reasoning must include a concrete invalidation/stop condition \
+and profit-taking condition. If an existing long breaks its invalidation level \
+or breaks below the consolidation you bought, close it instead of hoping.
 
 THESIS JOURNAL:
 You maintain a thesis journal across trading cycles. This is your memory.

@@ -55,6 +55,8 @@ def test_system_prompt_contains_key_rules():
     assert "40%" in SYSTEM_PROMPT
     assert "options" in SYSTEM_PROMPT.lower()
     assert "conviction" in SYSTEM_PROMPT.lower()
+    assert "avoid chasing extended" in SYSTEM_PROMPT.lower()
+    assert "concrete invalidation" in SYSTEM_PROMPT.lower()
 
 
 def test_trade_tool_schema():

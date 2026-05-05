@@ -36,6 +36,34 @@ def size_for_risk_budget(risk_budget: float, unit_cost: float) -> int:
     return max(int(risk_budget / unit_cost), 0)
 
 
+def scale_risk_pct_for_conviction(risk_pct: float, conviction: float) -> float:
+    """Scale marginal trades down without blocking the model's thesis.
+
+    The execution threshold is deliberately permissive at 0.60 so the model can
+    express fresh edges. Trades close to that threshold should be probes; full
+    requested sizing is reserved for much stronger evidence.
+    """
+    if risk_pct <= 0:
+        return 0.0
+
+    risk_pct = max(0.0, float(risk_pct))
+    if risk_pct <= 0.02:
+        return risk_pct
+
+    conviction = max(0.0, min(float(conviction), 1.0))
+    if conviction >= 0.80:
+        multiplier = 1.0
+    elif conviction >= 0.75:
+        multiplier = 0.85
+    elif conviction >= 0.70:
+        multiplier = 0.70
+    elif conviction >= 0.65:
+        multiplier = 0.50
+    else:
+        multiplier = 0.35
+    return risk_pct * multiplier
+
+
 def evaluate_trade_risk(
     equity: float,
     cash: float,
