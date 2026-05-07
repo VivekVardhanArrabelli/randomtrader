@@ -17,6 +17,8 @@ MAX_TOTAL_EXPOSURE = 0.80          # max 80 % of equity in open positions
 MAX_OPEN_POSITIONS = 5
 DAILY_LOSS_LIMIT = 0.10            # halt trading if day P&L <= -10 %
 MIN_TRADE_CONVICTION = 0.60        # LLM must have >= 60 % conviction
+OPTION_LOSS_STREAK_GUARD_LOOKBACK = 3
+OPTION_LOSS_STREAK_GUARD_MIN_CONVICTION = 0.80
 
 # ---------------------------------------------------------------------------
 # Options preferences

@@ -2110,6 +2110,55 @@ def _build_performance_summary(
     return "\n".join(lines)
 
 
+def _backtest_option_loss_streak_guard_reason(
+    closed_trades: list[dict],
+    conviction: float,
+    *,
+    lookback: int | None = None,
+    min_conviction: float | None = None,
+) -> str:
+    lookback = (
+        config.OPTION_LOSS_STREAK_GUARD_LOOKBACK
+        if lookback is None else int(lookback)
+    )
+    min_conviction = (
+        config.OPTION_LOSS_STREAK_GUARD_MIN_CONVICTION
+        if min_conviction is None else float(min_conviction)
+    )
+    if lookback <= 0 or conviction >= min_conviction:
+        return ""
+
+    option_closes = [
+        trade for trade in reversed(closed_trades)
+        if str(trade.get("option_type") or "").lower() in {"call", "put"}
+    ]
+    if len(option_closes) < lookback:
+        return ""
+
+    if all(float(trade.get("pnl") or 0.0) < 0 for trade in option_closes[:lookback]):
+        return (
+            f"last {lookback} closed option trades were losses; "
+            f"option entries require conviction >= {min_conviction:.2f}"
+        )
+    return ""
+
+
+def _stock_symbol_notional_for_budget(
+    positions: list[SimPosition],
+    underlying: str,
+    current_price: float,
+) -> float:
+    total = 0.0
+    for pos in positions:
+        if pos.option_type != "stock":
+            continue
+        if pos.underlying.upper() != underlying.upper():
+            continue
+        reference_price = current_price if current_price > 0 else pos.entry_premium
+        total += abs(pos.qty) * reference_price
+    return total
+
+
 def _build_market_trend_context(
     api_key: str,
     as_of: date | datetime,
@@ -3525,6 +3574,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_results.append(trade_record)
                     continue
 
+                guard_reason = _backtest_option_loss_streak_guard_reason(
+                    closed_trades,
+                    decision.conviction,
+                )
+                if guard_reason:
+                    trade_record["skip_reason"] = guard_reason
+                    trade_results.append(trade_record)
+                    continue
+
                 option_type = "call" if decision.action == "buy_call" else "put"
                 underlying = decision.underlying
                 spot = _current_underlying_price(
@@ -3865,6 +3923,48 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
 # Printing
 # ---------------------------------------------------------------------------
 
+def _summarize_decision_log(decision_log: list[dict]) -> dict:
+    proposed = executed = skipped = 0
+    skip_counter: Counter[str] = Counter()
+
+    for entry in decision_log:
+        proposed_trades = entry.get("trades_proposed") or []
+        if isinstance(proposed_trades, list):
+            proposed += len(proposed_trades)
+            for trade in proposed_trades:
+                if not isinstance(trade, dict):
+                    continue
+                status = str(trade.get("status") or "")
+                if status == "executed":
+                    executed += 1
+                elif status == "skipped":
+                    skipped += 1
+                    reason = str(trade.get("skip_reason") or "unknown")
+                    skip_counter[reason] += 1
+        else:
+            entry_executed = int(entry.get("trades_executed") or 0)
+            entry_skipped = int(entry.get("trades_skipped") or 0)
+            executed += entry_executed
+            skipped += entry_skipped
+            proposed += entry_executed + entry_skipped
+
+    guardrail_skips = sum(
+        count for reason, count in skip_counter.items()
+        if "option entries require conviction" in reason
+        or "closed option trades were losses" in reason
+    )
+    return {
+        "proposed": proposed,
+        "executed": executed,
+        "skipped": skipped,
+        "guardrail_skips": guardrail_skips,
+        "skip_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in skip_counter.most_common()
+        ],
+    }
+
+
 def print_backtest_result(r: BacktestResult) -> None:
     print("=" * 60)
     print("  AI TRADER BACKTEST RESULTS")
@@ -3881,6 +3981,19 @@ def print_backtest_result(r: BacktestResult) -> None:
     print(f"  Losses:           {r.losses}")
     if r.win_rate is not None:
         print(f"  Win rate:         {r.win_rate:.1%}")
+
+    decision_summary = _summarize_decision_log(r.decision_log)
+    if decision_summary["proposed"]:
+        print(f"\n  Proposed trades:  {decision_summary['proposed']}")
+        print(f"  Executed props:   {decision_summary['executed']}")
+        print(f"  Skipped props:    {decision_summary['skipped']}")
+        if decision_summary["guardrail_skips"]:
+            print(f"  Guardrail skips:  {decision_summary['guardrail_skips']}")
+        top_reasons = decision_summary["skip_reasons"][:3]
+        if top_reasons:
+            print("  Top skip reasons:")
+            for row in top_reasons:
+                print(f"    {row['count']}x {row['reason']}")
 
     print(f"\n  Max drawdown:     ${r.max_drawdown:,.2f}")
     if r.sharpe_ratio is not None:
@@ -3940,6 +4053,7 @@ def backtest_result_to_dict(r: BacktestResult) -> dict:
         "llm_failure_days": r.llm_failure_days,
         "historical_options_provider": r.historical_options_provider,
         "log_db_path": r.log_db_path,
+        "decision_summary": _summarize_decision_log(r.decision_log),
         "equity_curve": [{"date": d, "equity": e} for d, e in r.equity_curve],
         "trades": [
             {
@@ -3997,6 +4111,19 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         f"Period: {r.days_tested} trading days | "
         f"Final: ${r.final_equity:,.0f} ({r.total_return_pct:+.1%}) | {win_loss}"
     )
+    decision_summary = _summarize_decision_log(r.decision_log)
+    if decision_summary["proposed"]:
+        lines.append(
+            "Decision summary: "
+            f"{decision_summary['proposed']} proposed | "
+            f"{decision_summary['executed']} executed | "
+            f"{decision_summary['skipped']} skipped | "
+            f"{decision_summary['guardrail_skips']} guardrail skips"
+        )
+        if decision_summary["skip_reasons"]:
+            lines.append("Top skip reasons:")
+            for row in decision_summary["skip_reasons"][:5]:
+                lines.append(f"- {row['count']}x {row['reason']}")
     lines.append("")
 
     for entry in r.decision_log:

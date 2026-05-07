@@ -8,12 +8,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import config
 from .db import DEFAULT_DB_PATH
 
 
@@ -55,6 +57,13 @@ class TradeMetrics:
     decision_cycles: int = 0
     cycles_with_trades: int = 0
     conviction_vs_outcome: list[tuple[float, float]] | None = None
+    latest_portfolio_snapshot: dict | None = None
+    option_loss_streak: int = 0
+    option_guard_active: bool = False
+    option_guard_min_conviction: float = 0.0
+    llm_failure_cycles: int = 0
+    llm_parse_failures: int = 0
+    llm_api_failures: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -91,12 +100,126 @@ def _load_decisions(db_path: Path) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _load_latest_portfolio_snapshot(db_path: Path) -> dict | None:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'portfolio_snapshots'"
+    ).fetchone()
+    if exists is None:
+        conn.close()
+        return None
+
+    row = conn.execute(
+        "SELECT * FROM portfolio_snapshots ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+
+    snapshot = dict(row)
+    raw_positions = snapshot.pop("positions_json", "") or "[]"
+    try:
+        positions = json.loads(raw_positions)
+    except (TypeError, ValueError):
+        positions = []
+    snapshot["positions"] = positions if isinstance(positions, list) else []
+    return snapshot
+
+
 # ---------------------------------------------------------------------------
 # Computation
 # ---------------------------------------------------------------------------
 
 def _safe_div(a: float, b: float) -> float | None:
     return a / b if b != 0 else None
+
+
+def _decision_rows_from_json(raw: object) -> list[dict]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        return [row for row in parsed if isinstance(row, dict)]
+    if isinstance(parsed, dict):
+        trades = parsed.get("trades")
+        if isinstance(trades, list):
+            return [row for row in trades if isinstance(row, dict)]
+    return []
+
+
+def _decision_has_trade_activity(decision: dict) -> bool:
+    """Return True when a decision cycle produced at least one trade decision."""
+    if int(decision.get("trades_executed") or 0) > 0:
+        return True
+    return len(_decision_rows_from_json(decision.get("decisions_json"))) > 0
+
+
+def _is_entry_action(action: object) -> bool:
+    return str(action or "") in {"buy_call", "buy_put", "buy_stock"}
+
+
+def _entry_risk_pcts_from_decisions(decisions: list[dict]) -> list[float]:
+    """Return requested risk_pct values for opening trade decisions."""
+    risk_pcts: list[float] = []
+    for decision in decisions:
+        for row in _decision_rows_from_json(decision.get("decisions_json")):
+            if not _is_entry_action(row.get("action")):
+                continue
+            try:
+                risk_pct = float(row.get("risk_pct"))
+            except (TypeError, ValueError):
+                continue
+            if risk_pct >= 0:
+                risk_pcts.append(risk_pct)
+    return risk_pcts
+
+
+def _is_option_symbol(symbol: object) -> bool:
+    return re.match(
+        r"^(?:O:)?[A-Z]+[0-9]{6}[CP][0-9]{8}$",
+        str(symbol or "").upper(),
+    ) is not None
+
+
+def _current_option_loss_streak(closes: list[dict]) -> int:
+    streak = 0
+    for close in reversed(closes):
+        option_type = str(close.get("option_type") or "").strip().lower()
+        if option_type not in {"call", "put"} and not _is_option_symbol(close.get("symbol")):
+            continue
+        if float(close.get("pnl") or 0.0) < 0:
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _llm_failure_counts(decisions: list[dict]) -> tuple[int, int, int]:
+    failures = parse_failures = api_failures = 0
+    for decision in decisions:
+        analysis = str(decision.get("market_analysis") or "").lower()
+        is_parse = (
+            "parse error" in analysis
+            or "not valid json" in analysis
+            or "malformed llm" in analysis
+            or "did not include content or tool calls" in analysis
+        )
+        is_api = (
+            "deepseek error" in analysis
+            or "llm error" in analysis
+            or "unsupported llm provider" in analysis
+        )
+        if is_parse:
+            parse_failures += 1
+        if is_api:
+            api_failures += 1
+        if is_parse or is_api:
+            failures += 1
+    return failures, parse_failures, api_failures
 
 
 def _median(values: list[float]) -> float | None:
@@ -113,11 +236,21 @@ def compute_metrics(db_path: Path) -> TradeMetrics:
     decisions = _load_decisions(db_path)
 
     m = TradeMetrics()
+    m.latest_portfolio_snapshot = _load_latest_portfolio_snapshot(db_path)
     m.total_trades = len(trades)
     m.filled = sum(1 for t in trades if t["status"] == "filled")
     m.rejected = sum(1 for t in trades if t["status"] in ("rejected", "risk_rejected", "error"))
     m.decision_cycles = len(decisions)
-    m.cycles_with_trades = sum(1 for d in decisions if d["trades_executed"] > 0)
+    m.cycles_with_trades = sum(1 for d in decisions if _decision_has_trade_activity(d))
+    entry_risks = _entry_risk_pcts_from_decisions(decisions)
+    m.avg_risk_pct = sum(entry_risks) / len(entry_risks) if entry_risks else 0.0
+    m.option_loss_streak = _current_option_loss_streak(closes)
+    m.option_guard_min_conviction = config.OPTION_LOSS_STREAK_GUARD_MIN_CONVICTION
+    m.option_guard_active = (
+        m.option_loss_streak >= config.OPTION_LOSS_STREAK_GUARD_LOOKBACK
+        and config.OPTION_LOSS_STREAK_GUARD_LOOKBACK > 0
+    )
+    m.llm_failure_cycles, m.llm_parse_failures, m.llm_api_failures = _llm_failure_counts(decisions)
 
     if not closes:
         return m
@@ -147,7 +280,7 @@ def compute_metrics(db_path: Path) -> TradeMetrics:
     # Match closes back to trade convictions
     trade_by_symbol: dict[str, dict] = {}
     for t in trades:
-        if t["status"] == "filled":
+        if t["status"] == "filled" and _is_entry_action(t.get("action")):
             trade_by_symbol[t["symbol"]] = t
 
     for c in closes:
@@ -240,6 +373,57 @@ def _fmt(val: float | None, prefix: str = "$", decimals: int = 2) -> str:
     return f"{prefix}{val:,.{decimals}f}"
 
 
+def _print_open_exposure(snapshot: dict | None) -> None:
+    print("\n--- Current Open Exposure ---")
+    if not snapshot:
+        print("  No portfolio snapshot logged yet.")
+        return
+
+    equity = float(snapshot.get("equity") or 0.0)
+    total_exposure = float(snapshot.get("total_exposure") or 0.0)
+    exposure_pct = _safe_div(total_exposure, equity)
+    print(f"  Snapshot:             {snapshot.get('timestamp', 'unknown')}")
+    print(f"  Equity:               {_fmt(equity)}")
+    print(f"  Cash:                 {_fmt(float(snapshot.get('cash') or 0.0))}")
+    print(
+        f"  Total exposure:       {_fmt(total_exposure)} "
+        f"({_fmt(exposure_pct, '%')})"
+    )
+    print(f"  Options exposure:     {_fmt(float(snapshot.get('total_options_exposure') or 0.0))}")
+    print(f"  Equity exposure:      {_fmt(float(snapshot.get('total_equity_exposure') or 0.0))}")
+
+    positions = snapshot.get("positions") or []
+    if not positions:
+        print("  Open positions:       none")
+        return
+
+    print("  Open positions:")
+    ranked = sorted(
+        [p for p in positions if isinstance(p, dict)],
+        key=lambda p: abs(float(p.get("market_value") or 0.0)),
+        reverse=True,
+    )
+    for pos in ranked[:8]:
+        symbol = str(pos.get("symbol") or "?")
+        asset_type = str(pos.get("asset_type") or "?")
+        qty = int(float(pos.get("qty") or 0))
+        value = float(pos.get("market_value") or 0.0)
+        upl = float(pos.get("unrealized_pl") or 0.0)
+        pnl_pct = float(pos.get("pnl_pct") or 0.0)
+        detail = ""
+        if asset_type == "option":
+            detail = (
+                f" {str(pos.get('option_type') or '').upper()} "
+                f"${float(pos.get('strike') or 0.0):.2f} "
+                f"exp={pos.get('expiration', '')}"
+            )
+        print(
+            f"    {symbol:18s} {asset_type:6s} qty={qty:<5d}"
+            f" value={_fmt(value):>12s} UPL={_fmt(upl):>12s} "
+            f"({pnl_pct:.1%}){detail}"
+        )
+
+
 def print_report(m: TradeMetrics) -> None:
     print("=" * 60)
     print("  AI TRADER PERFORMANCE REPORT")
@@ -247,10 +431,12 @@ def print_report(m: TradeMetrics) -> None:
 
     print("\n--- Activity ---")
     print(f"  Decision cycles:       {m.decision_cycles}")
-    print(f"  Cycles with trades:    {m.cycles_with_trades}")
+    print(f"  Cycles with orders:    {m.cycles_with_trades}")
     print(f"  Total orders:          {m.total_trades}")
     print(f"  Filled:                {m.filled}")
     print(f"  Rejected / errors:     {m.rejected}")
+
+    _print_open_exposure(m.latest_portfolio_snapshot)
 
     if m.wins + m.losses + m.breakeven == 0:
         print("\n  No closed positions yet.")
@@ -278,12 +464,26 @@ def print_report(m: TradeMetrics) -> None:
     print(f"  Sharpe ratio:          {_fmt(m.sharpe_ratio, '', 2)}")
     print(f"  Calmar ratio:          {_fmt(m.calmar_ratio, '', 2)}")
 
+    print("\n--- Strategy Guardrails ---")
+    print(f"  Option loss streak:    {m.option_loss_streak}")
+    if m.option_guard_active:
+        print(
+            "  Marginal options:      blocked below "
+            f"{m.option_guard_min_conviction:.2f} conviction"
+        )
+    else:
+        print("  Marginal options:      normal conviction threshold")
+
     print("\n--- Direction ---")
     print(f"  Calls traded:          {m.calls_traded}  (win rate: {_fmt(m.call_win_rate, '%')})")
     print(f"  Puts traded:           {m.puts_traded}  (win rate: {_fmt(m.put_win_rate, '%')})")
 
     print("\n--- LLM Quality ---")
     print(f"  Avg conviction:        {_fmt(m.avg_conviction, '', 2)}")
+    print(f"  Avg requested risk:    {_fmt(m.avg_risk_pct, '%')}")
+    print(f"  Failure cycles:        {m.llm_failure_cycles}")
+    print(f"  Parse failures:        {m.llm_parse_failures}")
+    print(f"  API/provider failures: {m.llm_api_failures}")
     if m.conviction_vs_outcome:
         high_conv = [p for c, p in m.conviction_vs_outcome if c >= 0.80]
         low_conv = [p for c, p in m.conviction_vs_outcome if c < 0.80]

@@ -3,7 +3,48 @@
 from datetime import datetime
 import sqlite3
 
-from ai_trader.db import AITradeLogger, PositionCloseRecord, format_trade_history
+from ai_trader.db import (
+    AITradeLogger,
+    PositionCloseRecord,
+    _conviction_calibration,
+    format_trade_history,
+)
+
+
+def test_conviction_calibration_matches_closes_by_exact_symbol() -> None:
+    trades = [
+        {
+            "symbol": "AAPL260515C00160000",
+            "underlying": "AAPL",
+            "action": "buy_call",
+            "status": "filled",
+            "conviction": 0.85,
+        },
+        {
+            "symbol": "AAPL260515C00150000",
+            "underlying": "AAPL",
+            "action": "buy_call",
+            "status": "filled",
+            "conviction": 0.65,
+        },
+    ]
+    closes = [
+        {
+            "symbol": "AAPL260515C00160000",
+            "underlying": "AAPL",
+            "pnl": 250.0,
+        },
+        {
+            "symbol": "AAPL260515C00150000",
+            "underlying": "AAPL",
+            "pnl": -200.0,
+        },
+    ]
+
+    lines = _conviction_calibration(trades, closes)
+
+    assert "    0.60-0.69: 0/1 wins (0%)" in lines
+    assert "    0.80-0.89: 1/1 wins (100%)" in lines
 
 
 def test_format_trade_history_includes_profile_calibration_lines():

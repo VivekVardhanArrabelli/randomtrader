@@ -74,6 +74,21 @@ class PositionCloseRecord:
     entry_date: str = ""
 
 
+@dataclass(frozen=True)
+class PortfolioSnapshotRecord:
+    timestamp: datetime
+    equity: float
+    cash: float
+    buying_power: float
+    day_pl: float
+    total_options_exposure: float
+    total_equity_exposure: float
+    total_exposure: float
+    open_option_count: int
+    open_equity_count: int
+    positions_json: str
+
+
 class AITradeLogger:
     def __init__(self, db_path: Path = DEFAULT_DB_PATH) -> None:
         self.db_path = db_path
@@ -139,6 +154,23 @@ class AITradeLogger:
                     option_type TEXT,
                     expiration TEXT,
                     entry_date TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                    timestamp TEXT,
+                    equity REAL,
+                    cash REAL,
+                    buying_power REAL,
+                    day_pl REAL,
+                    total_options_exposure REAL,
+                    total_equity_exposure REAL,
+                    total_exposure REAL,
+                    open_option_count INTEGER,
+                    open_equity_count INTEGER,
+                    positions_json TEXT
                 )
                 """
             )
@@ -269,6 +301,31 @@ class AITradeLogger:
                 ),
             )
 
+    def log_portfolio_snapshot(self, record: PortfolioSnapshotRecord) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO portfolio_snapshots (
+                    timestamp, equity, cash, buying_power, day_pl,
+                    total_options_exposure, total_equity_exposure, total_exposure,
+                    open_option_count, open_equity_count, positions_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.timestamp.isoformat(),
+                    record.equity,
+                    record.cash,
+                    record.buying_power,
+                    record.day_pl,
+                    record.total_options_exposure,
+                    record.total_equity_exposure,
+                    record.total_exposure,
+                    record.open_option_count,
+                    record.open_equity_count,
+                    record.positions_json,
+                ),
+            )
+
     def get_pending_trades(self, limit: int = 100) -> list[dict]:
         placeholders = ",".join("?" for _ in _PENDING_ORDER_STATUSES)
         query = (
@@ -353,29 +410,29 @@ class AITradeLogger:
 
 def _conviction_calibration(trades: list[dict], closes: list[dict]) -> list[str]:
     """Group closes by conviction bucket and show win rate per bucket."""
-    # Build a map from underlying -> conviction from the trades table
-    # (trades table has conviction; closes table does not)
-    symbol_conviction: dict[str, float] = {}
-    underlying_conviction: dict[str, float] = {}
+    # Match closes to exact entry rows. Underlying-level matching can
+    # miscalibrate when multiple contracts on the same ticker had different
+    # entry convictions.
+    entry_by_symbol: dict[str, dict] = {}
     for t in trades:
         action = str(t.get("action") or "")
-        if t.get("status") == "filled" and t.get("conviction") and action.startswith("buy_"):
-            symbol = t.get("symbol", "")
-            if symbol:
-                symbol_conviction[symbol] = float(t["conviction"])
-            sym = t.get("underlying", "")
-            underlying_conviction[sym] = float(t["conviction"])
+        symbol = str(t.get("symbol") or "")
+        if (
+            symbol
+            and symbol not in entry_by_symbol
+            and t.get("status") == "filled"
+            and t.get("conviction")
+            and action in ("buy_call", "buy_put", "buy_stock")
+        ):
+            entry_by_symbol[symbol] = t
 
     # Bucket: conviction -> list of pnl
     buckets: dict[str, list[float]] = {}
     for c in closes:
-        symbol = c.get("symbol", "")
-        sym = c.get("underlying", "")
-        conv = symbol_conviction.get(symbol)
-        if conv is None:
-            conv = underlying_conviction.get(sym)
-        if conv is None:
+        trade = entry_by_symbol.get(str(c.get("symbol") or ""))
+        if trade is None:
             continue
+        conv = float(trade.get("conviction") or 0.0)
         if conv < 0.7:
             bucket = "0.60-0.69"
         elif conv < 0.8:

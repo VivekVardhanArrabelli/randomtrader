@@ -29,7 +29,13 @@ from .candidates import (
     format_candidate_table,
     select_candidate_finalists,
 )
-from .db import AIDecisionRecord, AITradeLogger, expression_guidance_lines, format_trade_history
+from .db import (
+    AIDecisionRecord,
+    AITradeLogger,
+    PortfolioSnapshotRecord,
+    expression_guidance_lines,
+    format_trade_history,
+)
 from .executor import _execute_close, execute_trade, reconcile_pending_orders
 from .journal import ThesisJournal
 from .llm import api_key_env_name, infer_provider, resolve_api_key
@@ -71,6 +77,60 @@ def _within_trading_window(current: datetime) -> bool:
     no_trade_start = time(open_minutes // 60, open_minutes % 60, tzinfo=EASTERN_TZ)
     no_trade_end = time(close_minutes // 60, close_minutes % 60, tzinfo=EASTERN_TZ)
     return no_trade_start <= ct <= no_trade_end
+
+
+def _portfolio_snapshot_record(portfolio) -> PortfolioSnapshotRecord:
+    """Build a normalized end-of-cycle portfolio snapshot for reporting."""
+    positions: list[dict] = []
+    for pos in portfolio.option_positions:
+        positions.append(
+            {
+                "asset_type": "option",
+                "symbol": pos.symbol,
+                "underlying": pos.underlying,
+                "option_type": pos.option_type,
+                "strike": pos.strike,
+                "expiration": pos.expiration,
+                "qty": pos.qty,
+                "avg_entry_price": pos.avg_entry_price,
+                "current_price": pos.current_price,
+                "market_value": pos.market_value,
+                "unrealized_pl": pos.unrealized_pl,
+                "cost_basis": pos.cost_basis,
+                "pnl_pct": pos.pnl_pct,
+                "dte": pos.dte,
+                "risk_alert": pos.risk_alert,
+            }
+        )
+    for pos in portfolio.equity_positions:
+        positions.append(
+            {
+                "asset_type": "stock",
+                "symbol": pos.symbol,
+                "underlying": pos.symbol,
+                "qty": pos.qty,
+                "avg_entry_price": pos.avg_entry_price,
+                "current_price": pos.current_price,
+                "market_value": pos.market_value,
+                "unrealized_pl": pos.unrealized_pl,
+                "cost_basis": pos.cost_basis,
+                "pnl_pct": pos.pnl_pct,
+            }
+        )
+
+    return PortfolioSnapshotRecord(
+        timestamp=now_eastern(),
+        equity=portfolio.account.equity,
+        cash=portfolio.account.cash,
+        buying_power=portfolio.account.buying_power,
+        day_pl=portfolio.account.day_pl,
+        total_options_exposure=portfolio.total_options_exposure,
+        total_equity_exposure=portfolio.total_equity_exposure,
+        total_exposure=portfolio.total_exposure,
+        open_option_count=portfolio.open_option_count,
+        open_equity_count=portfolio.open_equity_count,
+        positions_json=json.dumps(positions),
+    )
 
 
 def _compute_bar_trends(bars: list[dict]) -> dict:
@@ -747,6 +807,7 @@ def run_cycle(
 
     # 11. Update the logged cycle with realized execution count.
     logger.update_decision_trade_count(decision_id, trades_executed)
+    logger.log_portfolio_snapshot(_portfolio_snapshot_record(portfolio))
 
     return trades_executed
 

@@ -89,18 +89,59 @@ class OptionPosition:
 
 
 @dataclass
+class EquityPosition:
+    symbol: str
+    qty: int
+    avg_entry_price: float
+    current_price: float
+    market_value: float
+    unrealized_pl: float
+    cost_basis: float
+
+    @property
+    def pnl_pct(self) -> float:
+        if self.cost_basis <= 0:
+            return 0.0
+        return self.unrealized_pl / self.cost_basis
+
+    def to_context_str(self) -> str:
+        side = "LONG" if self.qty >= 0 else "SHORT"
+        return (
+            f"{self.symbol} {side} qty={self.qty} "
+            f"entry=${self.avg_entry_price:.2f} current=${self.current_price:.2f} "
+            f"P&L=${self.unrealized_pl:.2f} ({self.pnl_pct:.1%})"
+        )
+
+
+@dataclass
 class PortfolioState:
     account: AccountSnapshot
     option_positions: list[OptionPosition]
-    equity_positions: list[dict]  # raw equity positions if any
+    equity_positions: list[EquityPosition]
 
     @property
     def total_options_exposure(self) -> float:
         return sum(abs(p.market_value) for p in self.option_positions)
 
     @property
+    def total_equity_exposure(self) -> float:
+        return sum(abs(p.market_value) for p in self.equity_positions)
+
+    @property
+    def total_exposure(self) -> float:
+        return self.total_options_exposure + self.total_equity_exposure
+
+    @property
     def open_option_count(self) -> int:
         return len(self.option_positions)
+
+    @property
+    def open_equity_count(self) -> int:
+        return len(self.equity_positions)
+
+    @property
+    def open_position_count(self) -> int:
+        return self.open_option_count + self.open_equity_count
 
     def to_context_str(self) -> str:
         lines = [
@@ -111,11 +152,20 @@ class PortfolioState:
             f"Options Exposure: ${self.total_options_exposure:,.2f} "
             f"({self.total_options_exposure / self.account.equity * 100:.1f}% of equity)"
             if self.account.equity > 0 else "",
+            f"Equity Exposure: ${self.total_equity_exposure:,.2f} "
+            f"({self.total_equity_exposure / self.account.equity * 100:.1f}% of equity)"
+            if self.account.equity > 0 else "",
+            f"Total Exposure: ${self.total_exposure:,.2f} "
+            f"({self.total_exposure / self.account.equity * 100:.1f}% of equity)"
+            if self.account.equity > 0 else "",
             f"Open Option Positions: {self.open_option_count}",
+            f"Open Equity Positions: {self.open_equity_count}",
         ]
-        if self.option_positions:
+        if self.option_positions or self.equity_positions:
             lines.append("\nCurrent Positions:")
             for pos in self.option_positions:
+                lines.append(f"  {pos.to_context_str()}")
+            for pos in self.equity_positions:
                 lines.append(f"  {pos.to_context_str()}")
         else:
             lines.append("\nNo open positions.")
@@ -137,7 +187,7 @@ def get_portfolio_state(alpaca: AlpacaClient) -> PortfolioState:
 
     raw_positions = alpaca.get_positions()
     option_positions: list[OptionPosition] = []
-    equity_positions: list[dict] = []
+    equity_positions: list[EquityPosition] = []
 
     for pos in raw_positions:
         asset_class = pos.get("asset_class", "").lower()
@@ -160,11 +210,21 @@ def get_portfolio_state(alpaca: AlpacaClient) -> PortfolioState:
                 )
             )
         else:
-            equity_positions.append(pos)
+            equity_positions.append(
+                EquityPosition(
+                    symbol=symbol,
+                    qty=int(float(pos.get("qty") or 0)),
+                    avg_entry_price=float(pos.get("avg_entry_price") or 0),
+                    current_price=float(pos.get("current_price") or 0),
+                    market_value=float(pos.get("market_value") or 0),
+                    unrealized_pl=float(pos.get("unrealized_pl") or 0),
+                    cost_basis=float(pos.get("cost_basis") or 0),
+                )
+            )
 
     log(
         f"portfolio: equity=${account.equity:,.2f} cash=${account.cash:,.2f} "
-        f"day_pl=${account.day_pl:,.2f} options={len(option_positions)}"
+        f"day_pl=${account.day_pl:,.2f} options={len(option_positions)} equities={len(equity_positions)}"
     )
     return PortfolioState(
         account=account,

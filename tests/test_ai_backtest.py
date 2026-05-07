@@ -12,6 +12,7 @@ from ai_trader.backtest import (
     PolygonCache,
     SimPosition,
     SimTrade,
+    _backtest_option_loss_streak_guard_reason,
     _decision_timestamps_for_day,
     _first_bar_at_or_after,
     _is_trading_day,
@@ -31,6 +32,8 @@ from ai_trader.backtest import (
     _rank_prefetch_contracts,
     _previous_trading_day,
     _session_intraday_bars_before,
+    _stock_symbol_notional_for_budget,
+    _summarize_decision_log,
     _ticker_price_metrics_as_of,
     _select_real_contract,
     _trading_days,
@@ -39,6 +42,7 @@ from ai_trader.backtest import (
     fetch_option_daily_bar,
     fetch_polygon_option_contracts,
     print_backtest_result,
+    save_backtest_result,
     save_debug_log,
 )
 from ai_trader.historical_cache import PolygonResponseStore
@@ -2065,6 +2069,110 @@ def test_backtest_result_decision_log():
     assert "Broad selloff continues" in serialized
 
 
+def test_summarize_decision_log_counts_skip_reasons():
+    summary = _summarize_decision_log([
+        {
+            "trades_proposed": [
+                {
+                    "status": "executed",
+                    "skip_reason": "",
+                },
+                {
+                    "status": "skipped",
+                    "skip_reason": "no contract found",
+                },
+                {
+                    "status": "skipped",
+                    "skip_reason": "last 3 closed option trades were losses; option entries require conviction >= 0.80",
+                },
+            ]
+        },
+        {
+            "trades_proposed": [
+                {
+                    "status": "skipped",
+                    "skip_reason": "no contract found",
+                },
+            ]
+        },
+    ])
+
+    assert summary["proposed"] == 4
+    assert summary["executed"] == 1
+    assert summary["skipped"] == 3
+    assert summary["guardrail_skips"] == 1
+    assert summary["skip_reasons"][0] == {"reason": "no contract found", "count": 2}
+
+
+def test_backtest_option_loss_streak_guard_blocks_marginal_options():
+    closed_trades = [
+        {"option_type": "call", "pnl": -1500.0},
+        {"option_type": "call", "pnl": -2590.0},
+        {"option_type": "call", "pnl": -2109.0},
+        {"option_type": "stock", "pnl": 47.70},
+    ]
+
+    reason = _backtest_option_loss_streak_guard_reason(
+        closed_trades,
+        conviction=0.75,
+    )
+
+    assert "closed option trades were losses" in reason
+
+
+def test_backtest_option_loss_streak_guard_allows_high_conviction():
+    closed_trades = [
+        {"option_type": "call", "pnl": -1500.0},
+        {"option_type": "call", "pnl": -2590.0},
+        {"option_type": "put", "pnl": -2109.0},
+    ]
+
+    assert _backtest_option_loss_streak_guard_reason(
+        closed_trades,
+        conviction=0.85,
+    ) == ""
+
+
+def test_stock_symbol_notional_for_budget_counts_existing_same_symbol_stock():
+    positions = [
+        SimPosition(
+            underlying="NVDA",
+            option_type="stock",
+            strike=0.0,
+            entry_date=date(2026, 5, 6),
+            expiry_date=date(2026, 8, 1),
+            entry_premium=206.0,
+            qty=22,
+            conviction=0.65,
+            reasoning="existing stock",
+        ),
+        SimPosition(
+            underlying="AVGO",
+            option_type="stock",
+            strike=0.0,
+            entry_date=date(2026, 5, 6),
+            expiry_date=date(2026, 8, 1),
+            entry_premium=420.0,
+            qty=10,
+            conviction=0.70,
+            reasoning="different stock",
+        ),
+        SimPosition(
+            underlying="NVDA",
+            option_type="call",
+            strike=220.0,
+            entry_date=date(2026, 5, 6),
+            expiry_date=date(2026, 5, 15),
+            entry_premium=5.0,
+            qty=1,
+            conviction=0.85,
+            reasoning="option should not count as stock notional",
+        ),
+    ]
+
+    assert _stock_symbol_notional_for_budget(positions, "NVDA", 207.0) == 4554.0
+
+
 # ---------------------------------------------------------------------------
 # save_debug_log
 # ---------------------------------------------------------------------------
@@ -2116,7 +2224,33 @@ def test_save_debug_log(tmp_path):
     assert "Executed" in content
     assert "SKIPPED" in content
     assert "no contract found" in content
+    assert "Decision summary: 2 proposed | 1 executed | 1 skipped" in content
     assert "$95,000" in content
+
+
+def test_save_backtest_result_includes_decision_summary(tmp_path):
+    r = BacktestResult(
+        decision_log=[
+            {
+                "trades_proposed": [
+                    {"status": "executed", "skip_reason": ""},
+                    {"status": "skipped", "skip_reason": "zero volume"},
+                ],
+            }
+        ],
+    )
+    out_path = tmp_path / "result.json"
+
+    save_backtest_result(r, out_path)
+
+    import json
+    data = json.loads(out_path.read_text())
+    assert data["decision_summary"]["proposed"] == 2
+    assert data["decision_summary"]["executed"] == 1
+    assert data["decision_summary"]["skipped"] == 1
+    assert data["decision_summary"]["skip_reasons"] == [
+        {"reason": "zero volume", "count": 1}
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,18 @@ def _execute_open_option(
     underlying = decision.underlying
     option_type = "call" if decision.action == "buy_call" else "put"
 
+    guard_reason = _option_loss_streak_guard_reason(logger, decision)
+    if guard_reason:
+        log(f"option risk check FAILED for {underlying}: {guard_reason}")
+        _log_option_decision_rejection(
+            logger=logger,
+            decision=decision,
+            option_type=option_type,
+            market_analysis=market_analysis,
+            status="risk_rejected",
+        )
+        return ExecutionResult(False, underlying, None, 0, 0.0, f"risk: {guard_reason}")
+
     underlying_price = _get_underlying_price(alpaca, underlying)
     if underlying_price <= 0:
         log(f"cannot get price for {underlying}")
@@ -271,6 +283,7 @@ def _execute_open_stock(
 ) -> ExecutionResult:
     """Open a new equity position."""
     symbol = decision.underlying.upper()
+    existing_position = _find_equity_position(portfolio.equity_positions, symbol)
     quote = _get_stock_quote(alpaca, symbol)
     ask = quote["ask"]
     mid = quote["mid"]
@@ -333,12 +346,24 @@ def _execute_open_stock(
         decision.risk_pct, decision.conviction,
     )
     requested_budget = portfolio.account.equity * effective_risk_pct
-    max_by_risk = size_for_risk_budget(requested_budget, limit_price)
+    existing_symbol_notional = (
+        _equity_position_notional(existing_position)
+        if existing_position is not None
+        else 0.0
+    )
+    remaining_symbol_budget = requested_budget - existing_symbol_notional
+    max_by_risk = size_for_risk_budget(remaining_symbol_budget, limit_price)
     if max_by_risk <= 0:
-        reason = (
-            f"requested risk budget too small for 1 share "
-            f"(${requested_budget:.2f} vs ${limit_price:.2f})"
-        )
+        if existing_symbol_notional > 0:
+            reason = (
+                f"existing {symbol} exposure already uses requested risk budget "
+                f"(${existing_symbol_notional:.2f} vs ${requested_budget:.2f})"
+            )
+        else:
+            reason = (
+                f"requested risk budget too small for 1 share "
+                f"(${requested_budget:.2f} vs ${limit_price:.2f})"
+            )
         log(f"stock risk check FAILED for {symbol}: {reason}")
         _log_stock_trade(
             logger=logger,
@@ -427,34 +452,16 @@ def _execute_close_option(
     market_analysis: str,
 ) -> ExecutionResult:
     """Close an existing options position."""
-    target = decision.target_symbol
-    position = None
-    if target:
-        position = next((p for p in portfolio.option_positions if p.symbol == target), None)
-    else:
-        matching = [
-            p for p in portfolio.option_positions
-            if p.underlying.upper() == decision.underlying.upper()
-        ]
-        if not matching:
-            return ExecutionResult(False, decision.underlying, None, 0, 0.0, "no matching position")
-        if len(matching) == 1:
-            position = matching[0]
-        else:
-            position = _select_close_candidate_from_reasoning(matching, decision.reasoning)
-            if position is None:
-                candidates = ", ".join(p.symbol for p in matching)
-                return ExecutionResult(
-                    False,
-                    decision.underlying,
-                    None,
-                    0,
-                    0.0,
-                    f"ambiguous close target for {decision.underlying}; candidates: {candidates}",
-                )
-
+    position, resolve_error = _resolve_option_close_position(decision, portfolio)
     if position is None:
-        return ExecutionResult(False, target or decision.underlying, None, 0, 0.0, "position not found")
+        return ExecutionResult(
+            False,
+            decision.target_symbol or decision.underlying,
+            None,
+            0,
+            0.0,
+            resolve_error or "position not found",
+        )
 
     existing_close = _find_open_order(alpaca, position.symbol, side="sell")
     if existing_close:
@@ -548,6 +555,48 @@ def _execute_close(
 ) -> ExecutionResult:
     """Backward-compatible alias for option close."""
     return _execute_close_option(alpaca, decision, portfolio, logger, market_analysis)
+
+
+def _resolve_option_close_position(
+    decision: TradeDecision,
+    portfolio: PortfolioState,
+):
+    target = (decision.target_symbol or "").strip()
+    if target:
+        for position in portfolio.option_positions:
+            if _option_position_matches_target(position, target):
+                return position, ""
+
+    matching = [
+        p for p in portfolio.option_positions
+        if p.underlying.upper() == decision.underlying.upper()
+    ]
+    if not matching:
+        return None, "no matching position"
+    if len(matching) == 1:
+        return matching[0], ""
+
+    position = _select_close_candidate_from_reasoning(matching, decision.reasoning)
+    if position is not None:
+        return position, ""
+
+    candidates = ", ".join(p.symbol for p in matching)
+    return None, f"ambiguous close target for {decision.underlying}; candidates: {candidates}"
+
+
+def _option_position_matches_target(position, target: str) -> bool:
+    target_symbol = _normalize_option_symbol_for_match(target)
+    position_symbol = _normalize_option_symbol_for_match(str(position.symbol))
+    if target_symbol and target_symbol == position_symbol:
+        return True
+    return target.upper() == str(position.underlying).upper()
+
+
+def _normalize_option_symbol_for_match(symbol: str) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if normalized.startswith("O:"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def _execute_close_stock(
@@ -760,6 +809,37 @@ def _extract_strike_hint(text: str) -> float | None:
     return None
 
 
+def _option_loss_streak_guard_reason(
+    logger: AITradeLogger,
+    decision: TradeDecision,
+) -> str:
+    lookback = int(config.OPTION_LOSS_STREAK_GUARD_LOOKBACK)
+    min_conviction = float(config.OPTION_LOSS_STREAK_GUARD_MIN_CONVICTION)
+    if lookback <= 0 or decision.conviction >= min_conviction:
+        return ""
+
+    recent_closes = logger.get_recent_closes(limit=max(lookback * 4, 10))
+    option_closes = [c for c in recent_closes if _close_record_is_option(c)]
+    if len(option_closes) < lookback:
+        return ""
+
+    streak = option_closes[:lookback]
+    if all(float(c.get("pnl") or 0.0) < 0 for c in streak):
+        return (
+            f"last {lookback} closed option trades were losses; "
+            f"option entries now require conviction >= {min_conviction:.2f}"
+        )
+    return ""
+
+
+def _close_record_is_option(record: dict) -> bool:
+    option_type = str(record.get("option_type") or "").strip().lower()
+    if option_type in {"call", "put"}:
+        return True
+    symbol = str(record.get("symbol") or "").upper()
+    return re.match(r"^(?:O:)?[A-Z]+[0-9]{6}[CP][0-9]{8}$", symbol) is not None
+
+
 def _log_close_option_trade(
     logger: AITradeLogger,
     position,
@@ -786,6 +866,35 @@ def _log_close_option_trade(
             reasoning=decision.reasoning,
             market_analysis=market_analysis,
             order_id=order_id,
+            status=status,
+            expression_profile=decision.expression_profile or "",
+        )
+    )
+
+
+def _log_option_decision_rejection(
+    logger: AITradeLogger,
+    decision: TradeDecision,
+    option_type: str,
+    market_analysis: str,
+    status: str,
+) -> None:
+    logger.log_trade(
+        AITradeRecord(
+            timestamp=now_eastern(),
+            symbol=decision.underlying,
+            underlying=decision.underlying,
+            option_type=option_type,
+            strike=0.0,
+            expiration="",
+            action=decision.action,
+            qty=0,
+            premium=0.0,
+            total_cost=0.0,
+            conviction=decision.conviction,
+            reasoning=decision.reasoning,
+            market_analysis=market_analysis,
+            order_id=None,
             status=status,
             expression_profile=decision.expression_profile or "",
         )
@@ -871,6 +980,21 @@ def _find_equity_position(
         if position.symbol.upper() == target:
             return position
     return None
+
+
+def _equity_position_notional(position: EquityPosition) -> float:
+    """Return the best available notional estimate for an equity position."""
+    by_market = abs(float(position.market_value or 0.0))
+    if by_market > 0:
+        return by_market
+    by_cost = abs(float(position.cost_basis or 0.0))
+    if by_cost > 0:
+        return by_cost
+    reference_price = max(
+        float(position.current_price or 0.0),
+        float(position.avg_entry_price or 0.0),
+    )
+    return abs(position.qty) * reference_price
 
 
 def check_and_close_risk_exits(

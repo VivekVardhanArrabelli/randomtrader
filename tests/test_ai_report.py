@@ -5,7 +5,13 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from ai_trader.db import AITradeLogger, AITradeRecord, PositionCloseRecord, AIDecisionRecord
+from ai_trader.db import (
+    AIDecisionRecord,
+    AITradeLogger,
+    AITradeRecord,
+    PortfolioSnapshotRecord,
+    PositionCloseRecord,
+)
 from ai_trader.report import compute_metrics
 
 
@@ -93,3 +99,185 @@ def test_profit_factor():
         # gross_profit = 1600, gross_loss = 300
         assert m.profit_factor is not None
         assert m.profit_factor > 1.0
+
+
+def test_compute_metrics_counts_legacy_decision_json_activity():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "legacy.db"
+        logger = AITradeLogger(db_path)
+        logger.log_decision(AIDecisionRecord(
+            timestamp=datetime(2026, 5, 1, 14, 24, 0),
+            market_analysis="legacy pending order",
+            news_summary="",
+            portfolio_state="",
+            decisions_json='[{"action":"buy_call","underlying":"AAPL"}]',
+            trades_executed=0,
+        ))
+
+        m = compute_metrics(db_path)
+
+        assert m.decision_cycles == 1
+        assert m.cycles_with_trades == 1
+
+
+def test_compute_metrics_counts_nested_trade_activity():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "nested.db"
+        logger = AITradeLogger(db_path)
+        logger.log_decision(AIDecisionRecord(
+            timestamp=datetime(2026, 5, 1, 14, 24, 0),
+            market_analysis="newer decision format",
+            news_summary="",
+            portfolio_state="",
+            decisions_json='{"trades":[{"action":"buy_put","underlying":"SPY","risk_pct":0.06}]}',
+            trades_executed=0,
+        ))
+
+        m = compute_metrics(db_path)
+
+        assert m.cycles_with_trades == 1
+        assert m.avg_risk_pct == 0.06
+
+
+def test_compute_metrics_uses_entry_conviction_for_closed_pnl():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "entry_conviction.db"
+        logger = AITradeLogger(db_path)
+        now = datetime(2026, 5, 1, 10, 0, 0)
+        symbol = "AAPL260515C00150000"
+
+        logger.log_trade(AITradeRecord(
+            timestamp=now,
+            symbol=symbol,
+            underlying="AAPL",
+            option_type="call",
+            strike=150.0,
+            expiration="2026-05-15",
+            action="buy_call",
+            qty=1,
+            premium=5.0,
+            total_cost=500.0,
+            conviction=0.65,
+            reasoning="entry decision",
+            market_analysis="test",
+            order_id="entry-order",
+            status="filled",
+        ))
+        logger.log_trade(AITradeRecord(
+            timestamp=now,
+            symbol=symbol,
+            underlying="AAPL",
+            option_type="call",
+            strike=150.0,
+            expiration="2026-05-15",
+            action="close_position",
+            qty=1,
+            premium=5.0,
+            total_cost=0.0,
+            conviction=0.95,
+            reasoning="exit confidence should not calibrate entry quality",
+            market_analysis="test",
+            order_id="close-order",
+            status="filled",
+        ))
+        logger.log_position_close(PositionCloseRecord(
+            timestamp=now,
+            symbol=symbol,
+            underlying="AAPL",
+            qty=1,
+            entry_premium=5.0,
+            exit_premium=3.0,
+            pnl=-200.0,
+            reason="stop_loss",
+        ))
+
+        m = compute_metrics(db_path)
+
+        assert m.avg_conviction == 0.65
+        assert m.conviction_vs_outcome == [(0.65, -200.0)]
+        assert m.calls_traded == 1
+
+
+def test_compute_metrics_loads_latest_portfolio_snapshot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "snapshot.db"
+        logger = AITradeLogger(db_path)
+        logger.log_portfolio_snapshot(PortfolioSnapshotRecord(
+            timestamp=datetime(2026, 5, 6, 15, 30, 0),
+            equity=95_000.0,
+            cash=88_000.0,
+            buying_power=176_000.0,
+            day_pl=125.0,
+            total_options_exposure=0.0,
+            total_equity_exposure=4_500.0,
+            total_exposure=4_500.0,
+            open_option_count=0,
+            open_equity_count=1,
+            positions_json=(
+                '[{"asset_type":"stock","symbol":"NVDA","qty":22,'
+                '"market_value":4500.0,"unrealized_pl":125.0,"pnl_pct":0.028}]'
+            ),
+        ))
+
+        m = compute_metrics(db_path)
+
+        snapshot = m.latest_portfolio_snapshot
+        assert snapshot is not None
+        assert snapshot["equity"] == 95_000.0
+        assert snapshot["total_exposure"] == 4_500.0
+        assert snapshot["open_equity_count"] == 1
+        assert snapshot["positions"][0]["symbol"] == "NVDA"
+
+
+def test_compute_metrics_reports_active_option_loss_guardrail():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "option_guard.db"
+        logger = AITradeLogger(db_path)
+        now = datetime(2026, 5, 6, 10, 0, 0)
+        for symbol in (
+            "LLY260508C00950000",
+            "TT260515C00490000",
+            "W260515C00065000",
+        ):
+            logger.log_position_close(PositionCloseRecord(
+                timestamp=now,
+                symbol=symbol,
+                underlying=symbol[:3].rstrip("0123456789"),
+                qty=1,
+                entry_premium=5.0,
+                exit_premium=3.0,
+                pnl=-200.0,
+                reason="option loss",
+            ))
+
+        m = compute_metrics(db_path)
+
+        assert m.option_loss_streak == 3
+        assert m.option_guard_active
+        assert m.option_guard_min_conviction == 0.80
+
+
+def test_compute_metrics_counts_llm_failure_cycles():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "llm_failures.db"
+        logger = AITradeLogger(db_path)
+        now = datetime(2026, 5, 1, 10, 0, 0)
+        for analysis in (
+            "DeepSeek response parse error: Unterminated string",
+            "DeepSeek error: read timed out",
+            "Broad market constructive; no trades.",
+        ):
+            logger.log_decision(AIDecisionRecord(
+                timestamp=now,
+                market_analysis=analysis,
+                news_summary="",
+                portfolio_state="",
+                decisions_json="[]",
+                trades_executed=0,
+            ))
+
+        m = compute_metrics(db_path)
+
+        assert m.llm_failure_cycles == 2
+        assert m.llm_parse_failures == 1
+        assert m.llm_api_failures == 1
