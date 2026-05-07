@@ -2677,10 +2677,20 @@ def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):
 
     with sqlite3.connect(log_db) as conn:
         row = conn.execute(
-            "SELECT underlying, direction, conviction, status FROM thesis_journal"
+            """
+            SELECT underlying, direction, conviction, status, created_at, updated_at
+            FROM thesis_journal
+            """
         ).fetchone()
 
-    assert row == ("AAPL", "bullish", 0.72, "developing")
+    assert row == (
+        "AAPL",
+        "bullish",
+        0.72,
+        "developing",
+        decision_time.isoformat(),
+        decision_time.isoformat(),
+    )
 
 
 def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch):

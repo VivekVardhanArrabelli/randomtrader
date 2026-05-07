@@ -3279,6 +3279,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 bar_minutes=bt_config.signal_bar_minutes,
             )
 
+            if journal:
+                journal.set_time(decision_time)
             journal_context = journal.to_context_str() if journal else ""
             trade_history_context = ""
             annotated_trades = list(closed_trades)

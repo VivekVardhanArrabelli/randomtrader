@@ -63,6 +63,8 @@ def test_trade_tool_schema():
     assert "market_analysis" in schema["properties"]
     assert "trades" in schema["properties"]
     assert "thesis_updates" in schema["properties"]
+    thesis_props = schema["properties"]["thesis_updates"]["items"]["properties"]
+    assert thesis_props["thesis"]["minLength"] == 1
     trade_props = schema["properties"]["trades"]["items"]["properties"]
     assert trade_props["risk_pct"]["maximum"] == 0.40
     assert "contract_symbol" in trade_props
@@ -156,6 +158,59 @@ def test_run_packet_retries_once_on_adapter_error():
 
     assert adapter.calls == 2
     assert analysis.analysis == "ok"
+
+
+def test_parse_response_repairs_blank_new_thesis_from_trade_reasoning():
+    brain = TradingBrain(api_key="fake")
+
+    analysis = brain._parse_response(
+        LLMCompletion(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            tool_calls=[
+                ToolCall(
+                    name="submit_trade_decisions",
+                    input={
+                        "market_analysis": (
+                            "Indices rallying. AAPL earnings beat faded "
+                            "premarket pop but uptrend intact."
+                        ),
+                        "thesis_updates": [
+                            {
+                                "id": None,
+                                "underlying": "AAPL",
+                                "direction": "bullish",
+                                "thesis": "",
+                                "conviction": 0.7,
+                                "status": "ready",
+                                "new_observation": "",
+                            }
+                        ],
+                        "trades": [
+                            {
+                                "action": "buy_call",
+                                "underlying": "AAPL",
+                                "conviction": 0.7,
+                                "risk_pct": 0.1,
+                                "reasoning": (
+                                    "Earnings beat with positive trend and "
+                                    "favorable short-term call entry."
+                                ),
+                            }
+                        ],
+                    },
+                )
+            ],
+            raw_response={},
+        )
+    )
+
+    assert len(analysis.thesis_updates) == 1
+    update = analysis.thesis_updates[0]
+    assert update.thesis == (
+        "Earnings beat with positive trend and favorable short-term call entry."
+    )
+    assert update.new_observation == update.thesis
 
 
 def test_run_packet_retries_once_on_missing_tool_call():

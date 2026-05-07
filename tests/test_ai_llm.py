@@ -56,6 +56,141 @@ def test_create_adapter_selects_anthropic_from_provider():
     assert adapter.provider == "anthropic"
 
 
+def test_openai_chat_adapter_forces_named_tool_choice():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def __init__(self):
+            self.last_json = None
+
+        def post(self, url, headers, json, timeout):
+            self.last_json = json
+            return DummyResponse(
+                {
+                    "id": "chat_123",
+                    "model": json["model"],
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "submit_trade_decisions",
+                                            "arguments": (
+                                                '{"market_analysis":"ok",'
+                                                '"thesis_updates":[],"trades":[]}'
+                                            ),
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    session = DummySession()
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        provider="openai",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-4.1",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert session.last_json["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_trade_decisions"},
+    }
+    assert completion.tool_calls[0].input["market_analysis"] == "ok"
+
+
+def test_deepseek_chat_adapter_omits_tool_choice():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def __init__(self):
+            self.last_json = None
+
+        def post(self, url, headers, json, timeout):
+            self.last_json = json
+            return DummyResponse(
+                {
+                    "id": "chat_123",
+                    "model": json["model"],
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "submit_trade_decisions",
+                                            "arguments": (
+                                                '{"market_analysis":"ok",'
+                                                '"thesis_updates":[],"trades":[]}'
+                                            ),
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    session = DummySession()
+    adapter = OpenAIAdapter(
+        api_key="test-deepseek-key",
+        base_url="https://api.deepseek.com",
+        provider="deepseek",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="deepseek-v4-pro",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.0,
+    )
+
+    assert "tool_choice" not in session.last_json
+    assert completion.tool_calls[0].input["market_analysis"] == "ok"
+
+
 def test_resolved_llm_model_prefers_env(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
 

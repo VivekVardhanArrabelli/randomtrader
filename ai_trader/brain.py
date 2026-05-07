@@ -270,6 +270,7 @@ TRADE_TOOL = {
                         },
                         "thesis": {
                             "type": "string",
+                            "minLength": 1,
                             "description": "The core thesis in 1 short plain-text sentence. No embedded quotes.",
                         },
                         "conviction": {
@@ -444,6 +445,72 @@ def _parse_range(
     except (TypeError, ValueError):
         return None
     return (min(low, high), max(low, high))
+
+
+def _compact_plain_text(value: object, *, max_chars: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _fallback_thesis_text(
+    update: ThesisUpdate,
+    trades: list[TradeDecision],
+    market_analysis: str,
+) -> str:
+    if update.new_observation:
+        return _compact_plain_text(update.new_observation)
+
+    update_underlying = update.underlying.upper()
+    for trade in trades:
+        if (
+            trade.underlying.upper() == update_underlying
+            and trade.action in {"buy_call", "buy_put"}
+            and trade.reasoning
+        ):
+            return _compact_plain_text(trade.reasoning)
+
+    if update_underlying and update_underlying in market_analysis.upper():
+        return _compact_plain_text(market_analysis)
+    return ""
+
+
+def _repair_blank_new_theses(
+    updates: list[ThesisUpdate],
+    trades: list[TradeDecision],
+    market_analysis: str,
+) -> list[ThesisUpdate]:
+    repaired: list[ThesisUpdate] = []
+    for update in updates:
+        if update.id or update.thesis.strip():
+            repaired.append(update)
+            continue
+
+        thesis = _fallback_thesis_text(update, trades, market_analysis)
+        if not thesis:
+            log(
+                "journal update skipped: blank new thesis "
+                f"for {update.underlying or '?'}"
+            )
+            continue
+
+        repaired.append(
+            ThesisUpdate(
+                id=update.id,
+                underlying=update.underlying,
+                direction=update.direction,
+                thesis=thesis,
+                conviction=update.conviction,
+                status=update.status,
+                new_observation=update.new_observation or thesis,
+            )
+        )
+        log(
+            "journal update repaired: blank new thesis "
+            f"for {update.underlying or '?'}"
+        )
+    return repaired
 
 
 class TradingBrain:
@@ -689,12 +756,6 @@ class TradingBrain:
                 data = tool_call.input
                 analysis = data.get("market_analysis", "")
 
-                # Parse thesis updates
-                raw_theses = data.get("thesis_updates", [])
-                thesis_updates = parse_thesis_updates(raw_theses)
-                if thesis_updates:
-                    log(f"journal updates: {len(thesis_updates)} theses")
-
                 # Parse trades
                 raw_trades = data.get("trades", [])
                 trades = []
@@ -753,6 +814,17 @@ class TradingBrain:
                     )
 
                 log(f"LLM analysis complete: {len(trades)} actionable trades")
+                # Parse thesis updates after trades so blank new theses can be
+                # repaired from same-symbol trade reasoning when available.
+                raw_theses = data.get("thesis_updates", [])
+                thesis_updates = _repair_blank_new_theses(
+                    parse_thesis_updates(raw_theses),
+                    trades,
+                    analysis,
+                )
+                if thesis_updates:
+                    log(f"journal updates: {len(thesis_updates)} theses")
+
                 return MarketAnalysis(
                     analysis=analysis, trades=trades, thesis_updates=thesis_updates,
                 )
