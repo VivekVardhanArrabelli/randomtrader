@@ -47,7 +47,7 @@ intelligence shows up in the trades it chooses.
 The repo has moved materially beyond the original prototype.
 
 - live trading uses Alpaca
-- historical options backtesting now defaults to Theta Data
+- historical options backtesting defaults to Polygon, with Theta available for deliberate comparisons
 - historical news and equity backfill still use Polygon
 - LLM access is provider-agnostic
 - decision packets can be logged and replayed
@@ -71,8 +71,8 @@ This is a credible positive baseline, not proof of robust production alpha.
 
 ```text
 Alpaca News / Market Data / Options Chain
-Theta Historical Options Data (backtests)
-Polygon Historical News / Equity Data
+Polygon Historical News / Equity / Options Data
+Theta Historical Options Data (optional comparisons)
         │
         ▼
 Deterministic Retrieval + Enrichment + Candidate Triage
@@ -243,8 +243,8 @@ Promotion rule:
 
 ### Historical Backtesting
 
-- Theta Data is the default historical options provider for backtests
-- Polygon is still used for historical news and equity bars
+- Polygon is the default historical provider for news, equity bars, and options
+- Theta Data is available for explicit historical options comparison runs
 - the repo supports persistent historical caching and offline backtest mode
 - the first cold historical materialization can still be slow because unique
   option requests must be fetched once
@@ -272,13 +272,15 @@ Configure the keys you actually use:
 
 - `ALPACA_API_KEY`
 - `ALPACA_API_SECRET`
-- `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`
+- `DEEPSEEK_API_KEY` for the unattended campaign LLM path
+- `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` for intentional comparisons
 - `POLYGON_API_KEY` for historical news/equity backfills used by backtests
-- a local Theta Terminal for historical options backtests
+- a local Theta Terminal only when explicitly testing `HISTORICAL_OPTIONS_PROVIDER=theta`
 
-The default provider/model path in this repo is now `openai/gpt-5.4`. Override
-`LLM_MODEL` or `LLM_PROVIDER` only when you intentionally want a different
-comparison target.
+The default provider/model path in this repo is now `deepseek/deepseek-v4-pro`.
+Override `LLM_MODEL` or `LLM_PROVIDER` only when you intentionally want a
+different comparison target. Historical options backtests default to Polygon;
+set `HISTORICAL_OPTIONS_PROVIDER=theta` only for a deliberate Theta run.
 
 ## Basic Commands
 
@@ -324,7 +326,7 @@ python -m ai_trader.backtest --start 2026-01-20 --end 2026-02-13 --prepare-data
 Replay logged packets:
 
 ```bash
-python -m ai_trader.replay --limit 25 --provider openai --model gpt-5.4 --json
+python -m ai_trader.replay --limit 25 --provider deepseek --model deepseek-v4-pro --json
 ```
 
 Experiment suite outputs land under `ai_trader/logs/experiments/` by default and

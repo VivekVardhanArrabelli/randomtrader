@@ -528,8 +528,14 @@ class TradingBrain:
             system_prompt=SYSTEM_PROMPT,
             user_message=user_message,
             tool=TRADE_TOOL,
-            max_tokens=config.LLM_MAX_TOKENS,
-            temperature=config.LLM_TEMPERATURE,
+            max_tokens=config.resolved_llm_max_tokens(
+                model=self.model,
+                provider=self.provider,
+            ),
+            temperature=config.resolved_llm_temperature(
+                model=self.model,
+                provider=self.provider,
+            ),
             contexts={
                 "portfolio_context": portfolio_context,
                 "candidate_context": candidate_context,

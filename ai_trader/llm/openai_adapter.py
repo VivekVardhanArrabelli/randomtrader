@@ -250,16 +250,16 @@ def _should_retry_status(status_code: int) -> bool:
 
 
 class OpenAIAdapter:
-    provider = "openai"
-
     def __init__(
         self,
         api_key: str,
         *,
         base_url: str = "https://api.openai.com/v1",
+        provider: str = "openai",
         session: requests.Session | None = None,
     ) -> None:
         self.api_key = api_key
+        self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
 

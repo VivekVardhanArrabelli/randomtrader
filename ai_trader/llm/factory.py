@@ -10,6 +10,7 @@ from .types import LLMAdapter
 
 _PROVIDER_API_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
     "openai": "OPENAI_API_KEY",
 }
 
@@ -27,6 +28,8 @@ def infer_provider(model: str | None = None, provider: str | None = None) -> str
     model_name = (model or "").strip().lower()
     if model_name.startswith("claude"):
         return "anthropic"
+    if model_name.startswith("deepseek"):
+        return "deepseek"
     if model_name.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
         return "openai"
 
@@ -66,6 +69,17 @@ def create_adapter(
 
     if resolved_provider == "anthropic":
         return AnthropicAdapter(api_key=resolved_api_key)
+    if resolved_provider == "deepseek":
+        return OpenAIAdapter(
+            api_key=resolved_api_key,
+            base_url=(
+                base_url
+                or os.environ.get("DEEPSEEK_BASE_URL")
+                or os.environ.get("LLM_BASE_URL")
+                or "https://api.deepseek.com"
+            ),
+            provider="deepseek",
+        )
     if resolved_provider == "openai":
         return OpenAIAdapter(
             api_key=resolved_api_key,
