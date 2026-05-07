@@ -79,6 +79,45 @@ def test_previous_trading_day_skips_weekend():
     assert _previous_trading_day(date(2025, 1, 7)) == date(2025, 1, 6)  # Tuesday -> Monday
 
 
+def test_run_backtest_uses_campaign_default_deepseek_posture(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    captured: dict[str, str] = {}
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            captured["provider"] = kwargs["provider"]
+            captured["model"] = kwargs["model"]
+
+        def run(self, **kwargs):  # pragma: no cover - weekend window has no decisions
+            raise AssertionError("weekend backtest should not run decisions")
+
+    def fake_resolve_api_key(provider, api_key=None):
+        captured["api_key_provider"] = provider
+        return "test-deepseek"
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "resolve_api_key", fake_resolve_api_key)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=date(2025, 1, 4),
+            end_date=date(2025, 1, 5),
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert result.trades == []
+    assert captured == {
+        "api_key_provider": "deepseek",
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+    }
+
+
 def test_trading_days_skip_nyse_holidays():
     days = _trading_days(date(2025, 12, 24), date(2025, 12, 26))
 

@@ -63,10 +63,16 @@ def test_resolved_llm_model_prefers_env(monkeypatch):
     assert config.resolved_llm_model("o4-mini") == "o4-mini"
 
 
-def test_default_llm_model_is_openai_family(monkeypatch):
+def test_default_llm_posture_is_deepseek_campaign_default(monkeypatch):
     monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
 
-    assert config.resolved_llm_model() == "gpt-5.4"
+    assert config.LLM_PROVIDER == "deepseek"
+    assert config.resolved_llm_model() == "deepseek-v4-pro"
+    assert infer_provider(
+        model=config.resolved_llm_model(),
+        provider=config.LLM_PROVIDER,
+    ) == "deepseek"
 
 
 def test_resolved_llm_max_tokens_uses_deepseek_budget(monkeypatch):

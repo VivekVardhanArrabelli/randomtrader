@@ -107,8 +107,8 @@ HISTORICAL_OPTIONS_PROVIDER = "polygon"  # theta / polygon
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
-LLM_PROVIDER = ""                 # infer from model unless overridden
-LLM_MODEL = "gpt-5.4"
+LLM_PROVIDER = "deepseek"         # unattended campaign default unless overridden
+LLM_MODEL = "deepseek-v4-pro"
 LLM_MAX_TOKENS = 4096
 DEEPSEEK_LLM_MAX_TOKENS = 8192    # DeepSeek Pro uses completion budget for reasoning + JSON
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading
