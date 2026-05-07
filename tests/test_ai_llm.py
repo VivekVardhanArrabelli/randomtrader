@@ -15,6 +15,7 @@ def test_infer_provider_from_model_prefixes(monkeypatch):
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
 
     assert infer_provider(model="claude-opus-4-6") == "anthropic"
+    assert infer_provider(model="deepseek-v4-pro") == "deepseek"
     assert infer_provider(model="gpt-5") == "openai"
     assert infer_provider(model="o4-mini") == "openai"
 
@@ -33,6 +34,18 @@ def test_create_adapter_selects_openai_from_model(monkeypatch):
     assert adapter.base_url == "https://example.com/v1"
 
 
+def test_create_adapter_selects_deepseek_from_provider():
+    adapter = create_adapter(
+        provider="deepseek",
+        api_key="test-deepseek-key",
+        base_url="https://deepseek.example",
+    )
+
+    assert isinstance(adapter, OpenAIAdapter)
+    assert adapter.provider == "deepseek"
+    assert adapter.base_url == "https://deepseek.example"
+
+
 def test_create_adapter_selects_anthropic_from_provider():
     adapter = create_adapter(
         provider="anthropic",
@@ -43,6 +56,141 @@ def test_create_adapter_selects_anthropic_from_provider():
     assert adapter.provider == "anthropic"
 
 
+def test_openai_chat_adapter_forces_named_tool_choice():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def __init__(self):
+            self.last_json = None
+
+        def post(self, url, headers, json, timeout):
+            self.last_json = json
+            return DummyResponse(
+                {
+                    "id": "chat_123",
+                    "model": json["model"],
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "submit_trade_decisions",
+                                            "arguments": (
+                                                '{"market_analysis":"ok",'
+                                                '"thesis_updates":[],"trades":[]}'
+                                            ),
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    session = DummySession()
+    adapter = OpenAIAdapter(
+        api_key="test-openai-key",
+        base_url="https://example.com/v1",
+        provider="openai",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="gpt-4.1",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.2,
+    )
+
+    assert session.last_json["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_trade_decisions"},
+    }
+    assert completion.tool_calls[0].input["market_analysis"] == "ok"
+
+
+def test_deepseek_chat_adapter_omits_tool_choice():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def __init__(self):
+            self.last_json = None
+
+        def post(self, url, headers, json, timeout):
+            self.last_json = json
+            return DummyResponse(
+                {
+                    "id": "chat_123",
+                    "model": json["model"],
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "submit_trade_decisions",
+                                            "arguments": (
+                                                '{"market_analysis":"ok",'
+                                                '"thesis_updates":[],"trades":[]}'
+                                            ),
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    session = DummySession()
+    adapter = OpenAIAdapter(
+        api_key="test-deepseek-key",
+        base_url="https://api.deepseek.com",
+        provider="deepseek",
+        session=session,
+    )
+
+    completion = adapter.complete_structured(
+        model="deepseek-v4-pro",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.0,
+    )
+
+    assert "tool_choice" not in session.last_json
+    assert completion.tool_calls[0].input["market_analysis"] == "ok"
+
+
 def test_resolved_llm_model_prefers_env(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
 
@@ -50,10 +198,69 @@ def test_resolved_llm_model_prefers_env(monkeypatch):
     assert config.resolved_llm_model("o4-mini") == "o4-mini"
 
 
-def test_default_llm_model_is_openai_family(monkeypatch):
+def test_default_llm_posture_is_deepseek_campaign_default(monkeypatch):
     monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
 
-    assert config.resolved_llm_model() == "gpt-5.4"
+    assert config.LLM_PROVIDER == "deepseek"
+    assert config.resolved_llm_model() == "deepseek-v4-pro"
+    assert infer_provider(
+        model=config.resolved_llm_model(),
+        provider=config.LLM_PROVIDER,
+    ) == "deepseek"
+
+
+def test_resolved_llm_max_tokens_uses_deepseek_budget(monkeypatch):
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("DEEPSEEK_LLM_MAX_TOKENS", raising=False)
+
+    assert config.resolved_llm_max_tokens(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 8192
+    assert config.resolved_llm_max_tokens(
+        model="gpt-5.4",
+        provider="openai",
+    ) == 4096
+
+
+def test_resolved_llm_max_tokens_allows_explicit_override(monkeypatch):
+    monkeypatch.setenv("LLM_MAX_TOKENS", "6000")
+
+    assert config.resolved_llm_max_tokens(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 6000
+
+
+def test_resolved_llm_temperature_uses_deepseek_replay_default(monkeypatch):
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+    monkeypatch.delenv("DEEPSEEK_LLM_TEMPERATURE", raising=False)
+
+    assert config.resolved_llm_temperature(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 0.0
+    assert config.resolved_llm_temperature(
+        model="gpt-5.4",
+        provider="openai",
+    ) == 0.3
+
+
+def test_resolved_llm_temperature_allows_provider_and_global_override(monkeypatch):
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+    monkeypatch.setenv("DEEPSEEK_LLM_TEMPERATURE", "0.15")
+
+    assert config.resolved_llm_temperature(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 0.15
+
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.25")
+    assert config.resolved_llm_temperature(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 0.25
 
 
 def test_trading_brain_defaults_to_resolved_model(monkeypatch):

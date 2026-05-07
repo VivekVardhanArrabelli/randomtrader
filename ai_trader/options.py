@@ -231,7 +231,7 @@ class OptionContract:
             if age_seconds < 60:
                 parts.append(f"quote_age={int(age_seconds)}s")
             else:
-                parts.append(f"quote_age={int(age_seconds // 60)}m")
+                parts.append(f"quote_age={int(age_seconds // 60)}min")
         return " ".join(parts)
 
 

@@ -29,9 +29,10 @@ class ThesisEntry:
     updated_at: datetime
     cycles_observed: int = 1        # how many cycles this thesis has been tracked
 
-    def to_context_str(self) -> str:
+    def to_context_str(self, reference_time: datetime | None = None) -> str:
         obs = "; ".join(self.key_observations[-5:]) if self.key_observations else "none yet"
-        age = (now_eastern() - self.created_at).total_seconds() / 3600
+        current_time = reference_time or now_eastern()
+        age = (current_time - self.created_at).total_seconds() / 3600
         return (
             f"[{self.id}] {self.underlying} {self.direction.upper()} "
             f"(conviction={self.conviction:.2f}, status={self.status}, "
@@ -163,29 +164,40 @@ class ThesisJournal:
     def apply_updates(self, updates: list[ThesisUpdate]) -> None:
         """Apply LLM's journal updates."""
         self.pruned_theses = []  # reset for this cycle
-        now = now_eastern()
+        now = self._now()
         for u in updates:
+            thesis_text = _compact_text(u.thesis)
+            observation_text = _compact_text(u.new_observation)
             if u.id and u.id in self.entries:
                 entry = self.entries[u.id]
                 entry.conviction = u.conviction
                 entry.status = u.status
-                entry.thesis = u.thesis or entry.thesis
-                entry.direction = u.direction or entry.direction
-                if u.new_observation:
-                    entry.key_observations.append(u.new_observation)
+                entry.thesis = thesis_text or entry.thesis
+                entry.direction = _compact_text(u.direction) or entry.direction
+                if observation_text:
+                    entry.key_observations.append(observation_text)
                 entry.updated_at = now
                 entry.cycles_observed += 1
                 self._save_entry(entry)
                 log(f"journal: updated [{entry.id}] {entry.underlying} -> {entry.status} ({entry.conviction:.2f})")
             else:
+                underlying = _compact_text(u.underlying).upper()
+                if not thesis_text:
+                    thesis_text = observation_text
+                if not underlying or not thesis_text:
+                    log(
+                        "journal: skipped blank thesis update "
+                        f"for {underlying or '?'}"
+                    )
+                    continue
                 new_id = f"thesis-{self._next_id}"
                 self._next_id += 1
-                obs = [u.new_observation] if u.new_observation else []
+                obs = [observation_text] if observation_text else []
                 entry = ThesisEntry(
                     id=new_id,
-                    underlying=u.underlying,
-                    direction=u.direction,
-                    thesis=u.thesis,
+                    underlying=underlying,
+                    direction=_compact_text(u.direction) or "neutral",
+                    thesis=thesis_text,
                     conviction=u.conviction,
                     status=u.status,
                     key_observations=obs,
@@ -253,6 +265,7 @@ class ThesisJournal:
             return "No active theses. You can start developing new ones based on the news."
 
         parts: list[str] = []
+        reference_time = self._now()
 
         if active:
             active.sort(key=lambda e: e.conviction, reverse=True)
@@ -265,7 +278,7 @@ class ThesisJournal:
                 header = f"Active theses ({len(active)}, showing top {len(top)} in detail):{cap_note}"
                 lines = [header]
                 for entry in top:
-                    lines.append(entry.to_context_str())
+                    lines.append(entry.to_context_str(reference_time=reference_time))
                 lines.append(f"--- {len(rest)} lower-priority theses (summary only) ---")
                 for entry in rest:
                     lines.append(entry.to_summary_str())
@@ -273,7 +286,7 @@ class ThesisJournal:
             else:
                 lines = [f"Active theses ({len(active)}):{cap_note}"]
                 for entry in active:
-                    lines.append(entry.to_context_str())
+                    lines.append(entry.to_context_str(reference_time=reference_time))
                 parts.append("\n\n".join(lines))
         else:
             parts.append("No active theses. You can start developing new ones based on the news.")
@@ -310,3 +323,7 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
             )
         )
     return updates
+
+
+def _compact_text(value: object) -> str:
+    return " ".join(str(value or "").split())

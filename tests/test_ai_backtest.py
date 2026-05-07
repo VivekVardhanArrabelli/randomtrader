@@ -38,8 +38,10 @@ from ai_trader.backtest import (
     fetch_historical_daily_bars_range,
     fetch_option_daily_bar,
     fetch_polygon_option_contracts,
+    backtest_result_to_dict,
     print_backtest_result,
     save_debug_log,
+    summarize_decisions,
 )
 from ai_trader.historical_cache import PolygonResponseStore
 from ai_trader.journal import ThesisUpdate
@@ -69,6 +71,45 @@ def test_trading_days_single():
 def test_previous_trading_day_skips_weekend():
     assert _previous_trading_day(date(2025, 1, 6)) == date(2025, 1, 3)  # Monday -> Friday
     assert _previous_trading_day(date(2025, 1, 7)) == date(2025, 1, 6)  # Tuesday -> Monday
+
+
+def test_run_backtest_uses_campaign_default_deepseek_posture(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    captured: dict[str, str] = {}
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            captured["provider"] = kwargs["provider"]
+            captured["model"] = kwargs["model"]
+
+        def run(self, **kwargs):  # pragma: no cover - weekend window has no decisions
+            raise AssertionError("weekend backtest should not run decisions")
+
+    def fake_resolve_api_key(provider, api_key=None):
+        captured["api_key_provider"] = provider
+        return "test-deepseek"
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "resolve_api_key", fake_resolve_api_key)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=date(2025, 1, 4),
+            end_date=date(2025, 1, 5),
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert result.trades == []
+    assert captured == {
+        "api_key_provider": "deepseek",
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+    }
 
 
 def test_trading_days_skip_nyse_holidays():
@@ -2065,6 +2106,68 @@ def test_backtest_result_decision_log():
     assert "Broad selloff continues" in serialized
 
 
+def test_backtest_result_to_dict_includes_period_provider_and_decision_summary():
+    r = BacktestResult(
+        start_date=date(2025, 1, 6),
+        end_date=date(2025, 1, 10),
+        llm_provider="deepseek",
+        llm_model="deepseek-v4-pro",
+        llm_error_cycles=1,
+        llm_failure_days=1,
+        decision_log=[
+            {
+                "trades_proposed": [
+                    {"status": "executed", "skip_reason": ""},
+                    {"status": "skipped", "skip_reason": "no liquid contracts after filters"},
+                    {"status": "skipped", "skip_reason": "risk: daily loss limit"},
+                ],
+            }
+        ],
+    )
+
+    payload = backtest_result_to_dict(r)
+
+    assert payload["start_date"] == "2025-01-06"
+    assert payload["end_date"] == "2025-01-10"
+    assert payload["llm_provider"] == "deepseek"
+    assert payload["llm_model"] == "deepseek-v4-pro"
+    assert payload["decision_summary"] == {
+        "decision_points": 1,
+        "proposed": 3,
+        "executed": 1,
+        "skipped": 2,
+        "dropped": 0,
+        "llm_error_cycles": 1,
+        "llm_failure_days": 1,
+        "guardrail_skips": 1,
+        "skip_reasons": [
+            {"reason": "no liquid contracts after filters", "count": 1},
+            {"reason": "risk: daily loss limit", "count": 1},
+        ],
+        "drop_reasons": [],
+    }
+
+
+def test_summarize_decisions_counts_dropped_trades():
+    r = BacktestResult(
+        decision_log=[
+            {
+                "trades_proposed": [
+                    {"status": "dropped", "drop_reason": "parse failure"},
+                    {"status": "unknown", "skip_reason": "no contract found"},
+                ],
+            }
+        ],
+    )
+
+    summary = summarize_decisions(r)
+
+    assert summary["proposed"] == 2
+    assert summary["skipped"] == 1
+    assert summary["dropped"] == 1
+    assert summary["drop_reasons"] == [{"reason": "parse failure", "count": 1}]
+
+
 # ---------------------------------------------------------------------------
 # save_debug_log
 # ---------------------------------------------------------------------------
@@ -2638,10 +2741,20 @@ def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):
 
     with sqlite3.connect(log_db) as conn:
         row = conn.execute(
-            "SELECT underlying, direction, conviction, status FROM thesis_journal"
+            """
+            SELECT underlying, direction, conviction, status, created_at, updated_at
+            FROM thesis_journal
+            """
         ).fetchone()
 
-    assert row == ("AAPL", "bullish", 0.72, "developing")
+    assert row == (
+        "AAPL",
+        "bullish",
+        0.72,
+        "developing",
+        decision_time.isoformat(),
+        decision_time.isoformat(),
+    )
 
 
 def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch):

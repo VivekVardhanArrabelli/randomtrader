@@ -45,6 +45,69 @@ def test_create_new_thesis():
     assert entry.cycles_observed == 1
 
 
+def test_blank_new_thesis_is_not_created():
+    j = _make_journal()
+
+    j.apply_updates([
+        ThesisUpdate(
+            id=None,
+            underlying="AAPL",
+            direction="bullish",
+            thesis="",
+            conviction=0.7,
+            status="ready",
+            new_observation="",
+        )
+    ])
+
+    assert j.entries == {}
+
+
+def test_blank_new_thesis_uses_observation_as_fallback():
+    j = _make_journal()
+
+    j.apply_updates([
+        ThesisUpdate(
+            id=None,
+            underlying="AAPL",
+            direction="bullish",
+            thesis="",
+            conviction=0.7,
+            status="ready",
+            new_observation="Earnings beat confirmed by opening strength",
+        )
+    ])
+
+    entry = list(j.entries.values())[0]
+    assert entry.thesis == "Earnings beat confirmed by opening strength"
+    assert entry.key_observations == ["Earnings beat confirmed by opening strength"]
+
+
+def test_set_time_controls_journal_timestamps_and_age():
+    j = _make_journal()
+    start = datetime(2026, 5, 1, 13, 35, tzinfo=timezone.utc)
+    later = datetime(2026, 5, 1, 14, 35, tzinfo=timezone.utc)
+
+    j.set_time(start)
+    j.apply_updates([
+        ThesisUpdate(
+            id=None,
+            underlying="AAPL",
+            direction="bullish",
+            thesis="Earnings beat is holding",
+            conviction=0.7,
+            status="ready",
+            new_observation="Opening strength held",
+        )
+    ])
+    entry = list(j.entries.values())[0]
+    assert entry.created_at == start
+    assert entry.updated_at == start
+
+    j.set_time(later)
+    assert "age=1.0h" in j.to_context_str()
+
+
 def test_update_existing_thesis():
     j = _make_journal()
     # Create

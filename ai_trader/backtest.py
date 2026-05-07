@@ -1708,6 +1708,8 @@ class BacktestConfig:
 
 @dataclass
 class BacktestResult:
+    start_date: date | None = None
+    end_date: date | None = None
     trades: list[SimTrade] = field(default_factory=list)
     equity_curve: list[tuple[str, float]] = field(default_factory=list)
     initial_equity: float = 100_000.0
@@ -1725,6 +1727,8 @@ class BacktestResult:
     days_tested: int = 0
     llm_error_cycles: int = 0
     llm_failure_days: int = 0
+    llm_provider: str = ""
+    llm_model: str = ""
     historical_options_provider: str = ""
     log_db_path: str | None = None
     decision_log: list[dict] = field(default_factory=list)
@@ -2349,7 +2353,7 @@ def _build_catalyst_reaction_context(
         )
         lines.append(
             f"  {symbol}: event={event.event_type}/{event.freshness}"
-            f" age={event.age_minutes}m"
+            f" age={event.age_minutes}min"
             f" now({metrics['intraday_chg']:+.1f}%)"
             f" 5d({metrics['five_d_chg']:+.1f}%)"
             f" trend={metrics['trend']}"
@@ -3032,6 +3036,7 @@ def _simulated_current_exposure(
 def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     """Run the full backtest using real historical options data."""
     llm_provider = ""
+    llm_model = ""
     historical_options_provider = _historical_options_provider()
     brain: TradingBrain | None = None
     if not bt_config.prepare_only:
@@ -3061,7 +3066,11 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     trading_days = _trading_days(bt_config.start_date, bt_config.end_date)
 
     result = BacktestResult(
+        start_date=bt_config.start_date,
+        end_date=bt_config.end_date,
         initial_equity=bt_config.initial_equity,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
         historical_options_provider=historical_options_provider,
     )
     result.log_db_path = str(bt_config.log_db_path) if bt_config.log_db_path else None
@@ -3279,6 +3288,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 bar_minutes=bt_config.signal_bar_minutes,
             )
 
+            if journal:
+                journal.set_time(decision_time)
             journal_context = journal.to_context_str() if journal else ""
             trade_history_context = ""
             annotated_trades = list(closed_trades)
@@ -3916,8 +3927,68 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print("=" * 60)
 
 
+def _reason_counts(counter: Counter) -> list[dict]:
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in counter.most_common()
+    ]
+
+
+def summarize_decisions(r: BacktestResult) -> dict:
+    """Aggregate decision-log execution stats for artifact comparison."""
+    proposed = 0
+    executed = 0
+    skipped = 0
+    dropped = 0
+    skip_reasons: Counter = Counter()
+    drop_reasons: Counter = Counter()
+
+    for entry in r.decision_log:
+        for trade in entry.get("trades_proposed", []):
+            proposed += 1
+            status = str(trade.get("status") or "skipped")
+            if status == "executed":
+                executed += 1
+            elif status == "dropped":
+                dropped += 1
+                reason = str(
+                    trade.get("drop_reason")
+                    or trade.get("skip_reason")
+                    or "unknown"
+                )
+                drop_reasons[reason] += 1
+            else:
+                skipped += 1
+                reason = str(trade.get("skip_reason") or "unknown")
+                skip_reasons[reason] += 1
+
+    guardrail_skips = sum(
+        count for reason, count in skip_reasons.items()
+        if reason.startswith("risk:")
+    )
+
+    return {
+        "decision_points": len(r.decision_log),
+        "proposed": proposed,
+        "executed": executed,
+        "skipped": skipped,
+        "dropped": dropped,
+        "llm_error_cycles": r.llm_error_cycles,
+        "llm_failure_days": r.llm_failure_days,
+        "guardrail_skips": guardrail_skips,
+        "skip_reasons": _reason_counts(skip_reasons),
+        "drop_reasons": _reason_counts(drop_reasons),
+    }
+
+
+def _date_to_json(value: date | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def backtest_result_to_dict(r: BacktestResult) -> dict:
     return {
+        "start_date": _date_to_json(r.start_date),
+        "end_date": _date_to_json(r.end_date),
         "initial_equity": r.initial_equity,
         "final_equity": r.final_equity,
         "total_return_pct": r.total_return_pct,
@@ -3933,8 +4004,11 @@ def backtest_result_to_dict(r: BacktestResult) -> dict:
         "days_tested": r.days_tested,
         "llm_error_cycles": r.llm_error_cycles,
         "llm_failure_days": r.llm_failure_days,
+        "llm_provider": r.llm_provider,
+        "llm_model": r.llm_model,
         "historical_options_provider": r.historical_options_provider,
         "log_db_path": r.log_db_path,
+        "decision_summary": summarize_decisions(r),
         "equity_curve": [{"date": d, "equity": e} for d, e in r.equity_curve],
         "trades": [
             {
@@ -3992,6 +4066,21 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         f"Period: {r.days_tested} trading days | "
         f"Final: ${r.final_equity:,.0f} ({r.total_return_pct:+.1%}) | {win_loss}"
     )
+    summary = summarize_decisions(r)
+    if summary["proposed"] or summary["llm_error_cycles"]:
+        lines.append(
+            "Decision summary: "
+            f"{summary['proposed']} proposed | "
+            f"{summary['executed']} executed | "
+            f"{summary['skipped']} skipped | "
+            f"{summary['dropped']} dropped | "
+            f"{summary['llm_error_cycles']} LLM errors | "
+            f"{summary['guardrail_skips']} guardrail skips"
+        )
+        if summary["skip_reasons"]:
+            lines.append("Top skip reasons:")
+            for item in summary["skip_reasons"][:5]:
+                lines.append(f"- {item['count']}x {item['reason']}")
     lines.append("")
 
     for entry in r.decision_log:

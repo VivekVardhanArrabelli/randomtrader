@@ -24,6 +24,15 @@ def _to_openai_tool(tool: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _chat_tool_choice(provider: str, tool_name: str) -> str | dict[str, Any] | None:
+    if provider.strip().lower() == "deepseek":
+        return None
+    return {
+        "type": "function",
+        "function": {"name": tool_name},
+    }
+
+
 def _extract_text_parts(content: Any) -> list[str]:
     if isinstance(content, str):
         return [content] if content else []
@@ -250,16 +259,16 @@ def _should_retry_status(status_code: int) -> bool:
 
 
 class OpenAIAdapter:
-    provider = "openai"
-
     def __init__(
         self,
         api_key: str,
         *,
         base_url: str = "https://api.openai.com/v1",
+        provider: str = "openai",
         session: requests.Session | None = None,
     ) -> None:
         self.api_key = api_key
+        self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
 
@@ -307,11 +316,10 @@ class OpenAIAdapter:
             ],
             "temperature": temperature,
             "tools": [_to_openai_tool(tool)],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": tool["name"]},
-            },
         }
+        tool_choice = _chat_tool_choice(self.provider, tool["name"])
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
         if _uses_max_completion_tokens(model):
             payload["max_completion_tokens"] = max_tokens
         else:

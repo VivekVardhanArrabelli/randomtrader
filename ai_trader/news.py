@@ -99,7 +99,7 @@ class NewsEvent:
         lines = [
             (
                 f"[{self.freshness.upper()} | {self.event_type} | {catalyst_quality} | "
-                f"{self.source_count} sources | {self.age_minutes}m ago] {symbols_str}"
+                f"{self.source_count} sources | {self.age_minutes} min ago] {symbols_str}"
             ),
             f"  Event: {self.headline}",
         ]
@@ -460,7 +460,7 @@ def format_symbol_setup_context(
             "catalyst="
             f"{quality}/{event.event_type}/{event.freshness}/{event.source_count}src"
         )
-        parts.append(f"age={event.age_minutes}m")
+        parts.append(f"age={event.age_minutes}min")
         if metrics is not None:
             reaction = classify_catalyst_reaction(
                 event.age_minutes,

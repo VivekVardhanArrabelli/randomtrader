@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.randomtrader.ai-paper</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-main</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/opt/homebrew/Caskroom/miniconda/base/bin/python</string>
+      <string>-u</string>
+      <string>-m</string>
+      <string>ai_trader.paper_runner</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>/opt/homebrew/Caskroom/miniconda/base/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <key>PYTHONUNBUFFERED</key>
+      <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Weekdays in launchd: 1=Sunday ... 7=Saturday. Machine timezone is Central. -->
+    <!-- Start at 08:35 CT, which is 09:35 ET during US daylight time. -->
+    <key>StartCalendarInterval</key>
+    <array>
+      <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+      <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+      <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+      <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+      <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    </array>
+
+    <!-- Restart on crashes, but not after the app exits normally after market close. -->
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-main/ai_trader/logs/launchd_ai_paper.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-main/ai_trader/logs/launchd_ai_paper.err</string>
+  </dict>
+</plist>

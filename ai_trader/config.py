@@ -97,15 +97,17 @@ POLYGON_429_RETRY_ATTEMPTS = 5
 # Theta Data API (historical options backtests)
 # ---------------------------------------------------------------------------
 THETA_BASE_URL = "http://127.0.0.1:25510"
-HISTORICAL_OPTIONS_PROVIDER = "theta"  # theta / polygon
+HISTORICAL_OPTIONS_PROVIDER = "polygon"  # theta / polygon
 
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
-LLM_PROVIDER = ""                 # infer from model unless overridden
-LLM_MODEL = "gpt-5.4"
+LLM_PROVIDER = "deepseek"         # unattended campaign default unless overridden
+LLM_MODEL = "deepseek-v4-pro"
 LLM_MAX_TOKENS = 4096
+DEEPSEEK_LLM_MAX_TOKENS = 8192    # DeepSeek Pro uses completion budget for reasoning + JSON
 LLM_TEMPERATURE = 0.3              # lower = more deterministic trading
+DEEPSEEK_LLM_TEMPERATURE = 0.0     # backtest/replay reproducibility matters more than variety
 LLM_MAX_ATTEMPTS = 3
 MAX_CONSECUTIVE_LLM_ERROR_CYCLES = int(
     os.environ.get("MAX_CONSECUTIVE_LLM_ERROR_CYCLES", "3") or "0"
@@ -117,6 +119,73 @@ def resolved_llm_model(model: str | None = None) -> str:
     if model and model.strip():
         return model.strip()
     return os.environ.get("LLM_MODEL", "").strip() or LLM_MODEL
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(int(raw), minimum)
+    except ValueError:
+        return default
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float = 2.0,
+) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return min(max(float(raw), minimum), maximum)
+    except ValueError:
+        return default
+
+
+def resolved_llm_max_tokens(
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+) -> int:
+    """Resolve structured-output token budget after provider/model selection."""
+    explicit = os.environ.get("LLM_MAX_TOKENS", "").strip()
+    if explicit:
+        return _env_int("LLM_MAX_TOKENS", LLM_MAX_TOKENS)
+
+    resolved_model = resolved_llm_model(model).lower()
+    resolved_provider = (provider or os.environ.get("LLM_PROVIDER", "")).strip().lower()
+    if resolved_provider == "deepseek" or resolved_model.startswith("deepseek"):
+        return _env_int(
+            "DEEPSEEK_LLM_MAX_TOKENS",
+            DEEPSEEK_LLM_MAX_TOKENS,
+            minimum=LLM_MAX_TOKENS,
+        )
+    return LLM_MAX_TOKENS
+
+
+def resolved_llm_temperature(
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+) -> float:
+    """Resolve model temperature after provider/model selection."""
+    explicit = os.environ.get("LLM_TEMPERATURE", "").strip()
+    if explicit:
+        return _env_float("LLM_TEMPERATURE", LLM_TEMPERATURE)
+
+    resolved_model = resolved_llm_model(model).lower()
+    resolved_provider = (provider or os.environ.get("LLM_PROVIDER", "")).strip().lower()
+    if resolved_provider == "deepseek" or resolved_model.startswith("deepseek"):
+        return _env_float(
+            "DEEPSEEK_LLM_TEMPERATURE",
+            DEEPSEEK_LLM_TEMPERATURE,
+        )
+    return LLM_TEMPERATURE
 
 
 def resolved_max_consecutive_llm_error_cycles(value: int | None = None) -> int:
