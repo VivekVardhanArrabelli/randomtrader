@@ -5,11 +5,12 @@ Now with thesis journal (memory across cycles) and trade history awareness.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from . import config
 from .journal import ThesisUpdate, parse_thesis_updates
-from .llm import LLMAdapter, LLMCompletion, LLMDecisionPacket, create_adapter, infer_provider
+from .llm import LLMAdapter, LLMCompletion, LLMDecisionPacket, ToolCall, create_adapter, infer_provider
 from .utils import log
 
 
@@ -614,6 +615,65 @@ def _dropped_trade_record(
     return record
 
 
+def _parse_json_object_from_text(text: str) -> dict | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        candidate = "\n".join(lines).strip()
+
+    for raw in (
+        candidate,
+        candidate[candidate.find("{"):candidate.rfind("}") + 1]
+        if "{" in candidate and "}" in candidate else "",
+    ):
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _completion_with_text_tool_call(completion: LLMCompletion) -> LLMCompletion:
+    if completion.tool_calls:
+        return completion
+    for text in completion.text_blocks:
+        parsed = _parse_json_object_from_text(text)
+        if not isinstance(parsed, dict):
+            continue
+        if "market_analysis" not in parsed:
+            continue
+        parsed.setdefault("thesis_updates", [])
+        parsed.setdefault("trades", [])
+        if not isinstance(parsed.get("thesis_updates"), list):
+            parsed["thesis_updates"] = []
+        if not isinstance(parsed.get("trades"), list):
+            parsed["trades"] = []
+        log("recovered structured trade payload from LLM text block")
+        return LLMCompletion(
+            provider=completion.provider,
+            model=completion.model,
+            text_blocks=completion.text_blocks,
+            tool_calls=[
+                ToolCall(
+                    name="submit_trade_decisions",
+                    input=parsed,
+                )
+            ],
+            raw_response=completion.raw_response,
+        )
+    return completion
+
+
 class TradingBrain:
     def __init__(
         self,
@@ -726,6 +786,7 @@ class TradingBrain:
                     user_message=request_packet.user_message,
                     tool=request_packet.tool,
                 )
+                completion = _completion_with_text_tool_call(completion)
                 if not completion.tool_calls and attempt < max_attempts - 1:
                     log(
                         f"LLM returned no structured tool call "

@@ -340,9 +340,16 @@ def test_parse_thesis_updates_accepts_ticker_and_reasoning_aliases():
             "thesis_id": "thesis-2",
             "reason": "Ticker unclear and setup is no longer actionable.",
         },
+        {
+            "thesis_id": "TH-001",
+            "ticker": "AMZN",
+            "status": "developing",
+            "conviction": 0.4,
+            "summary": "Strong earnings, waiting for pullback.",
+        },
     ])
 
-    assert len(updates) == 2
+    assert len(updates) == 3
     assert updates[0].id is None
     assert updates[0].underlying == "ASTS"
     assert updates[0].direction == "bearish"
@@ -352,6 +359,11 @@ def test_parse_thesis_updates_accepts_ticker_and_reasoning_aliases():
     assert updates[1].status == "invalidated"
     assert updates[1].direction == ""
     assert updates[1].new_observation == "Ticker unclear and setup is no longer actionable."
+    assert updates[2].id is None
+    assert updates[2].underlying == "AMZN"
+    assert updates[2].direction == "neutral"
+    assert updates[2].thesis == "Strong earnings, waiting for pullback."
+    assert updates[2].new_observation == "Strong earnings, waiting for pullback."
 
 
 def test_run_packet_marks_missing_tool_call_after_retries_as_llm_error():
@@ -385,6 +397,45 @@ def test_run_packet_marks_missing_tool_call_after_retries_as_llm_error():
     assert adapter.calls >= 1
     assert analysis.analysis.startswith("LLM error: LLM returned no structured tool call")
     assert analysis.trades == []
+
+
+def test_run_packet_recovers_json_text_block_without_tool_call():
+    class TextOnlyAdapter:
+        provider = "deepseek"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete_structured(self, **kwargs):
+            self.calls += 1
+            return LLMCompletion(
+                provider="deepseek",
+                model="deepseek-v4-pro",
+                text_blocks=[
+                    """```json
+{"market_analysis":"Recovered JSON","thesis_updates":[],"trades":[{"action":"buy","ticker":"AAPL","direction":"call","instrument":"option","conviction":0.7,"risk_pct":0.02,"reasoning":"Fresh catalyst with stop and target."}]}
+```"""
+                ],
+                tool_calls=[],
+                raw_response={},
+            )
+
+    adapter = TextOnlyAdapter()
+    brain = TradingBrain(adapter=adapter, model="deepseek-v4-pro")
+
+    analysis = brain.analyze(
+        portfolio_context="port",
+        candidate_context="candidates",
+        news_context="news",
+        market_context="market",
+        options_context="options",
+    )
+
+    assert adapter.calls == 1
+    assert analysis.analysis == "Recovered JSON"
+    assert len(analysis.trades) == 1
+    assert analysis.trades[0].action == "buy_call"
+    assert analysis.trades[0].underlying == "AAPL"
 
 
 def test_run_packet_retries_once_on_missing_tool_call():

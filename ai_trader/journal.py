@@ -309,7 +309,9 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
         raw_action = str(item.get("action") or "").strip().lower()
         raw_id = item.get("id")
         if raw_id is None and raw_action not in {"create", "new"}:
-            raw_id = item.get("thesis_id")
+            raw_thesis_id = item.get("thesis_id")
+            if str(raw_thesis_id or "").startswith("thesis-"):
+                raw_id = raw_thesis_id
         underlying = item.get("underlying") or item.get("ticker") or item.get("symbol")
         if not underlying:
             tickers = item.get("tickers")
@@ -320,6 +322,7 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
             item.get("thesis")
             or item.get("reasoning")
             or item.get("reason")
+            or item.get("summary")
             or item.get("new_observation")
             or ""
         )
@@ -328,6 +331,7 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
             or item.get("observation")
             or item.get("reasoning")
             or item.get("reason")
+            or item.get("summary")
             or ""
         )
         raw_direction = item.get("direction")
