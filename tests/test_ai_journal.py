@@ -277,6 +277,33 @@ def test_new_thesis_uses_observation_when_thesis_blank():
     ]
 
 
+def test_set_time_controls_journal_timestamps_and_context_age():
+    j = _make_journal()
+    created_at = datetime(2025, 1, 6, 14, 35, tzinfo=timezone.utc)
+    observed_at = datetime(2025, 1, 6, 15, 35, tzinfo=timezone.utc)
+
+    j.set_time(created_at)
+    j.apply_updates([
+        ThesisUpdate(
+            id=None,
+            underlying="AAPL",
+            direction="bullish",
+            thesis="Product cycle gaining traction",
+            conviction=0.6,
+            status="developing",
+            new_observation="Relative strength held after the open",
+        )
+    ])
+
+    entry = list(j.entries.values())[0]
+    assert entry.created_at == created_at
+    assert entry.updated_at == created_at
+
+    j.set_time(observed_at)
+    ctx = j.to_context_str()
+    assert "age=1.0h" in ctx
+
+
 def test_multiple_theses_id_increment():
     j = _make_journal()
     for i in range(3):

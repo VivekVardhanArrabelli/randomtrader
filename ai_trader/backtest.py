@@ -3629,6 +3629,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 cache,
                 bar_minutes=bt_config.signal_bar_minutes,
             )
+            if journal:
+                journal.set_time(decision_time)
 
             news_window_start = decision_time - timedelta(hours=bt_config.news_lookback_hours)
             news_raw = fetch_historical_news_window(
