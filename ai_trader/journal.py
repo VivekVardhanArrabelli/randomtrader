@@ -358,6 +358,8 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
             item.get("summary"),
             new_observation if raw_id is None else "",
         )
+        if raw_id is None and not thesis and not new_observation:
+            continue
         raw_direction = item.get("direction")
         direction = str(raw_direction or "").strip().lower()
         if direction in {"call", "long", "bull"}:

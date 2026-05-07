@@ -232,6 +232,31 @@ def test_parse_thesis_updates_accepts_plural_observations():
     assert updates[0].new_observation == "INTC is extended; await pullback."
 
 
+def test_parse_thesis_updates_drops_blank_new_thesis():
+    updates = parse_thesis_updates([
+        {
+            "underlying": "AAPL",
+            "direction": "bullish",
+            "thesis": "",
+            "conviction": 0.7,
+            "status": "ready",
+            "new_observation": "",
+        },
+        {
+            "id": "thesis-3",
+            "underlying": "AAPL",
+            "direction": "bullish",
+            "thesis": "",
+            "conviction": 0.8,
+            "status": "acted_on",
+            "new_observation": "",
+        },
+    ])
+
+    assert len(updates) == 1
+    assert updates[0].id == "thesis-3"
+
+
 def test_new_thesis_uses_observation_when_thesis_blank():
     j = _make_journal()
     j.apply_updates([
