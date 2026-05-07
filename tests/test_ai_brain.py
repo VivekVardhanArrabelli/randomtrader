@@ -96,6 +96,7 @@ def test_system_prompt_contains_format_discipline():
     assert "short plain text" in SYSTEM_PROMPT.lower()
     assert "embedded double quotes" in SYSTEM_PROMPT.lower()
     assert "use exact action values" in SYSTEM_PROMPT.lower()
+    assert "every thesis update must include" in SYSTEM_PROMPT.lower()
     assert "underlying" in SYSTEM_PROMPT.lower()
 
 

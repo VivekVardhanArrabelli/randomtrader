@@ -261,6 +261,8 @@ FORMAT DISCIPLINE:
 - Do not use markdown bullets, code fences, or embedded double quotes inside string values.
 - Keep `market_analysis` to 2-4 short sentences.
 - Keep thesis/reasoning fields to one short sentence each when possible.
+- Every thesis update must include `underlying`, `direction`, `conviction`,
+  `status`, and a nonempty thesis or new observation.
 - For trades, use exact action values: buy_call, buy_put, buy_stock,
   close_position, or close_stock. Use `underlying` for the ticker symbol.\
 """
@@ -307,11 +309,17 @@ TRADE_TOOL = {
                         "direction": {
                             "type": "string",
                             "enum": ["bullish", "bearish", "neutral"],
-                            "description": "Your directional view.",
+                            "description": (
+                                "Required directional view for this thesis. "
+                                "Use bullish, bearish, or neutral; do not omit."
+                            ),
                         },
                         "thesis": {
                             "type": "string",
-                            "description": "The core thesis in 1 short plain-text sentence. No embedded quotes.",
+                            "description": (
+                                "The core thesis in 1 short plain-text sentence. "
+                                "Required for new theses. No embedded quotes."
+                            ),
                         },
                         "conviction": {
                             "type": "number",
@@ -331,7 +339,10 @@ TRADE_TOOL = {
                         },
                         "new_observation": {
                             "type": "string",
-                            "description": "What new evidence did you see this cycle? One short plain-text sentence.",
+                            "description": (
+                                "What new evidence did you see this cycle? "
+                                "Required for updates. One short plain-text sentence."
+                            ),
                         },
                     },
                     "required": ["underlying", "direction", "thesis", "conviction", "status"],
