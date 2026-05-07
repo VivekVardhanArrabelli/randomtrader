@@ -213,6 +213,45 @@ def test_parse_thesis_updates():
     assert updates[1].new_observation == ""  # missing key defaults to ""
 
 
+def test_parse_thesis_updates_accepts_plural_observations():
+    raw = [
+        {
+            "thesis_id": "thesis-4",
+            "underlying": "INTC",
+            "direction": "bullish",
+            "thesis": "",
+            "conviction": 0.55,
+            "status": "developing",
+            "observations": "INTC is extended; await pullback.",
+        }
+    ]
+    updates = parse_thesis_updates(raw)
+    assert len(updates) == 1
+    assert updates[0].id == "thesis-4"
+    assert updates[0].thesis == ""
+    assert updates[0].new_observation == "INTC is extended; await pullback."
+
+
+def test_new_thesis_uses_observation_when_thesis_blank():
+    j = _make_journal()
+    j.apply_updates([
+        ThesisUpdate(
+            id=None,
+            underlying="INTC",
+            direction="bullish",
+            thesis="",
+            conviction=0.5,
+            status="developing",
+            new_observation="Government stake narrative is strong but entry is extended.",
+        )
+    ])
+    entry = list(j.entries.values())[0]
+    assert entry.thesis == "Government stake narrative is strong but entry is extended."
+    assert entry.key_observations == [
+        "Government stake narrative is strong but entry is extended."
+    ]
+
+
 def test_multiple_theses_id_increment():
     j = _make_journal()
     for i in range(3):

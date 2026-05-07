@@ -178,6 +178,13 @@ class ThesisJournal:
                 self._save_entry(entry)
                 log(f"journal: updated [{entry.id}] {entry.underlying} -> {entry.status} ({entry.conviction:.2f})")
             else:
+                thesis_text = (u.thesis or "").strip() or (u.new_observation or "").strip()
+                if not thesis_text:
+                    log(
+                        f"journal: skipped blank thesis update for "
+                        f"{u.underlying or 'unknown'}"
+                    )
+                    continue
                 new_id = f"thesis-{self._next_id}"
                 self._next_id += 1
                 obs = [u.new_observation] if u.new_observation else []
@@ -185,7 +192,7 @@ class ThesisJournal:
                     id=new_id,
                     underlying=u.underlying,
                     direction=u.direction,
-                    thesis=u.thesis,
+                    thesis=thesis_text,
                     conviction=u.conviction,
                     status=u.status,
                     key_observations=obs,
@@ -302,6 +309,24 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
         except (TypeError, ValueError):
             return default
 
+    def coerce_text(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return "; ".join(
+                str(item).strip()
+                for item in value
+                if str(item).strip()
+            )
+        return str(value).strip()
+
+    def first_text(*values: object) -> str:
+        for value in values:
+            text = coerce_text(value)
+            if text:
+                return text
+        return ""
+
     updates = []
     for item in raw:
         if not isinstance(item, dict):
@@ -318,21 +343,20 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
             if isinstance(tickers, list) and tickers:
                 underlying = tickers[0]
         underlying = underlying or ""
-        thesis = (
-            item.get("thesis")
-            or item.get("reasoning")
-            or item.get("reason")
-            or item.get("summary")
-            or item.get("new_observation")
-            or ""
-        )
-        new_observation = (
+        new_observation = first_text(
             item.get("new_observation")
             or item.get("observation")
+            or item.get("observations")
             or item.get("reasoning")
             or item.get("reason")
             or item.get("summary")
-            or ""
+        )
+        thesis = first_text(
+            item.get("thesis"),
+            item.get("reasoning"),
+            item.get("reason"),
+            item.get("summary"),
+            new_observation if raw_id is None else "",
         )
         raw_direction = item.get("direction")
         direction = str(raw_direction or "").strip().lower()
@@ -355,7 +379,7 @@ def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
                 thesis=str(thesis),
                 conviction=safe_float(item.get("conviction"), 0.5),
                 status=status,
-                new_observation=str(new_observation),
+                new_observation=new_observation,
             )
         )
     return updates
