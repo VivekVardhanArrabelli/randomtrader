@@ -174,17 +174,31 @@ def _extract_response_tool_calls(output: Any) -> list[ToolCall]:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             continue
         arguments = item.get("arguments") or "{}"
-        try:
-            parsed_arguments = json.loads(arguments)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"OpenAI returned invalid tool JSON: {exc}") from exc
         tool_calls.append(
             ToolCall(
                 name=str(item.get("name") or ""),
-                input=dict(parsed_arguments or {}),
+                input=_parse_tool_arguments(arguments),
             )
         )
     return tool_calls
+
+
+def _parse_tool_arguments(arguments: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    try:
+        parsed_arguments = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        if exc.msg != "Extra data":
+            raise RuntimeError(f"OpenAI returned invalid tool JSON: {exc}") from exc
+        try:
+            parsed_arguments, _ = decoder.raw_decode(arguments)
+        except json.JSONDecodeError as raw_exc:
+            raise RuntimeError(
+                f"OpenAI returned invalid tool JSON: {raw_exc}"
+            ) from raw_exc
+    if not isinstance(parsed_arguments, dict):
+        raise RuntimeError("OpenAI tool JSON was not an object")
+    return dict(parsed_arguments)
 
 
 def _extract_response_text_tool_call(
@@ -375,14 +389,10 @@ class OpenAIAdapter:
         for call in message.get("tool_calls") or []:
             function = dict(call.get("function") or {})
             arguments = function.get("arguments") or "{}"
-            try:
-                parsed_arguments = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"OpenAI returned invalid tool JSON: {exc}") from exc
             tool_calls.append(
                 ToolCall(
                     name=str(function.get("name") or ""),
-                    input=dict(parsed_arguments or {}),
+                    input=_parse_tool_arguments(arguments),
                 )
             )
 

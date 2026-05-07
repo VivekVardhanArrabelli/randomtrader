@@ -191,6 +191,67 @@ def test_deepseek_chat_adapter_omits_tool_choice():
     assert completion.tool_calls[0].input["market_analysis"] == "ok"
 
 
+def test_chat_adapter_recovers_tool_json_with_trailing_data():
+    class DummyResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class DummySession:
+        def post(self, url, headers, json, timeout):
+            return DummyResponse(
+                {
+                    "id": "chat_123",
+                    "model": json["model"],
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "submit_trade_decisions",
+                                            "arguments": (
+                                                '{"market_analysis":"ok",'
+                                                '"thesis_updates":[],"trades":[]}'
+                                                "\nnot-json"
+                                            ),
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    adapter = OpenAIAdapter(
+        api_key="test-deepseek-key",
+        base_url="https://api.deepseek.com",
+        provider="deepseek",
+        session=DummySession(),
+    )
+
+    completion = adapter.complete_structured(
+        model="deepseek-v4-pro",
+        system_prompt="system",
+        user_message="user",
+        tool={
+            "name": "submit_trade_decisions",
+            "description": "desc",
+            "input_schema": {"type": "object"},
+        },
+        max_tokens=100,
+        temperature=0.0,
+    )
+
+    assert completion.tool_calls[0].input["market_analysis"] == "ok"
+
+
 def test_resolved_llm_model_prefers_env(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
 

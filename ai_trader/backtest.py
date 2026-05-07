@@ -45,7 +45,7 @@ from .historical_cache import (
     DEFAULT_HISTORICAL_CACHE_DB_PATH,
     PolygonResponseStore,
 )
-from .journal import ThesisJournal
+from .journal import ThesisJournal, ThesisUpdate
 from .llm import api_key_env_name, infer_provider, resolve_api_key
 from .news import (
     NewsItem,
@@ -541,6 +541,54 @@ def _theta_contracts_from_response(
 def _raise_if_offline(cache: PolygonCache | None, exc: Exception) -> None:
     if cache and cache.offline:
         raise RuntimeError(str(exc)) from exc
+
+
+def _is_offline_cache_miss(cache: PolygonCache | None, exc: Exception) -> bool:
+    """True when an optional replay lookup missed the persistent cache."""
+    if not (cache and cache.offline):
+        return False
+    message = str(exc).lower()
+    return "offline" in message and "cache miss" in message
+
+
+def _ticker_price_metrics_or_none(
+    api_key: str,
+    ticker: str,
+    as_of: date | datetime,
+    *,
+    cache: PolygonCache | None,
+    lookback_days: int = 10,
+    bar_minutes: int = 5,
+    metrics_cache: dict[str, dict | None] | None = None,
+    context: str,
+) -> dict | None:
+    """Fetch ticker metrics, degrading optional offline replay context to absent."""
+    try:
+        return _ticker_price_metrics_as_of(
+            api_key,
+            ticker,
+            as_of,
+            lookback_days=lookback_days,
+            cache=cache,
+            bar_minutes=bar_minutes,
+            metrics_cache=metrics_cache,
+        )
+    except RuntimeError as exc:
+        if not _is_offline_cache_miss(cache, exc):
+            raise
+        normalized = ticker.upper()
+        cache_key = (
+            normalized,
+            _coerce_eastern_datetime(as_of).isoformat(),
+            lookback_days,
+            bar_minutes,
+        )
+        if cache is not None:
+            cache.ticker_metrics[cache_key] = None
+        if metrics_cache is not None:
+            metrics_cache[normalized] = None
+        log(f"offline replay missing {context} for {normalized}: {exc}")
+        return None
 
 
 def fetch_historical_news_window(
@@ -1818,6 +1866,36 @@ def _analysis_to_decisions_json(analysis: MarketAnalysis) -> str:
     )
 
 
+def _reconcile_acted_on_thesis_updates(
+    thesis_updates: list[ThesisUpdate],
+    executed_underlyings: set[str],
+) -> list[ThesisUpdate]:
+    """Keep acted_on theses active when the matching trade did not execute."""
+    if not thesis_updates:
+        return []
+    executed = {symbol.upper() for symbol in executed_underlyings if symbol}
+    reconciled: list[ThesisUpdate] = []
+    for update in thesis_updates:
+        underlying = (update.underlying or "").upper()
+        if update.status == "acted_on" and underlying not in executed:
+            observation = update.new_observation.strip()
+            suffix = "Backtest did not execute the proposed trade; keeping thesis active."
+            if observation:
+                observation = f"{observation} {suffix}"
+            else:
+                observation = suffix
+            reconciled.append(
+                replace(
+                    update,
+                    status="ready",
+                    new_observation=observation,
+                )
+            )
+            continue
+        reconciled.append(update)
+    return reconciled
+
+
 def _log_backtest_open_trade(
     logger: AITradeLogger | None,
     *,
@@ -2180,6 +2258,11 @@ def _build_ticker_price_context(
     if not metrics:
         return None, 0.0
 
+    ctx = _format_ticker_price_context(metrics)
+    return ctx, metrics["price"]
+
+
+def _format_ticker_price_context(metrics: dict) -> str:
     ctx = (
         f"spot=${metrics['price']:.2f}"
         f" {'now' if metrics['is_intraday'] else 'today'}({metrics['intraday_chg']:+.1f}%)"
@@ -2192,7 +2275,7 @@ def _build_ticker_price_context(
         ctx += (
             f" 10d_hi/lo=${metrics['recent_high']:.0f}/{metrics['recent_low']:.0f}"
         )
-    return ctx, metrics["price"]
+    return ctx
 
 
 def _ticker_price_metrics_as_of(
@@ -2336,13 +2419,14 @@ def _build_catalyst_reaction_context(
             continue
         if focus_set and symbol not in focus_set:
             continue
-        metrics = _ticker_price_metrics_as_of(
+        metrics = _ticker_price_metrics_or_none(
             api_key,
             symbol,
             as_of,
             cache=cache,
             bar_minutes=bar_minutes,
             metrics_cache=metrics_cache,
+            context="catalyst reaction metrics",
         )
         if not metrics:
             continue
@@ -2515,12 +2599,13 @@ def _build_focus_tickers(
     }
     metrics_by_symbol: dict[str, dict] = {}
     for symbol in list(source_tags_by_symbol):
-        metrics = _ticker_price_metrics_as_of(
+        metrics = _ticker_price_metrics_or_none(
             api_key,
             symbol,
             as_of,
             cache=cache,
             metrics_cache=metrics_cache,
+            context="candidate metrics",
         )
         if not metrics:
             continue
@@ -2581,12 +2666,13 @@ def _build_options_context(
     ]
     lines.extend(expression_guidance_lines(closed_trades or []))
     found_any = False
+    noted_unavailable = False
 
     expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
     expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
     for ticker in tickers:
-        metrics = _ticker_price_metrics_as_of(
+        metrics = _ticker_price_metrics_or_none(
             api_key,
             ticker,
             as_of_dt,
@@ -2594,20 +2680,26 @@ def _build_options_context(
             lookback_days=10,
             bar_minutes=bar_minutes,
             metrics_cache=metrics_cache,
+            context="options context metrics",
         )
         # Fetch spot price + trend context (single range query, no extra call)
-        trend_ctx, spot = _build_ticker_price_context(
-            api_key,
-            ticker,
-            as_of_dt,
-            cache=cache,
-            bar_minutes=bar_minutes,
-            metrics_cache=metrics_cache,
-        )
+        trend_ctx = _format_ticker_price_context(metrics) if metrics else None
+        spot = float(metrics["price"]) if metrics else 0.0
         if spot <= 0:
-            bar = _current_equity_bar(
-                api_key, ticker, as_of_dt, cache=cache, bar_minutes=bar_minutes,
-            )
+            try:
+                bar = _current_equity_bar(
+                    api_key, ticker, as_of_dt, cache=cache, bar_minutes=bar_minutes,
+                )
+            except RuntimeError as exc:
+                if not _is_offline_cache_miss(cache, exc):
+                    raise
+                log(f"offline replay missing options context price for {ticker.upper()}: {exc}")
+                lines.append(
+                    f"  {ticker.upper()}: unavailable in offline historical cache; "
+                    "no options shown."
+                )
+                noted_unavailable = True
+                continue
             if bar is None:
                 continue
             spot = _equity_bar_price(bar)
@@ -2629,11 +2721,24 @@ def _build_options_context(
         strike_lte = round(spot * 1.03, 2)
 
         for opt_type in ("call", "put"):
-            contracts = fetch_polygon_option_contracts(
-                api_key, ticker, opt_type,
-                expiry_gte, expiry_lte, strike_gte, strike_lte,
-                as_of=trade_date, cache=cache,
-            )
+            try:
+                contracts = fetch_polygon_option_contracts(
+                    api_key, ticker, opt_type,
+                    expiry_gte, expiry_lte, strike_gte, strike_lte,
+                    as_of=trade_date, cache=cache,
+                )
+            except RuntimeError as exc:
+                if not _is_offline_cache_miss(cache, exc):
+                    raise
+                log(
+                    f"offline replay missing {ticker.upper()} {opt_type} "
+                    f"options context: {exc}"
+                )
+                lines.append(
+                    f"    {opt_type.upper()} shortlist unavailable in offline cache"
+                )
+                noted_unavailable = True
+                continue
             if not contracts:
                 continue
             def _shortlist_key(contract: dict) -> tuple[float, int]:
@@ -2676,9 +2781,18 @@ def _build_options_context(
                     found_any = True
                     continue
 
-                session_bars = _session_intraday_bars_before(
-                    api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
-                )
+                try:
+                    session_bars = _session_intraday_bars_before(
+                        api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
+                    )
+                except RuntimeError as exc:
+                    if not _is_offline_cache_miss(cache, exc):
+                        raise
+                    log(
+                        f"offline replay missing {opt_ticker} options premium context: {exc}"
+                    )
+                    noted_unavailable = True
+                    continue
                 if not session_bars:
                     continue
 
@@ -2702,6 +2816,8 @@ def _build_options_context(
                 found_any = True
 
     if not found_any:
+        if noted_unavailable:
+            return "\n".join(lines)
         return "(Backtest mode: real historical options data used for pricing)"
 
     return "\n".join(lines)
@@ -3393,13 +3509,6 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 consecutive_llm_errors = 0
             log(f"  {decision_time.strftime('%H:%M')} LLM: {analysis.analysis}")
 
-            if journal and analysis.thesis_updates:
-                journal.apply_updates(analysis.thesis_updates)
-                log(
-                    f"  Journal: {len(analysis.thesis_updates)} updates, "
-                    f"{len(journal.active_entries())} active"
-                )
-
             decision_id = 0
             if logger is not None:
                 decision_id = logger.log_decision(
@@ -3418,6 +3527,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 )
 
             trades_executed = 0
+            executed_trade_underlyings: set[str] = set()
             for decision in analysis.trades:
                 trade_record = {
                     "underlying": decision.underlying,
@@ -3507,6 +3617,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_record["pnl"] = trade_pnl
                     trade_results.append(trade_record)
                     trades_executed += 1
+                    executed_trade_underlyings.add(matched_pos.underlying.upper())
                     _log_backtest_close(
                         logger,
                         decision_time=decision_time,
@@ -3537,36 +3648,54 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
                 option_type = "call" if decision.action == "buy_call" else "put"
                 underlying = decision.underlying
-                spot = _current_underlying_price(
-                    polygon_key,
-                    underlying,
-                    decision_time,
-                    cache,
-                    bar_minutes=bt_config.signal_bar_minutes,
-                )
+                try:
+                    spot = _current_underlying_price(
+                        polygon_key,
+                        underlying,
+                        decision_time,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                except RuntimeError as exc:
+                    if not _is_offline_cache_miss(cache, exc):
+                        raise
+                    trade_record["skip_reason"] = (
+                        f"offline cache miss for underlying price: {exc}"
+                    )
+                    trade_results.append(trade_record)
+                    continue
                 if spot <= 0:
                     trade_record["skip_reason"] = "no price data before decision time"
                     trade_results.append(trade_record)
                     continue
 
-                contract = _select_real_contract(
-                    polygon_key,
-                    underlying,
-                    option_type,
-                    spot,
-                    trade_date,
-                    decision.strike_preference or "atm",
-                    decision.expiry_preference or "next_week",
-                    bt_config.default_dte,
-                    decision_time=decision_time,
-                    expression_profile=decision.expression_profile,
-                    contract_symbol=decision.contract_symbol,
-                    target_delta_range=decision.target_delta_range,
-                    target_dte_range=decision.target_dte_range,
-                    max_spread_pct=decision.max_spread_pct,
-                    cache=cache,
-                    bar_minutes=bt_config.signal_bar_minutes,
-                )
+                try:
+                    contract = _select_real_contract(
+                        polygon_key,
+                        underlying,
+                        option_type,
+                        spot,
+                        trade_date,
+                        decision.strike_preference or "atm",
+                        decision.expiry_preference or "next_week",
+                        bt_config.default_dte,
+                        decision_time=decision_time,
+                        expression_profile=decision.expression_profile,
+                        contract_symbol=decision.contract_symbol,
+                        target_delta_range=decision.target_delta_range,
+                        target_dte_range=decision.target_dte_range,
+                        max_spread_pct=decision.max_spread_pct,
+                        cache=cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                except RuntimeError as exc:
+                    if not _is_offline_cache_miss(cache, exc):
+                        raise
+                    trade_record["skip_reason"] = (
+                        f"offline cache miss for contract selection: {exc}"
+                    )
+                    trade_results.append(trade_record)
+                    continue
                 if contract is None:
                     trade_record["skip_reason"] = "no contract found"
                     trade_results.append(trade_record)
@@ -3580,26 +3709,44 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_results.append(trade_record)
                     continue
                 expiry = date.fromisoformat(expiry_str)
-                quote_bar = _current_option_bar(
-                    polygon_key,
-                    polygon_ticker,
-                    decision_time,
-                    cache,
-                    bar_minutes=bt_config.signal_bar_minutes,
-                )
+                try:
+                    quote_bar = _current_option_bar(
+                        polygon_key,
+                        polygon_ticker,
+                        decision_time,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                except RuntimeError as exc:
+                    if not _is_offline_cache_miss(cache, exc):
+                        raise
+                    trade_record["skip_reason"] = (
+                        f"offline cache miss for option quote: {exc}"
+                    )
+                    trade_results.append(trade_record)
+                    continue
                 limit_price = _entry_limit_price(contract, quote_bar)
                 if limit_price < 0.01:
                     trade_record["skip_reason"] = "no tradable quote"
                     trade_results.append(trade_record)
                     continue
 
-                entry_bar = _next_fill_option_bar(
-                    polygon_key,
-                    polygon_ticker,
-                    decision_time,
-                    cache,
-                    bar_minutes=bt_config.signal_bar_minutes,
-                )
+                try:
+                    entry_bar = _next_fill_option_bar(
+                        polygon_key,
+                        polygon_ticker,
+                        decision_time,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                except RuntimeError as exc:
+                    if not _is_offline_cache_miss(cache, exc):
+                        raise
+                    trade_record["skip_reason"] = (
+                        f"offline cache miss for fill bar: {exc}"
+                    )
+                    trade_results.append(trade_record)
+                    continue
                 if entry_bar is None:
                     trade_record["skip_reason"] = "no fill bar after decision time"
                     trade_results.append(trade_record)
@@ -3671,6 +3818,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_record["expression_profile"] = decision.expression_profile
                 trade_results.append(trade_record)
                 trades_executed += 1
+                executed_trade_underlyings.add(underlying.upper())
                 _log_backtest_open_trade(
                     logger,
                     decision_time=decision_time,
@@ -3692,6 +3840,24 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     bar_minutes=bt_config.signal_bar_minutes,
                 )
 
+            journal_updates = _reconcile_acted_on_thesis_updates(
+                analysis.thesis_updates,
+                executed_trade_underlyings,
+            )
+            if journal and journal_updates:
+                for original, reconciled in zip(analysis.thesis_updates, journal_updates):
+                    if original.status == "acted_on" and reconciled.status != "acted_on":
+                        log(
+                            "journal: retained "
+                            f"{(original.underlying or '?').upper()} as {reconciled.status} "
+                            "because no trade executed"
+                        )
+                journal.apply_updates(journal_updates)
+                log(
+                    f"  Journal: {len(journal_updates)} updates, "
+                    f"{len(journal.active_entries())} active"
+                )
+
             thesis_updates_serialized = [
                 {
                     "id": tu.id,
@@ -3702,7 +3868,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "status": tu.status,
                     "new_observation": tu.new_observation,
                 }
-                for tu in analysis.thesis_updates
+                for tu in journal_updates
             ]
             marked_equity, _ = _mark_to_market_equity(
                 equity,

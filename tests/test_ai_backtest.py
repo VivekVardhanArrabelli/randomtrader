@@ -23,12 +23,14 @@ from ai_trader.backtest import (
     _build_options_context,
     _build_performance_summary,
     _build_ticker_price_context,
+    _build_focus_tickers,
     _extract_top_news_tickers,
     _filter_news_quality,
     _option_bar_price,
     _exit_premium_for_position,
     _prefetch_prepare_option_data,
     _rank_prefetch_contracts,
+    _reconcile_acted_on_thesis_updates,
     _previous_trading_day,
     _session_intraday_bars_before,
     _ticker_price_metrics_as_of,
@@ -44,7 +46,7 @@ from ai_trader.backtest import (
     summarize_decisions,
 )
 from ai_trader.historical_cache import PolygonResponseStore
-from ai_trader.journal import ThesisUpdate
+from ai_trader.journal import ThesisJournal, ThesisUpdate
 from ai_trader.llm import LLMCompletion, LLMDecisionPacket, ToolCall
 from ai_trader.news import NewsEvent
 from ai_trader.utils import EASTERN_TZ
@@ -785,8 +787,21 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
 
     monkeypatch.setattr(
         bt_mod,
-        "_build_ticker_price_context",
-        lambda *args, **kwargs: ("spot=$100.00", 100.0),
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
     )
 
     def mock_fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
@@ -836,8 +851,21 @@ def test_build_options_context_fetches_intraday_only_for_primary_contracts(monke
 
     monkeypatch.setattr(
         bt_mod,
-        "_build_ticker_price_context",
-        lambda *args, **kwargs: ("spot=$100.00", 100.0),
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
     )
     monkeypatch.setattr(
         bt_mod,
@@ -897,6 +925,112 @@ def test_build_options_context_fetches_intraday_only_for_primary_contracts(monke
     assert "CALLITM CALL $95.00" in context
     assert "PUTITM PUT $105.00" in context
     assert "premium=$1.50" in context
+
+
+def test_build_options_context_notes_offline_cache_miss_for_uncached_symbol(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    cache = PolygonCache(offline=True)
+
+    def raise_cache_miss(*args, **kwargs):
+        raise RuntimeError("offline Polygon cache miss for /v2/aggs/ticker/SMH/range")
+
+    monkeypatch.setattr(bt_mod, "_ticker_price_metrics_as_of", raise_cache_miss)
+    monkeypatch.setattr(bt_mod, "_current_equity_bar", raise_cache_miss)
+
+    context = _build_options_context(
+        "fake",
+        ["SMH"],
+        datetime(2026, 5, 6, 9, 50, tzinfo=EASTERN_TZ),
+        cache,
+    )
+
+    assert "SMH: unavailable in offline historical cache; no options shown." in context
+
+
+def test_build_focus_tickers_skips_uncached_offline_thesis_symbol(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    cache = PolygonCache(offline=True)
+    journal = ThesisJournal()
+    journal.apply_updates([
+        ThesisUpdate(
+            id=None,
+            underlying="SMH",
+            direction="bearish",
+            thesis="Semiconductor ETF is extended and may mean revert.",
+            conviction=0.4,
+            status="developing",
+            new_observation="Model-created broad-sector thesis.",
+        )
+    ])
+
+    def mock_metrics(api_key, ticker, *args, **kwargs):
+        if ticker.upper() == "SMH":
+            raise RuntimeError("offline Polygon cache miss for /v2/aggs/ticker/SMH/range")
+        return {
+            "price": 100.0,
+            "intraday_chg": 0.2,
+            "five_d_chg": 1.0,
+            "ten_d_chg": 2.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        }
+
+    monkeypatch.setattr(bt_mod, "_ticker_price_metrics_as_of", mock_metrics)
+
+    candidate_context, finalists = _build_focus_tickers(
+        [],
+        [],
+        journal,
+        "fake",
+        datetime(2026, 5, 6, 9, 50, tzinfo=EASTERN_TZ),
+        cache,
+    )
+
+    assert "SMH" not in candidate_context
+    assert "SMH" not in finalists
+    assert finalists
+
+
+def test_reconcile_acted_on_thesis_updates_keeps_skipped_trade_active():
+    update = ThesisUpdate(
+        id="thesis-1",
+        underlying="AMZN",
+        direction="bullish",
+        thesis="Fresh cloud catalyst",
+        conviction=0.7,
+        status="acted_on",
+        new_observation="Trade selected.",
+    )
+
+    reconciled = _reconcile_acted_on_thesis_updates([update], set())
+
+    assert reconciled[0].status == "ready"
+    assert "did not execute" in reconciled[0].new_observation
+
+
+def test_reconcile_acted_on_thesis_updates_preserves_executed_trade():
+    update = ThesisUpdate(
+        id="thesis-1",
+        underlying="AMZN",
+        direction="bullish",
+        thesis="Fresh cloud catalyst",
+        conviction=0.7,
+        status="acted_on",
+        new_observation="Trade selected.",
+    )
+
+    reconciled = _reconcile_acted_on_thesis_updates([update], {"AMZN"})
+
+    assert reconciled[0].status == "acted_on"
+    assert reconciled[0].new_observation == "Trade selected."
 
 
 # ---------------------------------------------------------------------------
@@ -2755,6 +2889,104 @@ def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):
         decision_time.isoformat(),
         decision_time.isoformat(),
     )
+
+
+def test_run_backtest_keeps_acted_on_thesis_when_trade_skips(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_time = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+    log_db = tmp_path / "window.db"
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            analysis = MarketAnalysis(
+                analysis="Trade selected but cannot be priced",
+                thesis_updates=[
+                    ThesisUpdate(
+                        id=None,
+                        underlying="AAPL",
+                        direction="bullish",
+                        thesis="Product catalyst is ready",
+                        conviction=0.72,
+                        status="acted_on",
+                        new_observation="Selected call entry.",
+                    )
+                ],
+                trades=[
+                    TradeDecision(
+                        action="buy_call",
+                        underlying="AAPL",
+                        strike_preference="atm",
+                        expiry_preference="next_week",
+                        conviction=0.72,
+                        risk_pct=0.05,
+                        reasoning="Ready thesis",
+                        target_symbol=None,
+                    )
+                ],
+            )
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[],
+                raw_response={"id": "resp_acted_on_skip"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: [decision_time])
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+    monkeypatch.setattr(bt_mod, "_select_real_contract", lambda *args, **kwargs: None)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            log_db_path=log_db,
+        )
+    )
+
+    with sqlite3.connect(log_db) as conn:
+        row = conn.execute(
+            "SELECT underlying, status, key_observations FROM thesis_journal"
+        ).fetchone()
+
+    assert row[0:2] == ("AAPL", "ready")
+    assert "did not execute" in row[2]
+    assert result.decision_log[0]["thesis_updates"][0]["status"] == "ready"
+    assert result.decision_log[0]["trades_proposed"][0]["skip_reason"] == "no contract found"
 
 
 def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch):
