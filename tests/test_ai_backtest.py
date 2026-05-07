@@ -38,8 +38,10 @@ from ai_trader.backtest import (
     fetch_historical_daily_bars_range,
     fetch_option_daily_bar,
     fetch_polygon_option_contracts,
+    backtest_result_to_dict,
     print_backtest_result,
     save_debug_log,
+    summarize_decisions,
 )
 from ai_trader.historical_cache import PolygonResponseStore
 from ai_trader.journal import ThesisUpdate
@@ -2102,6 +2104,68 @@ def test_backtest_result_decision_log():
     import json
     serialized = json.dumps(r.decision_log)
     assert "Broad selloff continues" in serialized
+
+
+def test_backtest_result_to_dict_includes_period_provider_and_decision_summary():
+    r = BacktestResult(
+        start_date=date(2025, 1, 6),
+        end_date=date(2025, 1, 10),
+        llm_provider="deepseek",
+        llm_model="deepseek-v4-pro",
+        llm_error_cycles=1,
+        llm_failure_days=1,
+        decision_log=[
+            {
+                "trades_proposed": [
+                    {"status": "executed", "skip_reason": ""},
+                    {"status": "skipped", "skip_reason": "no liquid contracts after filters"},
+                    {"status": "skipped", "skip_reason": "risk: daily loss limit"},
+                ],
+            }
+        ],
+    )
+
+    payload = backtest_result_to_dict(r)
+
+    assert payload["start_date"] == "2025-01-06"
+    assert payload["end_date"] == "2025-01-10"
+    assert payload["llm_provider"] == "deepseek"
+    assert payload["llm_model"] == "deepseek-v4-pro"
+    assert payload["decision_summary"] == {
+        "decision_points": 1,
+        "proposed": 3,
+        "executed": 1,
+        "skipped": 2,
+        "dropped": 0,
+        "llm_error_cycles": 1,
+        "llm_failure_days": 1,
+        "guardrail_skips": 1,
+        "skip_reasons": [
+            {"reason": "no liquid contracts after filters", "count": 1},
+            {"reason": "risk: daily loss limit", "count": 1},
+        ],
+        "drop_reasons": [],
+    }
+
+
+def test_summarize_decisions_counts_dropped_trades():
+    r = BacktestResult(
+        decision_log=[
+            {
+                "trades_proposed": [
+                    {"status": "dropped", "drop_reason": "parse failure"},
+                    {"status": "unknown", "skip_reason": "no contract found"},
+                ],
+            }
+        ],
+    )
+
+    summary = summarize_decisions(r)
+
+    assert summary["proposed"] == 2
+    assert summary["skipped"] == 1
+    assert summary["dropped"] == 1
+    assert summary["drop_reasons"] == [{"reason": "parse failure", "count": 1}]
 
 
 # ---------------------------------------------------------------------------
