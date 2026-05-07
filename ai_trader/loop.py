@@ -728,6 +728,8 @@ def run_cycle(
     analysis = run_result.analysis
 
     log(f"LLM analysis: {analysis.analysis[:200]}")
+    if analysis.dropped_trades:
+        log(f"LLM dropped {len(analysis.dropped_trades)} malformed/low-conviction trade candidates")
 
     decisions_json = json.dumps(
         {
@@ -762,6 +764,7 @@ def run_cycle(
                 }
                 for d in analysis.trades
             ],
+            "dropped_trades": analysis.dropped_trades,
         }
     )
     decision_id = logger.log_decision(

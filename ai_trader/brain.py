@@ -5,7 +5,7 @@ Now with thesis journal (memory across cycles) and trade history awareness.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import config
 from .journal import ThesisUpdate, parse_thesis_updates
@@ -13,16 +13,39 @@ from .llm import LLMAdapter, LLMCompletion, LLMDecisionPacket, create_adapter, i
 from .utils import log
 
 
+_VALID_ACTIONS = {
+    "buy_call",
+    "buy_put",
+    "close_position",
+    "buy_stock",
+    "close_stock",
+}
+_ACTION_ALIASES = {
+    "call": "buy_call",
+    "long_call": "buy_call",
+    "buy_call_option": "buy_call",
+    "put": "buy_put",
+    "long_put": "buy_put",
+    "buy_put_option": "buy_put",
+    "long": "buy_stock",
+    "buy": "buy_stock",
+    "stock": "buy_stock",
+    "long_stock": "buy_stock",
+}
+_VALID_STRIKE_PREFERENCES = {"itm", "atm", "otm"}
+_VALID_EXPIRY_PREFERENCES = {"this_week", "next_week", "monthly"}
+
+
 @dataclass(frozen=True)
 class TradeDecision:
-    action: str                    # buy_call, buy_put, close_position
+    action: str                    # buy_call, buy_put, close_position, buy_stock, close_stock
     underlying: str
     strike_preference: str         # itm, atm, otm
     expiry_preference: str         # this_week, next_week, monthly
     conviction: float              # 0.0 - 1.0
     risk_pct: float                # fraction of equity to risk (max 0.40)
     reasoning: str
-    target_symbol: str | None      # specific option symbol for closes
+    target_symbol: str | None      # specific option/equity symbol for closes
     expression_profile: str | None = None
     contract_symbol: str | None = None
     target_delta_range: tuple[float, float] | None = None
@@ -35,6 +58,7 @@ class MarketAnalysis:
     analysis: str
     trades: list[TradeDecision]
     thesis_updates: list[ThesisUpdate]
+    dropped_trades: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -45,32 +69,39 @@ class AnalysisRun:
 
 
 SYSTEM_PROMPT = """\
-You are an autonomous AI options trader. Your job is to analyze real-time market \
-news and data, then make profitable options trading decisions.
+You are an autonomous AI trader. Your job is to analyze real-time market \
+news and data, then make profitable trading decisions.
 
 CORE RULES:
-1. You trade OPTIONS (calls and puts), not stocks directly.
-2. Each trade risks premium (the amount paid). Size your risk_pct based on \
-conviction and how much of your equity you can afford to lose on THIS trade \
-if you're wrong. A 0.40 risk_pct means you're betting 40% of your equity — \
+1. You can trade OPTIONS (calls and puts) and STOCKS (long only).
+2. Each trade uses risk_pct as a hard sizing budget from account equity. \
+A 0.40 risk_pct means you're allocating up to 40% of your equity — \
 reserve that for your highest-conviction, most asymmetric setups. Most trades \
 should risk 5-15% of equity.
-3. You buy calls when you're bullish, puts when you're bearish.
-4. Only trade when you have genuine conviction from news catalysts or clear \
+3. You buy calls or stocks when you're bullish; buy puts when you're bearish.
+4. Options are preferred for catalyst plays; stocks are valid when you want \
+clean directional exposure without theta decay.
+5. Only trade when you have genuine conviction from news catalysts or clear \
 technical setups. If nothing looks compelling, return no trades.
-5. Prefer liquid options with tight bid-ask spreads.
-6. Consider the current portfolio - don't double down on the same thesis.
-7. Be disciplined. No emotional trading. Cut losses, let winners run.
-8. For expiry, prefer weeklies (this_week/next_week) for momentum plays and \
+6. Prefer liquid options with tight bid-ask spreads.
+7. Consider the current portfolio - don't double down on the same thesis.
+8. Be disciplined. No emotional trading. Cut losses, let winners run.
+9. For expiry, prefer weeklies (this_week/next_week) for momentum plays and \
 monthlies for thesis-driven trades.
-9. Your conviction score (0-1) should reflect how strongly the news/data \
+10. Your conviction score (0-1) should reflect how strongly the news/data \
 supports the trade. Only trades with conviction >= 0.6 will be executed.
-10. Think about risk/reward. A great trade has asymmetric upside.
-11. Avoid chasing extended long entries. If the underlying is described as \
+11. Think about risk/reward. A great trade has asymmetric upside.
+12. Do not let one risk flag become a blanket veto. Elevated VIXY, mixed breadth, \
+or near-term uncertainty should change the expression, sizing, or required \
+evidence — not automatically force no trade when a genuine edge exists.
+13. If options are expensive but the directional thesis is strong, prefer \
+buy_stock with smaller risk instead of discarding the trade. Use options only \
+when the catalyst/asymmetry justifies paying premium.
+14. Avoid chasing extended long entries. If the underlying is described as \
 overbought, near all-time highs, surging/gapping, or up more than 20% over \
 10 days, only buy if you can name the pullback/reclaim/consolidation level \
 that makes the entry valid. Otherwise keep the thesis developing.
-12. Every buy reasoning must include a concrete invalidation/stop condition \
+15. Every buy reasoning must include a concrete invalidation/stop condition \
 and profit-taking condition. If an existing long breaks its invalidation level \
 or breaks below the consolidation you bought, close it instead of hoping.
 
@@ -228,7 +259,9 @@ FORMAT DISCIPLINE:
 - Every returned string value must be short plain text.
 - Do not use markdown bullets, code fences, or embedded double quotes inside string values.
 - Keep `market_analysis` to 2-4 short sentences.
-- Keep thesis/reasoning fields to one short sentence each when possible.\
+- Keep thesis/reasoning fields to one short sentence each when possible.
+- For trades, use exact action values: buy_call, buy_put, buy_stock,
+  close_position, or close_stock. Use `underlying` for the ticker symbol.\
 """
 
 TRADE_TOOL = {
@@ -314,7 +347,13 @@ TRADE_TOOL = {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["buy_call", "buy_put", "close_position"],
+                            "enum": [
+                                "buy_call",
+                                "buy_put",
+                                "close_position",
+                                "buy_stock",
+                                "close_stock",
+                            ],
                             "description": "The trade action to take.",
                         },
                         "underlying": {
@@ -324,12 +363,12 @@ TRADE_TOOL = {
                         "strike_preference": {
                             "type": "string",
                             "enum": ["itm", "atm", "otm"],
-                            "description": "Strike price preference relative to current price.",
+                            "description": "For options only: strike price preference relative to current price.",
                         },
                         "expiry_preference": {
                             "type": "string",
                             "enum": ["this_week", "next_week", "monthly"],
-                            "description": "Expiration preference.",
+                            "description": "For options only: expiration preference.",
                         },
                         "conviction": {
                             "type": "number",
@@ -339,9 +378,9 @@ TRADE_TOOL = {
                         },
                         "risk_pct": {
                             "type": "number",
-                            "minimum": 0.01,
+                            "minimum": 0.0,
                             "maximum": 0.40,
-                            "description": "Fraction of equity to risk on this trade (max 0.40).",
+                            "description": "Fraction of equity to risk on this trade (max 0.40). Use 0 for closes.",
                         },
                         "reasoning": {
                             "type": "string",
@@ -353,7 +392,7 @@ TRADE_TOOL = {
                         "target_symbol": {
                             "type": "string",
                             "description": (
-                                "For close_position: the option symbol to close. "
+                                "For close_position/close_stock: symbol to close. "
                                 "Leave empty for new trades."
                             ),
                         },
@@ -451,6 +490,128 @@ def _parse_range(
     except (TypeError, ValueError):
         return None
     return (min(low, high), max(low, high))
+
+
+def _coerce_float(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(value, upper))
+
+
+def _coerce_text(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
+def _normalize_trade_action(raw_trade: dict) -> str:
+    raw_action = _coerce_text(raw_trade.get("action")).strip().lower()
+    direction = _coerce_text(raw_trade.get("direction")).strip().lower()
+    instrument = _coerce_text(raw_trade.get("instrument")).strip().lower()
+    option_type = _coerce_text(
+        raw_trade.get("option_type") or raw_trade.get("type")
+    ).strip().lower()
+
+    option_direction = direction or option_type
+    if raw_action in {"buy", "long"}:
+        if option_direction in {"call", "calls", "bullish_call"}:
+            return "buy_call"
+        if option_direction in {"put", "puts", "bearish_put"}:
+            return "buy_put"
+        if instrument in {"stock", "stocks", "equity", "shares"}:
+            return "buy_stock"
+
+    if raw_action in {"buy_option", "option"}:
+        if option_direction in {"call", "calls", "bullish_call"}:
+            return "buy_call"
+        if option_direction in {"put", "puts", "bearish_put"}:
+            return "buy_put"
+
+    return _ACTION_ALIASES.get(raw_action, raw_action)
+
+
+def _normalize_underlying(raw_trade: dict) -> str:
+    for key in ("underlying", "ticker", "target_underlying"):
+        value = _coerce_text(raw_trade.get(key)).strip().upper()
+        if value and not value.startswith("O:"):
+            return value
+
+    tickers = raw_trade.get("tickers")
+    if isinstance(tickers, list) and tickers:
+        value = _coerce_text(tickers[0]).strip().upper()
+        if value and not value.startswith("O:"):
+            return value
+
+    symbol = _coerce_text(raw_trade.get("symbol")).strip().upper()
+    if symbol and not symbol.startswith("O:"):
+        return symbol
+
+    contract = _coerce_text(
+        raw_trade.get("contract_symbol") or raw_trade.get("option_symbol") or symbol
+    ).strip().upper()
+    if contract.startswith("O:"):
+        payload = contract[2:]
+        underlying = []
+        for char in payload:
+            if char.isdigit():
+                break
+            underlying.append(char)
+        return "".join(underlying)
+    return ""
+
+
+def _trade_direction(action: str) -> str | None:
+    if action in {"buy_call", "buy_stock"}:
+        return "bullish"
+    if action == "buy_put":
+        return "bearish"
+    return None
+
+
+def _matching_thesis_conviction(
+    thesis_updates: list[ThesisUpdate],
+    *,
+    underlying: str,
+    action: str,
+) -> float | None:
+    direction = _trade_direction(action)
+    if not underlying or direction is None:
+        return None
+    matches = [
+        update.conviction
+        for update in thesis_updates
+        if update.underlying.upper() == underlying.upper()
+        and update.direction == direction
+        and update.status in {"ready", "acted_on", "developing"}
+    ]
+    return max(matches) if matches else None
+
+
+def _dropped_trade_record(
+    raw_trade: object,
+    *,
+    reason: str,
+    action: str = "",
+    underlying: str = "",
+    conviction: float | None = None,
+) -> dict:
+    record = {
+        "reason": reason,
+        "action": action,
+        "underlying": underlying,
+    }
+    if conviction is not None:
+        record["conviction"] = conviction
+    if isinstance(raw_trade, dict):
+        record["raw"] = raw_trade
+    else:
+        record["raw"] = repr(raw_trade)
+    return record
 
 
 class TradingBrain:
@@ -604,6 +765,19 @@ class TradingBrain:
                 analysis=analysis,
             )
 
+        if not completion.tool_calls:
+            message = f"LLM returned no structured tool call after {max_attempts} attempts"
+            log(message)
+            return AnalysisRun(
+                packet=request_packet,
+                completion=completion,
+                analysis=MarketAnalysis(
+                    analysis=f"LLM error: {message}",
+                    trades=[],
+                    thesis_updates=[],
+                ),
+            )
+
         return AnalysisRun(
             packet=request_packet,
             completion=completion,
@@ -645,7 +819,7 @@ class TradingBrain:
         if "RISK ALERT" in portfolio_context:
             instruction += (
                 "IMPORTANT: You have positions with RISK ALERTS. For each alerted position, "
-                "you must either close it (submit a close_position trade) or explicitly "
+                "you must either close it (submit close_position or close_stock as appropriate) or explicitly "
                 "justify holding it in a thesis update with specific reasoning. "
                 "Do not ignore any risk alerts. "
             )
@@ -699,16 +873,114 @@ class TradingBrain:
                 # Parse trades
                 raw_trades = data.get("trades", [])
                 trades = []
+                dropped_trades = []
                 for t in raw_trades:
-                    conviction = float(t.get("conviction", 0))
-                    if conviction < config.MIN_TRADE_CONVICTION:
-                        log(
-                            f"skipping {t.get('underlying', '?')} trade: "
-                            f"conviction {conviction:.2f} < {config.MIN_TRADE_CONVICTION}"
+                    if not isinstance(t, dict):
+                        log("skipping malformed trade: not an object")
+                        dropped_trades.append(
+                            _dropped_trade_record(
+                                t,
+                                reason="malformed trade: not an object",
+                            )
                         )
                         continue
 
-                    risk_pct = min(float(t.get("risk_pct", 0.10)), config.MAX_RISK_PER_TRADE)
+                    raw_action = _coerce_text(t.get("action")).strip().lower()
+                    action = _normalize_trade_action(t)
+                    if action not in _VALID_ACTIONS:
+                        log(f"skipping malformed trade: unsupported action {raw_action or '?'}")
+                        dropped_trades.append(
+                            _dropped_trade_record(
+                                t,
+                                reason=f"unsupported action {raw_action or '?'}",
+                                action=action,
+                                underlying=_normalize_underlying(t),
+                            )
+                        )
+                        continue
+
+                    underlying = _normalize_underlying(t)
+                    target_symbol = _coerce_text(
+                        t.get("target_symbol") or t.get("close_symbol")
+                    ).strip().upper() or None
+                    if target_symbol is None and action in {"close_position", "close_stock"}:
+                        target_symbol = _coerce_text(
+                            t.get("symbol") or t.get("contract_symbol") or t.get("option_symbol")
+                        ).strip().upper() or None
+                    if not underlying and target_symbol and not target_symbol.startswith("O:"):
+                        underlying = target_symbol
+                    if not underlying and action not in {"close_position", "close_stock"}:
+                        log(f"skipping malformed trade: missing underlying for {action}")
+                        dropped_trades.append(
+                            _dropped_trade_record(
+                                t,
+                                reason="missing underlying",
+                                action=action,
+                                underlying=underlying,
+                            )
+                        )
+                        continue
+
+                    is_close_action = action in ("close_position", "close_stock")
+                    default_conviction = 1.0 if is_close_action else 0.0
+                    raw_conviction = (
+                        t.get("conviction")
+                        if t.get("conviction") is not None
+                        else t.get("confidence")
+                    )
+                    if raw_conviction is None:
+                        raw_conviction = t.get("confidence_score")
+                    thesis_conviction = _matching_thesis_conviction(
+                        thesis_updates,
+                        underlying=underlying,
+                        action=action,
+                    )
+                    if raw_conviction is None and thesis_conviction is not None:
+                        raw_conviction = thesis_conviction
+                    conviction = _clamp(
+                        _coerce_float(raw_conviction, default_conviction),
+                        0.0,
+                        1.0,
+                    )
+                    if not is_close_action and conviction < config.MIN_TRADE_CONVICTION:
+                        log(
+                            f"skipping {underlying or '?'} trade: "
+                            f"conviction {conviction:.2f} < {config.MIN_TRADE_CONVICTION}"
+                        )
+                        dropped_trades.append(
+                            _dropped_trade_record(
+                                t,
+                                reason=(
+                                    f"conviction {conviction:.2f} < "
+                                    f"{config.MIN_TRADE_CONVICTION}"
+                                ),
+                                action=action,
+                                underlying=underlying,
+                                conviction=conviction,
+                            )
+                        )
+                        continue
+
+                    default_risk_pct = 0.0 if is_close_action else 0.10
+                    risk_pct = _clamp(
+                        _coerce_float(t.get("risk_pct"), default_risk_pct),
+                        0.0,
+                        config.MAX_RISK_PER_TRADE,
+                    )
+                    strike_preference = _coerce_text(
+                        t.get("strike_preference"),
+                        config.DEFAULT_STRIKE_PREFERENCE,
+                    ).strip().lower()
+                    if strike_preference not in _VALID_STRIKE_PREFERENCES:
+                        strike_preference = config.DEFAULT_STRIKE_PREFERENCE
+
+                    expiry_preference = _coerce_text(
+                        t.get("expiry_preference"),
+                        "next_week",
+                    ).strip().lower()
+                    if expiry_preference not in _VALID_EXPIRY_PREFERENCES:
+                        expiry_preference = "next_week"
+
                     target_delta_range = _parse_range(t.get("target_delta_range"), float)
                     legacy_target_delta = t.get("target_delta")
                     if target_delta_range is None and legacy_target_delta is not None:
@@ -733,32 +1005,40 @@ class TradingBrain:
 
                     trades.append(
                         TradeDecision(
-                            action=t.get("action", ""),
-                            underlying=t.get("underlying", "").upper(),
-                            strike_preference=t.get("strike_preference", "atm"),
-                            expiry_preference=t.get("expiry_preference", "next_week"),
+                            action=action,
+                            underlying=underlying,
+                            strike_preference=strike_preference,
+                            expiry_preference=expiry_preference,
                             conviction=conviction,
                             risk_pct=risk_pct,
-                            reasoning=t.get("reasoning", ""),
-                            target_symbol=t.get("target_symbol"),
+                            reasoning=_coerce_text(t.get("reasoning")),
+                            target_symbol=target_symbol,
                             expression_profile=t.get("expression_profile"),
-                            contract_symbol=t.get("contract_symbol"),
+                            contract_symbol=_coerce_text(
+                                t.get("contract_symbol") or t.get("option_symbol")
+                            ).strip() or None,
                             target_delta_range=target_delta_range,
                             target_dte_range=target_dte_range,
                             max_spread_pct=(
-                                float(t.get("max_spread_pct"))
+                                _coerce_float(t.get("max_spread_pct"), 0.0)
                                 if t.get("max_spread_pct") is not None
                                 else None
                             ),
                         )
                     )
 
-                log(f"LLM analysis complete: {len(trades)} actionable trades")
+                log(
+                    f"LLM analysis complete: {len(trades)} actionable trades, "
+                    f"{len(dropped_trades)} dropped"
+                )
                 return MarketAnalysis(
-                    analysis=analysis, trades=trades, thesis_updates=thesis_updates,
+                    analysis=analysis,
+                    trades=trades,
+                    thesis_updates=thesis_updates,
+                    dropped_trades=dropped_trades,
                 )
 
         # Fallback: no tool use in response
         analysis = " ".join(response.text_blocks) if response.text_blocks else "No analysis returned."
         log("LLM returned no structured trades")
-        return MarketAnalysis(analysis=analysis, trades=[], thesis_updates=[])
+        return MarketAnalysis(analysis=analysis, trades=[], thesis_updates=[], dropped_trades=[])

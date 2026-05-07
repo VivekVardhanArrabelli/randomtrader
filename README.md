@@ -243,8 +243,8 @@ Promotion rule:
 
 ### Historical Backtesting
 
-- Theta Data is the default historical options provider for backtests
-- Polygon is still used for historical news and equity bars
+- Polygon is the default historical provider for unattended backtests
+- Theta Data can still be selected with `HISTORICAL_OPTIONS_PROVIDER=theta`
 - the repo supports persistent historical caching and offline backtest mode
 - the first cold historical materialization can still be slow because unique
   option requests must be fetched once

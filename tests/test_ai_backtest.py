@@ -2095,13 +2095,29 @@ def test_summarize_decision_log_counts_skip_reasons():
                 },
             ]
         },
+        {
+            "dropped_trades": [
+                {
+                    "action": "buy_put",
+                    "underlying": "ASTS",
+                    "reason": "conviction 0.00 < 0.6",
+                },
+                {
+                    "action": "buy_call",
+                    "underlying": "AAPL",
+                    "reason": "missing underlying",
+                },
+            ]
+        },
     ])
 
     assert summary["proposed"] == 4
     assert summary["executed"] == 1
     assert summary["skipped"] == 3
+    assert summary["dropped"] == 2
     assert summary["guardrail_skips"] == 1
     assert summary["skip_reasons"][0] == {"reason": "no contract found", "count": 2}
+    assert summary["drop_reasons"][0] == {"reason": "conviction 0.00 < 0.6", "count": 1}
 
 
 def test_backtest_option_loss_streak_guard_blocks_marginal_options():
@@ -2173,6 +2189,36 @@ def test_stock_symbol_notional_for_budget_counts_existing_same_symbol_stock():
     assert _stock_symbol_notional_for_budget(positions, "NVDA", 207.0) == 4554.0
 
 
+def test_mark_to_market_stock_uses_share_multiplier(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    pos = SimPosition(
+        underlying="AAPL",
+        option_type="stock",
+        strike=0.0,
+        entry_date=date(2026, 5, 6),
+        expiry_date=date(2026, 8, 1),
+        entry_premium=100.0,
+        qty=5,
+        conviction=0.7,
+        reasoning="stock proxy",
+        polygon_ticker="AAPL",
+    )
+
+    monkeypatch.setattr(bt_mod, "_current_equity_bar", lambda *args, **kwargs: {"c": 110.0})
+
+    equity, unrealized = bt_mod._mark_to_market_equity(
+        100_000.0,
+        [pos],
+        datetime(2026, 5, 6, 10, 0, tzinfo=EASTERN_TZ),
+        "polygon",
+        PolygonCache(),
+    )
+
+    assert unrealized == 50.0
+    assert equity == 100_050.0
+
+
 # ---------------------------------------------------------------------------
 # save_debug_log
 # ---------------------------------------------------------------------------
@@ -2206,6 +2252,10 @@ def test_save_debug_log(tmp_path):
                      "status": "skipped", "skip_reason": "no contract found",
                      "contract": "", "qty": 0, "premium": 0.0},
                 ],
+                "dropped_trades": [
+                    {"underlying": "ASTS", "action": "buy_put",
+                     "conviction": 0.3, "reason": "conviction 0.30 < 0.6"}
+                ],
                 "trades_executed": 1,
                 "trades_skipped": 1,
                 "equity": 95000.0,
@@ -2224,6 +2274,8 @@ def test_save_debug_log(tmp_path):
     assert "Executed" in content
     assert "SKIPPED" in content
     assert "no contract found" in content
+    assert "Dropped Model Trades" in content
+    assert "conviction 0.30 < 0.6" in content
     assert "Decision summary: 2 proposed | 1 executed | 1 skipped" in content
     assert "$95,000" in content
 
@@ -2685,6 +2737,138 @@ def test_run_backtest_streams_trades_and_decisions_to_log_db(tmp_path, monkeypat
         "2025-01-17",
         "2025-01-06",
     )
+
+
+def test_run_backtest_executes_buy_and_close_stock(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+    ]
+    analyses = [
+        MarketAnalysis(
+            analysis="Stock is the cleaner expression.",
+            thesis_updates=[],
+            trades=[
+                TradeDecision(
+                    action="buy_stock",
+                    underlying="AAPL",
+                    strike_preference="atm",
+                    expiry_preference="next_week",
+                    conviction=0.8,
+                    risk_pct=0.01,
+                    reasoning="Use shares to avoid option premium.",
+                    target_symbol=None,
+                    expression_profile="stock_proxy",
+                )
+            ],
+        ),
+        MarketAnalysis(
+            analysis="Take the stock gain.",
+            thesis_updates=[],
+            trades=[
+                TradeDecision(
+                    action="close_stock",
+                    underlying="AAPL",
+                    strike_preference="",
+                    expiry_preference="",
+                    conviction=1.0,
+                    risk_pct=0.0,
+                    reasoning="Manual close after target hit.",
+                    target_symbol="AAPL",
+                )
+            ],
+        ),
+    ]
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            self.idx = 0
+
+        def run(self, **kwargs):
+            analysis = analyses[self.idx]
+            self.idx += 1
+            packet = LLMDecisionPacket(
+                provider="openai",
+                model="gpt-5.4",
+                system_prompt="system",
+                user_message="prompt",
+                tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                max_tokens=256,
+                temperature=0.1,
+                contexts=kwargs,
+            )
+            completion = LLMCompletion(
+                provider="openai",
+                model="gpt-5.4",
+                tool_calls=[
+                    ToolCall(
+                        name="submit_trade_decisions",
+                        input={
+                            "market_analysis": analysis.analysis,
+                            "thesis_updates": [],
+                            "trades": [
+                                {
+                                    "action": trade.action,
+                                    "underlying": trade.underlying,
+                                    "conviction": trade.conviction,
+                                    "risk_pct": trade.risk_pct,
+                                    "reasoning": trade.reasoning,
+                                    "target_symbol": trade.target_symbol,
+                                }
+                                for trade in analysis.trades
+                            ],
+                        },
+                    )
+                ],
+                raw_response={"id": f"resp_stock_{self.idx}"},
+            )
+            return AnalysisRun(packet=packet, completion=completion, analysis=analysis)
+
+    def current_underlying_price(*args, **kwargs):
+        as_of = args[2]
+        if isinstance(as_of, datetime) and as_of.minute == 50:
+            return 106.0
+        return 100.0
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "infer_provider", lambda model=None, provider=None: "openai")
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-openai")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", current_underlying_price)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].option_type == "stock"
+    assert result.trades[0].qty == 10
+    assert result.trades[0].pnl == 60.0
+    assert result.trades[0].exit_reason == "manual_close"
+    assert result.decision_log[0]["trades_proposed"][0]["status"] == "executed"
+    assert result.decision_log[1]["trades_proposed"][0]["action"] == "close_stock"
 
 
 def test_run_backtest_persists_journal_into_log_db(tmp_path, monkeypatch):

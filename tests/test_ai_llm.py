@@ -69,6 +69,18 @@ def test_default_llm_model_is_openai_family(monkeypatch):
     assert config.resolved_llm_model() == "gpt-5.4"
 
 
+def test_default_historical_options_provider_is_polygon(monkeypatch):
+    monkeypatch.delenv("HISTORICAL_OPTIONS_PROVIDER", raising=False)
+
+    assert config.resolved_historical_options_provider() == "polygon"
+
+
+def test_historical_options_provider_env_override(monkeypatch):
+    monkeypatch.setenv("HISTORICAL_OPTIONS_PROVIDER", "theta")
+
+    assert config.resolved_historical_options_provider() == "theta"
+
+
 def test_trading_brain_defaults_to_resolved_model(monkeypatch):
     class DummyAdapter:
         provider = "openai"

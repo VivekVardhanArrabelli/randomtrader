@@ -67,6 +67,7 @@ from .options import (
 )
 from .risk import (
     evaluate_trade_risk,
+    evaluate_stock_trade_risk,
     evaluate_position_risk,
     scale_risk_pct_for_conviction,
     size_for_risk_budget,
@@ -1250,6 +1251,19 @@ def _mark_to_market_equity(
     for pos in positions:
         if not pos.polygon_ticker:
             continue
+        if pos.option_type == "stock":
+            bar = _current_equity_bar(
+                api_key,
+                pos.underlying,
+                as_of,
+                cache=cache,
+                bar_minutes=bar_minutes,
+            )
+            price = _equity_bar_price(bar) if bar else 0.0
+            if price <= 0 or pos.entry_premium <= 0:
+                continue
+            total_unrealized += (price - pos.entry_premium) * pos.qty
+            continue
         bar = _current_option_bar(
             api_key, pos.polygon_ticker, as_of, cache=cache, bar_minutes=bar_minutes,
         )
@@ -1811,6 +1825,7 @@ def _analysis_to_decisions_json(analysis: MarketAnalysis) -> str:
                 }
                 for decision in analysis.trades
             ],
+            "dropped_trades": analysis.dropped_trades,
         }
     )
 
@@ -1823,13 +1838,14 @@ def _log_backtest_open_trade(
     market_analysis: str,
     option_type: str,
     strike: float,
-    expiry: date,
+    expiry: date | None,
     polygon_ticker: str,
     qty: int,
     premium: float,
 ) -> None:
     if logger is None:
         return
+    multiplier = 1 if option_type == "stock" else 100
     logger.log_trade(
         AITradeRecord(
             timestamp=decision_time,
@@ -1837,11 +1853,11 @@ def _log_backtest_open_trade(
             underlying=decision.underlying,
             option_type=option_type,
             strike=strike,
-            expiration=expiry.isoformat(),
+            expiration=expiry.isoformat() if expiry else "",
             action=decision.action,
             qty=qty,
             premium=premium,
-            total_cost=premium * qty * 100,
+            total_cost=premium * qty * multiplier,
             conviction=decision.conviction,
             reasoning=decision.reasoning,
             market_analysis=market_analysis,
@@ -2976,6 +2992,31 @@ def _build_enriched_portfolio_context(
 
     total_unrealized = 0.0
     for pos in positions:
+        if pos.option_type == "stock":
+            line = f"  {pos.underlying} stock"
+            lines.append(line)
+            bar = _current_equity_bar(
+                api_key,
+                pos.underlying,
+                trade_date,
+                cache=cache,
+                bar_minutes=bar_minutes,
+            )
+            current_price = _equity_bar_price(bar) if bar else 0.0
+            if current_price > 0 and pos.entry_premium > 0:
+                pnl_pct = (current_price - pos.entry_premium) / pos.entry_premium * 100
+                pnl_dollar = (current_price - pos.entry_premium) * pos.qty
+                total_unrealized += pnl_dollar
+                lines.append(
+                    f"    entry=${pos.entry_premium:.2f} current=${current_price:.2f} "
+                    f"unrealized={pnl_pct:+.1f}% (${pnl_dollar:+,.2f}) qty={pos.qty}"
+                )
+            else:
+                lines.append(f"    entry=${pos.entry_premium:.2f} qty={pos.qty}")
+            if pos.risk_alert:
+                lines.append(f"    ** RISK ALERT: {pos.risk_alert}")
+            continue
+
         dte = (pos.expiry_date - trade_day).days
         line = (
             f"  {pos.polygon_ticker or pos.underlying} {pos.option_type} "
@@ -3045,6 +3086,20 @@ def _simulated_position_market_value(
     bar_minutes: int = 5,
 ) -> float:
     premium = pos.entry_premium
+    multiplier = 100
+    if pos.option_type == "stock":
+        multiplier = 1
+        bar = _current_equity_bar(
+            api_key,
+            pos.underlying,
+            as_of,
+            cache=cache,
+            bar_minutes=bar_minutes,
+        )
+        observed_price = _equity_bar_price(bar) if bar else 0.0
+        if observed_price > 0:
+            premium = observed_price
+        return max(premium, 0.0) * pos.qty * multiplier
     if pos.polygon_ticker:
         option_bar = _current_option_bar(
             api_key,
@@ -3056,7 +3111,7 @@ def _simulated_position_market_value(
         observed_premium = _option_bar_price(option_bar) if option_bar else 0.0
         if observed_premium > 0:
             premium = observed_premium
-    return max(premium, 0.0) * pos.qty * 100
+    return max(premium, 0.0) * pos.qty * multiplier
 
 
 def _simulated_current_exposure(
@@ -3155,6 +3210,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             remaining: list[SimPosition] = []
             for pos in positions:
                 pos = replace(pos, risk_alert="")
+                if pos.option_type == "stock":
+                    remaining.append(pos)
+                    continue
                 dte = (pos.expiry_date - decision_time.date()).days
                 if not pos.polygon_ticker:
                     remaining.append(pos)
@@ -3475,10 +3533,20 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     target = decision.target_symbol
                     matched_pos = None
                     if target:
-                        matched_pos = next((p for p in positions if p.polygon_ticker == target), None)
+                        matched_pos = next(
+                            (
+                                p for p in positions
+                                if p.option_type != "stock" and p.polygon_ticker == target
+                            ),
+                            None,
+                        )
                     if matched_pos is None:
                         matched_pos = next(
-                            (p for p in positions if p.underlying.upper() == decision.underlying.upper()),
+                            (
+                                p for p in positions
+                                if p.option_type != "stock"
+                                and p.underlying.upper() == decision.underlying.upper()
+                            ),
                             None,
                         )
                     if matched_pos is None:
@@ -3553,6 +3621,199 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         exit_premium=exit_premium,
                         trade_pnl=trade_pnl,
                         reason="manual_close",
+                    )
+                    account_equity, _ = _mark_to_market_equity(
+                        equity,
+                        positions,
+                        decision_time,
+                        polygon_key,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                    continue
+
+                if decision.action == "close_stock":
+                    target = (decision.target_symbol or decision.underlying).upper()
+                    matched_pos = next(
+                        (
+                            p for p in positions
+                            if p.option_type == "stock"
+                            and (p.underlying.upper() == target or p.polygon_ticker.upper() == target)
+                        ),
+                        None,
+                    )
+                    if matched_pos is None:
+                        trade_record["skip_reason"] = "no matching stock position"
+                        trade_results.append(trade_record)
+                        continue
+
+                    exit_price = _current_underlying_price(
+                        polygon_key,
+                        matched_pos.underlying,
+                        decision_time,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                    if exit_price <= 0:
+                        trade_record["skip_reason"] = "no stock price data before close"
+                        trade_results.append(trade_record)
+                        continue
+
+                    trade_pnl = (exit_price - matched_pos.entry_premium) * matched_pos.qty
+                    equity += trade_pnl
+                    result.trades.append(
+                        SimTrade(
+                            entry_date=matched_pos.entry_date,
+                            exit_date=decision_time.date(),
+                            underlying=matched_pos.underlying,
+                            option_type="stock",
+                            strike=0.0,
+                            entry_premium=matched_pos.entry_premium,
+                            exit_premium=exit_price,
+                            qty=matched_pos.qty,
+                            pnl=trade_pnl,
+                            exit_reason="manual_close",
+                            conviction=matched_pos.conviction,
+                            expression_profile=matched_pos.expression_profile,
+                            polygon_ticker=matched_pos.polygon_ticker,
+                            reasoning=matched_pos.reasoning,
+                        )
+                    )
+                    closed_trades.append({
+                        "timestamp": decision_time.isoformat(),
+                        "entry_date": matched_pos.entry_date.isoformat(),
+                        "symbol": matched_pos.polygon_ticker,
+                        "underlying": matched_pos.underlying,
+                        "option_type": "stock",
+                        "entry_premium": matched_pos.entry_premium,
+                        "exit_premium": exit_price,
+                        "pnl": trade_pnl,
+                        "reason": "manual_close",
+                        "conviction": matched_pos.conviction,
+                        "expression_profile": matched_pos.expression_profile,
+                        "polygon_ticker": matched_pos.polygon_ticker,
+                    })
+                    positions.remove(matched_pos)
+                    trade_record["status"] = "executed"
+                    trade_record["contract"] = matched_pos.polygon_ticker
+                    trade_record["qty"] = matched_pos.qty
+                    trade_record["premium"] = exit_price
+                    trade_record["pnl"] = trade_pnl
+                    trade_results.append(trade_record)
+                    trades_executed += 1
+                    _log_backtest_close(
+                        logger,
+                        decision_time=decision_time,
+                        position=matched_pos,
+                        exit_premium=exit_price,
+                        trade_pnl=trade_pnl,
+                        reason="manual_close",
+                    )
+                    account_equity, _ = _mark_to_market_equity(
+                        equity,
+                        positions,
+                        decision_time,
+                        polygon_key,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                    continue
+
+                if decision.action == "buy_stock":
+                    if len(positions) >= bt_config.max_positions:
+                        trade_record["skip_reason"] = "max positions reached"
+                        trade_results.append(trade_record)
+                        continue
+
+                    underlying = decision.underlying
+                    entry_price = _current_underlying_price(
+                        polygon_key,
+                        underlying,
+                        decision_time,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                    if entry_price <= 0:
+                        trade_record["skip_reason"] = "no stock price data before decision time"
+                        trade_results.append(trade_record)
+                        continue
+
+                    requested_risk_pct = min(
+                        scale_risk_pct_for_conviction(decision.risk_pct, decision.conviction),
+                        bt_config.max_risk_per_trade,
+                    )
+                    current_exposure = _simulated_current_exposure(
+                        positions,
+                        decision_time,
+                        polygon_key,
+                        cache,
+                        bar_minutes=bt_config.signal_bar_minutes,
+                    )
+                    cash = max(account_equity - current_exposure, 0.0)
+                    day_pl = account_equity - prior_day_equity
+                    risk_check = evaluate_stock_trade_risk(
+                        equity=account_equity,
+                        cash=cash,
+                        current_exposure=current_exposure,
+                        open_positions=len(positions),
+                        share_price=entry_price,
+                        day_pl=day_pl,
+                    )
+                    if not risk_check.approved:
+                        trade_record["skip_reason"] = f"risk: {risk_check.reason}"
+                        trade_results.append(trade_record)
+                        continue
+
+                    requested_budget = account_equity * requested_risk_pct
+                    existing_notional = _stock_symbol_notional_for_budget(
+                        positions,
+                        underlying,
+                        entry_price,
+                    )
+                    remaining_symbol_budget = max(requested_budget - existing_notional, 0.0)
+                    qty = min(
+                        risk_check.max_shares,
+                        size_for_risk_budget(remaining_symbol_budget, entry_price),
+                    )
+                    if qty <= 0:
+                        trade_record["skip_reason"] = "stock risk budget too small for 1 share"
+                        trade_results.append(trade_record)
+                        continue
+
+                    positions.append(
+                        SimPosition(
+                            underlying=underlying,
+                            option_type="stock",
+                            strike=0.0,
+                            entry_date=trade_date,
+                            expiry_date=bt_config.end_date,
+                            entry_premium=entry_price,
+                            qty=qty,
+                            conviction=decision.conviction,
+                            reasoning=decision.reasoning,
+                            expression_profile=decision.expression_profile or "stock_proxy",
+                            polygon_ticker=underlying,
+                        )
+                    )
+                    trade_record["status"] = "executed"
+                    trade_record["contract"] = underlying
+                    trade_record["qty"] = qty
+                    trade_record["premium"] = entry_price
+                    trade_record["effective_risk_pct"] = requested_risk_pct
+                    trade_record["expression_profile"] = decision.expression_profile or "stock_proxy"
+                    trade_results.append(trade_record)
+                    trades_executed += 1
+                    _log_backtest_open_trade(
+                        logger,
+                        decision_time=decision_time,
+                        decision=decision,
+                        market_analysis=analysis.analysis,
+                        option_type="stock",
+                        strike=0.0,
+                        expiry=None,
+                        polygon_ticker=underlying,
+                        qty=qty,
+                        premium=entry_price,
                     )
                     account_equity, _ = _mark_to_market_equity(
                         equity,
@@ -3777,6 +4038,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 "options_watchlist": options_watchlist or deep_focus_symbols,
                 "thesis_updates": thesis_updates_serialized,
                 "trades_proposed": trade_results,
+                "dropped_trades": analysis.dropped_trades,
                 "trades_executed": sum(1 for t in trade_results if t["status"] == "executed"),
                 "trades_skipped": sum(1 for t in trade_results if t["status"] == "skipped"),
                 "equity": marked_equity,
@@ -3816,7 +4078,31 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     last_date = trading_days[-1] if trading_days else bt_config.end_date
     for pos in positions:
         exit_premium = 0.0
-        if pos.polygon_ticker:
+        if pos.option_type == "stock":
+            close_time = _market_close_dt(last_date)
+            exit_premium = _current_underlying_price(
+                polygon_key,
+                pos.underlying,
+                close_time,
+                cache,
+                bar_minutes=bt_config.signal_bar_minutes,
+            )
+            if exit_premium <= 0:
+                for lookback in range(1, 4):
+                    check_date = last_date - timedelta(days=lookback)
+                    bar = fetch_historical_daily_bar(
+                        polygon_key,
+                        pos.underlying,
+                        check_date,
+                        cache=cache,
+                    )
+                    if bar is not None:
+                        exit_premium = _equity_bar_price(bar)
+                        if exit_premium > 0:
+                            break
+            if exit_premium <= 0:
+                exit_premium = pos.entry_premium
+        elif pos.polygon_ticker:
             close_time = _market_close_dt(last_date)
             option_bar = _current_option_bar(
                 polygon_key,
@@ -3838,7 +4124,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         if exit_premium > 0:
                             break
 
-        trade_pnl = (exit_premium - pos.entry_premium) * pos.qty * 100
+        multiplier = 1 if pos.option_type == "stock" else 100
+        trade_pnl = (exit_premium - pos.entry_premium) * pos.qty * multiplier
         equity += trade_pnl
         result.trades.append(
             SimTrade(
@@ -3926,6 +4213,8 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
 def _summarize_decision_log(decision_log: list[dict]) -> dict:
     proposed = executed = skipped = 0
     skip_counter: Counter[str] = Counter()
+    dropped = 0
+    drop_counter: Counter[str] = Counter()
 
     for entry in decision_log:
         proposed_trades = entry.get("trades_proposed") or []
@@ -3947,6 +4236,14 @@ def _summarize_decision_log(decision_log: list[dict]) -> dict:
             executed += entry_executed
             skipped += entry_skipped
             proposed += entry_executed + entry_skipped
+        dropped_trades = entry.get("dropped_trades") or []
+        if isinstance(dropped_trades, list):
+            dropped += len(dropped_trades)
+            for trade in dropped_trades:
+                if not isinstance(trade, dict):
+                    continue
+                reason = str(trade.get("reason") or "unknown")
+                drop_counter[reason] += 1
 
     guardrail_skips = sum(
         count for reason, count in skip_counter.items()
@@ -3957,10 +4254,15 @@ def _summarize_decision_log(decision_log: list[dict]) -> dict:
         "proposed": proposed,
         "executed": executed,
         "skipped": skipped,
+        "dropped": dropped,
         "guardrail_skips": guardrail_skips,
         "skip_reasons": [
             {"reason": reason, "count": count}
             for reason, count in skip_counter.most_common()
+        ],
+        "drop_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in drop_counter.most_common()
         ],
     }
 
@@ -3983,16 +4285,22 @@ def print_backtest_result(r: BacktestResult) -> None:
         print(f"  Win rate:         {r.win_rate:.1%}")
 
     decision_summary = _summarize_decision_log(r.decision_log)
-    if decision_summary["proposed"]:
+    if decision_summary["proposed"] or decision_summary["dropped"]:
         print(f"\n  Proposed trades:  {decision_summary['proposed']}")
         print(f"  Executed props:   {decision_summary['executed']}")
         print(f"  Skipped props:    {decision_summary['skipped']}")
+        print(f"  Dropped model:    {decision_summary['dropped']}")
         if decision_summary["guardrail_skips"]:
             print(f"  Guardrail skips:  {decision_summary['guardrail_skips']}")
         top_reasons = decision_summary["skip_reasons"][:3]
         if top_reasons:
             print("  Top skip reasons:")
             for row in top_reasons:
+                print(f"    {row['count']}x {row['reason']}")
+        top_drop_reasons = decision_summary["drop_reasons"][:3]
+        if top_drop_reasons:
+            print("  Top drop reasons:")
+            for row in top_drop_reasons:
                 print(f"    {row['count']}x {row['reason']}")
 
     print(f"\n  Max drawdown:     ${r.max_drawdown:,.2f}")
@@ -4112,17 +4420,22 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         f"Final: ${r.final_equity:,.0f} ({r.total_return_pct:+.1%}) | {win_loss}"
     )
     decision_summary = _summarize_decision_log(r.decision_log)
-    if decision_summary["proposed"]:
+    if decision_summary["proposed"] or decision_summary["dropped"]:
         lines.append(
             "Decision summary: "
             f"{decision_summary['proposed']} proposed | "
             f"{decision_summary['executed']} executed | "
             f"{decision_summary['skipped']} skipped | "
+            f"{decision_summary['dropped']} dropped | "
             f"{decision_summary['guardrail_skips']} guardrail skips"
         )
         if decision_summary["skip_reasons"]:
             lines.append("Top skip reasons:")
             for row in decision_summary["skip_reasons"][:5]:
+                lines.append(f"- {row['count']}x {row['reason']}")
+        if decision_summary["drop_reasons"]:
+            lines.append("Top drop reasons:")
+            for row in decision_summary["drop_reasons"][:5]:
                 lines.append(f"- {row['count']}x {row['reason']}")
     lines.append("")
 
@@ -4190,6 +4503,33 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         else:
             lines.append("**Trades:** None")
         lines.append("")
+
+        dropped_trades = entry.get("dropped_trades", [])
+        if dropped_trades:
+            lines.append("**Dropped Model Trades:**")
+            for dropped in dropped_trades:
+                if not isinstance(dropped, dict):
+                    lines.append(f"- unknown | {dropped}")
+                    continue
+                raw = dropped.get("raw") if isinstance(dropped.get("raw"), dict) else {}
+                action = (
+                    dropped.get("action")
+                    or raw.get("action")
+                    or "?"
+                )
+                underlying = (
+                    dropped.get("underlying")
+                    or raw.get("underlying")
+                    or raw.get("ticker")
+                    or "?"
+                )
+                conv = dropped.get("conviction")
+                conv_part = f" | conviction={conv:.2f}" if isinstance(conv, (int, float)) else ""
+                lines.append(
+                    f"- {action} {underlying}{conv_part} | "
+                    f"{dropped.get('reason', 'unknown')}"
+                )
+            lines.append("")
 
         # Equity / positions
         eq = entry.get("equity", 0)

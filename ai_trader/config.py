@@ -99,7 +99,7 @@ POLYGON_429_RETRY_ATTEMPTS = 5
 # Theta Data API (historical options backtests)
 # ---------------------------------------------------------------------------
 THETA_BASE_URL = "http://127.0.0.1:25510"
-HISTORICAL_OPTIONS_PROVIDER = "theta"  # theta / polygon
+HISTORICAL_OPTIONS_PROVIDER = "polygon"  # theta / polygon
 
 # ---------------------------------------------------------------------------
 # LLM

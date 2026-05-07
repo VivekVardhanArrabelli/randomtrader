@@ -296,17 +296,62 @@ class ThesisJournal:
 
 def parse_thesis_updates(raw: list[dict]) -> list[ThesisUpdate]:
     """Parse raw LLM output into ThesisUpdate objects."""
+    def safe_float(value: object, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     updates = []
     for item in raw:
+        if not isinstance(item, dict):
+            continue
+        raw_action = str(item.get("action") or "").strip().lower()
+        raw_id = item.get("id")
+        if raw_id is None and raw_action not in {"create", "new"}:
+            raw_id = item.get("thesis_id")
+        underlying = item.get("underlying") or item.get("ticker") or item.get("symbol")
+        if not underlying:
+            tickers = item.get("tickers")
+            if isinstance(tickers, list) and tickers:
+                underlying = tickers[0]
+        underlying = underlying or ""
+        thesis = (
+            item.get("thesis")
+            or item.get("reasoning")
+            or item.get("reason")
+            or item.get("new_observation")
+            or ""
+        )
+        new_observation = (
+            item.get("new_observation")
+            or item.get("observation")
+            or item.get("reasoning")
+            or item.get("reason")
+            or ""
+        )
+        raw_direction = item.get("direction")
+        direction = str(raw_direction or "").strip().lower()
+        if direction in {"call", "long", "bull"}:
+            direction = "bullish"
+        elif direction in {"put", "short", "bear"}:
+            direction = "bearish"
+        elif direction not in {"bullish", "bearish", "neutral"}:
+            direction = "neutral" if raw_id is None else ""
+        status = str(item.get("status") or "").strip().lower()
+        if raw_action in {"invalidate", "invalidated"}:
+            status = "invalidated"
+        elif not status:
+            status = "developing"
         updates.append(
             ThesisUpdate(
-                id=item.get("id"),
-                underlying=(item.get("underlying") or "").upper(),
-                direction=item.get("direction") or "neutral",
-                thesis=item.get("thesis") or "",
-                conviction=float(item.get("conviction") or 0.5),
-                status=item.get("status") or "developing",
-                new_observation=item.get("new_observation") or "",
+                id=str(raw_id) if raw_id is not None else None,
+                underlying=str(underlying).upper(),
+                direction=direction,
+                thesis=str(thesis),
+                conviction=safe_float(item.get("conviction"), 0.5),
+                status=status,
+                new_observation=str(new_observation),
             )
         )
     return updates
