@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import time as time_module
 from collections import Counter
 from dataclasses import dataclass, field, replace
@@ -26,7 +27,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from . import config
-from .brain import MarketAnalysis, TradingBrain, TradeDecision
+from .brain import AnalysisRun, MarketAnalysis, TradingBrain, TradeDecision
 from .candidates import (
     build_candidate_ideas,
     format_candidate_table,
@@ -46,7 +47,14 @@ from .historical_cache import (
     PolygonResponseStore,
 )
 from .journal import ThesisJournal
-from .llm import api_key_env_name, infer_provider, resolve_api_key
+from .llm import (
+    LLMCompletion,
+    LLMDecisionPacket,
+    ToolCall,
+    api_key_env_name,
+    infer_provider,
+    resolve_api_key,
+)
 from .news import (
     NewsItem,
     build_news_events,
@@ -1454,22 +1462,37 @@ def _rank_contracts_for_hydration(
     default_dte: int,
     contract_symbol: str | None = None,
     target_dte_range: tuple[int, int] | None = None,
+    target_strike_override: float | None = None,
+    target_dte_override: float | None = None,
     limit: int | None = None,
 ) -> list[dict]:
     """Bound expensive option-bar hydration to the most plausible contracts."""
     if not contracts:
         return []
     limit = max(int(limit or len(contracts)), 1)
-    if len(contracts) <= limit:
+    exact_symbol = (contract_symbol or "").strip()
+    needs_targeted_order = (
+        bool(exact_symbol)
+        or target_strike_override is not None
+        or target_dte_override is not None
+    )
+    if len(contracts) <= limit and not needs_targeted_order:
         return contracts
 
-    exact_symbol = (contract_symbol or "").strip()
-    target_strike = _target_strike_for_preference(spot, strike_preference, option_type)
-    target_dte = _target_dte_for_preference(
-        trade_date,
-        expiry_preference,
-        default_dte,
-        target_dte_range,
+    target_strike = (
+        target_strike_override
+        if target_strike_override is not None
+        else _target_strike_for_preference(spot, strike_preference, option_type)
+    )
+    target_dte = (
+        target_dte_override
+        if target_dte_override is not None
+        else _target_dte_for_preference(
+            trade_date,
+            expiry_preference,
+            default_dte,
+            target_dte_range,
+        )
     )
 
     def score(contract: dict) -> tuple[float, float, float, str]:
@@ -1484,7 +1507,8 @@ def _rank_contracts_for_hydration(
             symbol,
         )
 
-    return sorted(contracts, key=score)[:limit]
+    ranked = sorted(contracts, key=score)
+    return ranked[:limit] if len(ranked) > limit else ranked
 
 
 def _polygon_contract_to_option_contract(
@@ -1665,6 +1689,8 @@ def _select_real_contract(
     strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
     strike_lte = round(spot * (1.0 + strike_band_pct), 2)
     parsed_contract_symbol = _parse_polygon_option_ticker(contract_symbol or "")
+    contract_target_strike: float | None = None
+    contract_target_dte: float | None = None
     if parsed_contract_symbol is not None:
         (
             parsed_underlying,
@@ -1680,6 +1706,8 @@ def _select_real_contract(
             expiry_lte = max(expiry_lte, parsed_expiration)
             strike_gte = min(strike_gte, round(parsed_strike, 2))
             strike_lte = max(strike_lte, round(parsed_strike, 2))
+            contract_target_strike = parsed_strike
+            contract_target_dte = float(max((parsed_expiration - trade_date).days, 1))
 
     contracts = fetch_polygon_option_contracts(
         api_key, underlying, option_type,
@@ -1700,6 +1728,8 @@ def _select_real_contract(
         default_dte=default_dte,
         contract_symbol=contract_symbol,
         target_dte_range=target_dte_range,
+        target_strike_override=contract_target_strike,
+        target_dte_override=contract_target_dte,
         limit=getattr(config, "BACKTEST_CONTRACT_HYDRATION_LIMIT", 12),
     )
     as_of = decision_time or trade_date
@@ -1709,16 +1739,21 @@ def _select_real_contract(
     quoteable_count = 0
     for contract in contracts:
         hydrated_count += 1
-        option_contract = _polygon_contract_to_option_contract(
-            contract,
-            api_key=api_key,
-            underlying=underlying,
-            option_type=option_type,
-            trade_date=trade_date,
-            as_of=as_of,
-            cache=cache,
-            bar_minutes=bar_minutes,
-        )
+        try:
+            option_contract = _polygon_contract_to_option_contract(
+                contract,
+                api_key=api_key,
+                underlying=underlying,
+                option_type=option_type,
+                trade_date=trade_date,
+                as_of=as_of,
+                cache=cache,
+                bar_minutes=bar_minutes,
+            )
+        except RuntimeError as exc:
+            if _is_offline_cache_miss(exc):
+                continue
+            raise
         if option_contract is None or option_contract.ask <= 0:
             continue
         quoteable_count += 1
@@ -1892,6 +1927,7 @@ class BacktestConfig:
     prepare_only: bool = False
     cache_db_path: Path | None = None
     log_db_path: Path | None = None
+    decision_replay_db_path: Path | None = None
     prepare_prefetch_symbols: int = config.PREPARE_PREFETCH_SYMBOLS
     prepare_prefetch_contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE
     prepare_prefetch_strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT
@@ -1970,6 +2006,78 @@ def _is_llm_error_message(message: str | None) -> bool:
     if not isinstance(message, str):
         return False
     return message.strip().lower().startswith("llm error:")
+
+
+class _DecisionReplayAdapter:
+    provider = "replay"
+
+    def complete_structured(self, **kwargs) -> LLMCompletion:  # pragma: no cover - never called
+        raise RuntimeError("decision replay adapter cannot call an LLM")
+
+
+def _load_decision_replay_db(path: Path) -> dict[str, dict]:
+    """Load logged structured decisions keyed by ISO decision timestamp."""
+    replay: dict[str, dict] = {}
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT timestamp, decisions_json, llm_provider, llm_model
+            FROM ai_decisions
+            ORDER BY timestamp
+            """
+        ).fetchall()
+    for timestamp, decisions_json, provider, model in rows:
+        try:
+            payload = json.loads(decisions_json or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid replay decisions_json for {timestamp}: {exc}") from exc
+        replay[str(timestamp)] = {
+            "payload": payload,
+            "provider": provider or "replay",
+            "model": model or "logged",
+        }
+    return replay
+
+
+def _analysis_run_from_replayed_decision(
+    decision_time: datetime,
+    replay_entry: dict,
+) -> AnalysisRun:
+    payload = dict(replay_entry.get("payload") or {})
+    provider = str(replay_entry.get("provider") or "replay")
+    model = str(replay_entry.get("model") or "logged")
+    completion = LLMCompletion(
+        provider=provider,
+        model=model,
+        tool_calls=[
+            ToolCall(
+                name="submit_trade_decisions",
+                input=payload,
+            )
+        ],
+        raw_response={
+            "replayed": True,
+            "decision_time": decision_time.isoformat(),
+        },
+    )
+    parser = TradingBrain(adapter=_DecisionReplayAdapter(), model=model)
+    diagnostics = dict(payload.get("llm_diagnostics") or {})
+    diagnostics["replayed"] = True
+    return AnalysisRun(
+        packet=LLMDecisionPacket(
+            provider="replay",
+            model=model,
+            system_prompt="",
+            user_message=f"replayed logged decision for {decision_time.isoformat()}",
+            tool={"name": "submit_trade_decisions"},
+            max_tokens=0,
+            temperature=0.0,
+            contexts={},
+        ),
+        completion=completion,
+        analysis=parser._parse_response(completion),
+        diagnostics=diagnostics,
+    )
 
 
 def _analysis_to_decisions_json(
@@ -3336,7 +3444,10 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     llm_provider = ""
     historical_options_provider = _historical_options_provider()
     brain: TradingBrain | None = None
-    if not bt_config.prepare_only:
+    decision_replay: dict[str, dict] | None = None
+    if bt_config.decision_replay_db_path is not None:
+        decision_replay = _load_decision_replay_db(bt_config.decision_replay_db_path)
+    if not bt_config.prepare_only and decision_replay is None:
         llm_model = config.resolved_llm_model()
         llm_provider = infer_provider(
             model=llm_model,
@@ -3350,6 +3461,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             provider=llm_provider,
             model=llm_model,
         )
+    elif decision_replay is not None:
+        llm_provider = "replay"
     polygon_key = os.environ.get("POLYGON_API_KEY") or ""
     if not polygon_key and not bt_config.offline:
         raise ValueError("POLYGON_API_KEY required for backtesting")
@@ -3388,6 +3501,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     log(f"historical options provider: {historical_options_provider}")
     if bt_config.prepare_only:
         log(f"mode: prepare-only cache warm ({cache.store.db_path})")
+    elif decision_replay is not None:
+        log(f"mode: logged decision replay ({bt_config.decision_replay_db_path})")
     elif bt_config.offline:
         log(f"mode: offline cache replay ({cache.store.db_path})")
     prior_day_equity = bt_config.initial_equity
@@ -3685,15 +3800,29 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             if bt_config.llm_delay_seconds > 0:
                 time_module.sleep(bt_config.llm_delay_seconds)
 
-            run_result = brain.run(
-                portfolio_context=portfolio_context,
-                candidate_context=candidate_context,
-                news_context=news_context,
-                market_context=market_context,
-                options_context=options_context,
-                journal_context=journal_context,
-                trade_history_context=trade_history_context,
-            )
+            if decision_replay is not None:
+                replay_entry = decision_replay.get(decision_time.isoformat())
+                if replay_entry is None:
+                    raise RuntimeError(
+                        "decision replay missing logged decision for "
+                        f"{decision_time.isoformat()}"
+                    )
+                run_result = _analysis_run_from_replayed_decision(
+                    decision_time,
+                    replay_entry,
+                )
+            else:
+                if brain is None:
+                    raise RuntimeError("TradingBrain is not initialized")
+                run_result = brain.run(
+                    portfolio_context=portfolio_context,
+                    candidate_context=candidate_context,
+                    news_context=news_context,
+                    market_context=market_context,
+                    options_context=options_context,
+                    journal_context=journal_context,
+                    trade_history_context=trade_history_context,
+                )
             analysis = run_result.analysis
             llm_error = _is_llm_error_message(analysis.analysis)
             if llm_error:
@@ -4757,9 +4886,10 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
                 tid = tu.get("id") or "new"
                 status = tu.get("status", "")
                 tag = "NEW" if tid == "new" or not tu.get("id") else "UPDATE"
+                thesis_text = tu.get("thesis") or tu.get("new_observation") or ""
                 lines.append(
                     f"- [{tag}] {tid}: {tu.get('underlying', '?')} "
-                    f"{tu.get('direction', '?')} — {tu.get('thesis', '')} "
+                    f"{tu.get('direction', '?')} — {thesis_text} "
                     f"(conviction: {tu.get('conviction', 0)}, {status})"
                 )
             lines.append("")
@@ -4903,6 +5033,10 @@ def run() -> None:
         help="SQLite DB path for streaming backtest trades/decisions during the run",
     )
     parser.add_argument(
+        "--replay-decisions-db", type=str, default=None,
+        help="Replay logged ai_decisions rows instead of calling the LLM",
+    )
+    parser.add_argument(
         "--offline", action="store_true",
         help="Fail on historical cache misses instead of going to the network",
     )
@@ -4947,6 +5081,9 @@ def run() -> None:
         cache_db_path=Path(args.cache_db) if args.cache_db else None,
         log_db_path=Path(args.log_db) if args.log_db else (
             Path(args.output).with_suffix(".db") if args.output else None
+        ),
+        decision_replay_db_path=(
+            Path(args.replay_decisions_db) if args.replay_decisions_db else None
         ),
         prepare_prefetch_symbols=args.prepare_prefetch_symbols,
         prepare_prefetch_contracts_per_side=args.prepare_prefetch_contracts,

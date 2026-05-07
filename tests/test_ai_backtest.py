@@ -1,5 +1,6 @@
 """Tests for the AI trader backtest module."""
 
+import json
 import sqlite3
 from datetime import date, datetime, timedelta
 
@@ -1371,6 +1372,157 @@ def test_select_real_contract_falls_back_when_exact_symbol_missing(monkeypatch):
 
     assert result is not None
     assert result["ticker"] == "O:AAPL250207C00217500"
+
+
+def test_select_real_contract_hydrates_near_missing_exact_symbol(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 24)
+    contracts = [
+        _contract("O:AAPL250131C00220000", 220, "2025-01-31"),
+        _contract("O:AAPL250207C00217500", 217.5, "2025-02-07"),
+    ]
+    hydrated: list[str] = []
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+    monkeypatch.setattr(bt_mod.config, "BACKTEST_CONTRACT_HYDRATION_LIMIT", 1)
+
+    def hydrate(contract, **kwargs):
+        hydrated.append(contract["ticker"])
+        return OptionContract(
+            symbol=contract["ticker"],
+            underlying="AAPL",
+            option_type="call",
+            strike=float(contract["strike_price"]),
+            expiration=date.fromisoformat(contract["expiration_date"]),
+            dte=(date.fromisoformat(contract["expiration_date"]) - trade_day).days,
+            bid=1.0,
+            ask=1.2,
+            mid=1.1,
+            volume=25,
+            open_interest=100,
+        )
+
+    monkeypatch.setattr(bt_mod, "_polygon_contract_to_option_contract", hydrate)
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=220.0,
+        trade_date=trade_day,
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        contract_symbol="O:AAPL250207C00220000",
+    )
+
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250207C00217500"
+    assert hydrated == ["O:AAPL250207C00217500"]
+
+
+def test_select_real_contract_prioritizes_exact_symbol_within_limit(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 24)
+    contracts = [
+        _contract("O:AAPL250207C00210000", 210, "2025-02-07"),
+        _contract("O:AAPL250207C00220000", 220, "2025-02-07"),
+    ]
+    hydrated: list[str] = []
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+    monkeypatch.setattr(bt_mod.config, "BACKTEST_CONTRACT_HYDRATION_LIMIT", 5)
+
+    def hydrate(contract, **kwargs):
+        hydrated.append(contract["ticker"])
+        return OptionContract(
+            symbol=contract["ticker"],
+            underlying="AAPL",
+            option_type="call",
+            strike=float(contract["strike_price"]),
+            expiration=date.fromisoformat(contract["expiration_date"]),
+            dte=(date.fromisoformat(contract["expiration_date"]) - trade_day).days,
+            bid=1.0,
+            ask=1.2,
+            mid=1.1,
+            volume=25,
+            open_interest=100,
+        )
+
+    monkeypatch.setattr(bt_mod, "_polygon_contract_to_option_contract", hydrate)
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=220.0,
+        trade_date=trade_day,
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        contract_symbol="O:AAPL250207C00220000",
+    )
+
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250207C00220000"
+    assert hydrated[0] == "O:AAPL250207C00220000"
+
+
+def test_select_real_contract_skips_offline_hydration_misses(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 24)
+    contracts = [
+        _contract("O:AAPL250207C00210000", 210, "2025-02-07"),
+        _contract("O:AAPL250207C00220000", 220, "2025-02-07"),
+    ]
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+
+    def hydrate(contract, **kwargs):
+        if contract["ticker"] == "O:AAPL250207C00210000":
+            raise RuntimeError("offline Polygon cache miss for /v2/aggs/ticker/O:AAPL")
+        return OptionContract(
+            symbol=contract["ticker"],
+            underlying="AAPL",
+            option_type="call",
+            strike=float(contract["strike_price"]),
+            expiration=date.fromisoformat(contract["expiration_date"]),
+            dte=(date.fromisoformat(contract["expiration_date"]) - trade_day).days,
+            bid=1.0,
+            ask=1.2,
+            mid=1.1,
+            volume=25,
+            open_interest=100,
+        )
+
+    monkeypatch.setattr(bt_mod, "_polygon_contract_to_option_contract", hydrate)
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=210.0,
+        trade_date=trade_day,
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        cache=PolygonCache(offline=True),
+    )
+
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250207C00220000"
 
 
 def test_select_real_contract_respects_target_dte_range(monkeypatch):
@@ -3087,6 +3239,113 @@ def test_run_backtest_streams_trades_and_decisions_to_log_db(tmp_path, monkeypat
         "2025-01-17",
         "2025-01-06",
     )
+
+
+def test_run_backtest_replays_logged_decisions_without_llm(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_time = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+    replay_db = tmp_path / "replay.db"
+    log_db = tmp_path / "window.db"
+    payload = {
+        "market_analysis": "Replay analysis",
+        "thesis_updates": [],
+        "trades": [
+            {
+                "action": "buy_stock",
+                "underlying": "AAPL",
+                "conviction": 0.7,
+                "risk_pct": 0.01,
+                "reasoning": "Replay stock entry",
+            }
+        ],
+        "llm_diagnostics": {"attempts": 1, "retries": 0},
+    }
+    with sqlite3.connect(replay_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE ai_decisions (
+                timestamp TEXT,
+                market_analysis TEXT,
+                news_summary TEXT,
+                portfolio_state TEXT,
+                decisions_json TEXT,
+                trades_executed INTEGER,
+                llm_provider TEXT,
+                llm_model TEXT,
+                packet_json TEXT,
+                response_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ai_decisions (
+                timestamp, market_analysis, news_summary, portfolio_state,
+                decisions_json, trades_executed, llm_provider, llm_model,
+                packet_json, response_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_time.isoformat(),
+                "Replay analysis",
+                "",
+                "",
+                json.dumps(payload),
+                0,
+                "deepseek",
+                "deepseek-v4-pro",
+                "{}",
+                "{}",
+            ),
+        )
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        bt_mod,
+        "resolve_api_key",
+        lambda *args, **kwargs: pytest.fail("replay should not resolve an LLM API key"),
+    )
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: [decision_time])
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            log_db_path=log_db,
+            decision_replay_db_path=replay_db,
+        )
+    )
+
+    assert result.decision_log[0]["llm_diagnostics"]["replayed"] is True
+    assert result.decision_log[0]["trades_proposed"][0]["status"] == "executed"
+    assert result.trades[0].option_type == "stock"
+
+    with sqlite3.connect(log_db) as conn:
+        decision = conn.execute(
+            "SELECT llm_provider, llm_model, trades_executed FROM ai_decisions"
+        ).fetchone()
+    assert decision == ("replay", "deepseek-v4-pro", 1)
 
 
 def test_run_backtest_executes_buy_and_close_stock(tmp_path, monkeypatch):
