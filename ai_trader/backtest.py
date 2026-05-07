@@ -184,8 +184,9 @@ def _polygon_request(
             break
         retry_after = _retry_after_seconds(getattr(response, "headers", None))
         backoff_interval = _increase_polygon_request_interval(retry_after=retry_after)
-        sleep_seconds = retry_after if retry_after is not None else backoff_interval
-        time_module.sleep(sleep_seconds)
+        if attempt < max_attempts - 1:
+            sleep_seconds = retry_after if retry_after is not None else backoff_interval
+            time_module.sleep(sleep_seconds)
     if response is None:
         raise RuntimeError(f"Polygon request failed without a response for {path}")
     if response.status_code >= 400:

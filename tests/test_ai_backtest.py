@@ -250,6 +250,36 @@ def test_polygon_request_adapts_interval_after_429(monkeypatch):
     assert bt_mod._POLYGON_REQUEST_INTERVAL_SECONDS > base_interval
 
 
+def test_polygon_request_does_not_sleep_after_final_429(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    sleeps: list[float] = []
+    calls = {"count": 0}
+
+    class DummyResponse:
+        status_code = 429
+        headers = {"Retry-After": "7"}
+        text = "rate limited"
+
+        def json(self):
+            return {"status": "ERROR"}
+
+    def mock_get(url, params=None, timeout=30):
+        calls["count"] += 1
+        return DummyResponse()
+
+    monkeypatch.setattr("requests.get", mock_get)
+    monkeypatch.setattr(bt_mod.time_module, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(bt_mod, "_respect_polygon_rate_limit", lambda: None)
+    monkeypatch.setattr(bt_mod.config, "POLYGON_429_RETRY_ATTEMPTS", 2)
+
+    with pytest.raises(RuntimeError, match="Polygon 429"):
+        bt_mod._polygon_request("live-key", "/v2/test", {"ticker": "AAPL"})
+
+    assert calls["count"] == 2
+    assert sleeps == [7.0]
+
+
 def test_fetch_historical_daily_bars_range_offline_reraises(monkeypatch):
     import ai_trader.backtest as bt_mod
 
