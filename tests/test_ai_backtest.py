@@ -3348,6 +3348,136 @@ def test_run_backtest_replays_logged_decisions_without_llm(tmp_path, monkeypatch
     assert decision == ("replay", "deepseek-v4-pro", 1)
 
 
+def test_close_position_tries_next_matching_leg_when_first_has_no_price(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 10, 5, tzinfo=EASTERN_TZ),
+    ]
+    replay_db = tmp_path / "replay.db"
+    with sqlite3.connect(replay_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE ai_decisions (
+                timestamp TEXT,
+                market_analysis TEXT,
+                news_summary TEXT,
+                portfolio_state TEXT,
+                decisions_json TEXT,
+                trades_executed INTEGER,
+                llm_provider TEXT,
+                llm_model TEXT,
+                packet_json TEXT,
+                response_json TEXT
+            )
+            """
+        )
+        payloads = [
+            {
+                "market_analysis": "Open first leg",
+                "thesis_updates": [],
+                "trades": [
+                    {"action": "buy_call", "underlying": "AAPL", "conviction": 0.7, "risk_pct": 0.01}
+                ],
+            },
+            {
+                "market_analysis": "Open second leg",
+                "thesis_updates": [],
+                "trades": [
+                    {"action": "buy_call", "underlying": "AAPL", "conviction": 0.7, "risk_pct": 0.01}
+                ],
+            },
+            {
+                "market_analysis": "Close AAPL exposure",
+                "thesis_updates": [],
+                "trades": [
+                    {"action": "close_position", "underlying": "AAPL", "conviction": 1.0}
+                ],
+            },
+        ]
+        for decision_time, payload in zip(decision_times, payloads):
+            conn.execute(
+                """
+                INSERT INTO ai_decisions (
+                    timestamp, market_analysis, news_summary, portfolio_state,
+                    decisions_json, trades_executed, llm_provider, llm_model,
+                    packet_json, response_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_time.isoformat(),
+                    payload["market_analysis"],
+                    "",
+                    "",
+                    json.dumps(payload),
+                    0,
+                    "deepseek",
+                    "deepseek-v4-pro",
+                    "{}",
+                    "{}",
+                ),
+            )
+
+    contracts = [
+        {"ticker": "O:AAPL250117C00100000", "strike_price": 100.0, "expiration_date": "2025-01-17"},
+        {"ticker": "O:AAPL250117C00105000", "strike_price": 105.0, "expiration_date": "2025-01-17"},
+    ]
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+    monkeypatch.setattr(bt_mod, "_current_underlying_price", lambda *args, **kwargs: 100.0)
+    monkeypatch.setattr(bt_mod, "_select_real_contract", lambda *args, **kwargs: contracts.pop(0))
+    monkeypatch.setattr(bt_mod, "_next_fill_option_bar", lambda *args, **kwargs: {"c": 1.0, "v": 100})
+
+    option_bar_calls: dict[tuple[str, datetime], int] = {}
+
+    def current_option_bar(api_key, ticker, as_of, cache=None, bar_minutes=5):
+        if isinstance(as_of, datetime) and as_of == decision_times[2]:
+            if ticker == "O:AAPL250117C00100000":
+                return None
+            if ticker == "O:AAPL250117C00105000":
+                key = (ticker, as_of)
+                option_bar_calls[key] = option_bar_calls.get(key, 0) + 1
+                if option_bar_calls[key] == 1:
+                    return {"c": 1.0, "v": 100}
+                return {"c": 2.0, "v": 100}
+        return {"c": 1.0, "v": 100}
+
+    monkeypatch.setattr(bt_mod, "_current_option_bar", current_option_bar)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            profit_target_pct=5.0,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            decision_replay_db_path=replay_db,
+        )
+    )
+
+    manual_close = next(t for t in result.trades if t.exit_reason == "manual_close")
+    assert manual_close.polygon_ticker == "O:AAPL250117C00105000"
+    assert result.decision_log[2]["trades_proposed"][0]["status"] == "executed"
+
+
 def test_run_backtest_executes_buy_and_close_stock(tmp_path, monkeypatch):
     import ai_trader.backtest as bt_mod
 

@@ -3877,44 +3877,48 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
 
                 if decision.action == "close_position":
                     target = decision.target_symbol
-                    matched_pos = None
+                    close_candidates: list[SimPosition] = []
                     if target:
-                        matched_pos = next(
-                            (
-                                p for p in positions
-                                if p.option_type != "stock" and p.polygon_ticker == target
-                            ),
-                            None,
-                        )
-                    if matched_pos is None:
-                        matched_pos = next(
-                            (
-                                p for p in positions
-                                if p.option_type != "stock"
-                                and p.underlying.upper() == decision.underlying.upper()
-                            ),
-                            None,
-                        )
-                    if matched_pos is None:
+                        close_candidates = [
+                            p for p in positions
+                            if p.option_type != "stock" and p.polygon_ticker == target
+                        ]
+                    if not close_candidates:
+                        close_candidates = [
+                            p for p in positions
+                            if p.option_type != "stock"
+                            and p.underlying.upper() == decision.underlying.upper()
+                        ]
+                    if not close_candidates:
                         trade_record["skip_reason"] = "no matching position"
                         trade_results.append(trade_record)
                         continue
 
-                    exit_bar = _current_option_bar(
-                        polygon_key,
-                        matched_pos.polygon_ticker,
-                        decision_time,
-                        cache,
-                        bar_minutes=bt_config.signal_bar_minutes,
-                    )
-                    if exit_bar is None:
-                        trade_record["skip_reason"] = "no price data before close"
-                        trade_results.append(trade_record)
-                        continue
-
-                    exit_premium = _option_bar_exit_price(exit_bar)
-                    if exit_premium <= 0:
-                        trade_record["skip_reason"] = "invalid exit price"
+                    matched_pos = None
+                    exit_premium = 0.0
+                    skipped_for_invalid_price = False
+                    for candidate in close_candidates:
+                        exit_bar = _current_option_bar(
+                            polygon_key,
+                            candidate.polygon_ticker,
+                            decision_time,
+                            cache,
+                            bar_minutes=bt_config.signal_bar_minutes,
+                        )
+                        if exit_bar is None:
+                            continue
+                        candidate_exit_premium = _option_bar_exit_price(exit_bar)
+                        if candidate_exit_premium <= 0:
+                            skipped_for_invalid_price = True
+                            continue
+                        matched_pos = candidate
+                        exit_premium = candidate_exit_premium
+                        break
+                    if matched_pos is None:
+                        trade_record["skip_reason"] = (
+                            "invalid exit price"
+                            if skipped_for_invalid_price else "no price data before close"
+                        )
                         trade_results.append(trade_record)
                         continue
 
