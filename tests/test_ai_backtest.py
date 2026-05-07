@@ -1300,6 +1300,79 @@ def test_select_real_contract_exact_symbol(monkeypatch):
     assert result["ticker"] == "O:AAPL250207C00155000"
 
 
+def test_select_real_contract_exact_symbol_expands_query_window(monkeypatch):
+    contracts = [
+        _contract("O:AAPL250207C00220000", 220, "2025-02-07"),
+    ]
+    seen: dict[str, object] = {}
+    import ai_trader.backtest as bt_mod
+
+    def fetch_contracts(
+        api_key,
+        underlying,
+        contract_type,
+        expiry_gte,
+        expiry_lte,
+        strike_gte,
+        strike_lte,
+        as_of=None,
+        cache=None,
+    ):
+        seen.update({
+            "expiry_gte": expiry_gte,
+            "expiry_lte": expiry_lte,
+            "strike_gte": strike_gte,
+            "strike_lte": strike_lte,
+        })
+        return contracts
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", fetch_contracts)
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=150.0,
+        trade_date=date(2025, 1, 10),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        contract_symbol="O:AAPL250207C00220000",
+    )
+
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250207C00220000"
+    assert seen["expiry_lte"] == date(2025, 2, 7)
+    assert seen["strike_lte"] == 220.0
+
+
+def test_select_real_contract_falls_back_when_exact_symbol_missing(monkeypatch):
+    contracts = [
+        _contract("O:AAPL250124C00150000", 150, "2025-01-24"),
+        _contract("O:AAPL250207C00217500", 217.5, "2025-02-07"),
+    ]
+    import ai_trader.backtest as bt_mod
+    monkeypatch.setattr(
+        bt_mod, "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=220.0,
+        trade_date=date(2025, 1, 24),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        contract_symbol="O:AAPL250207C00220000",
+    )
+
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250207C00217500"
+
+
 def test_select_real_contract_respects_target_dte_range(monkeypatch):
     contracts = [
         _contract("O:AAPL250117C00150000", 150, "2025-01-17"),

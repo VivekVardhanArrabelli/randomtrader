@@ -92,6 +92,9 @@ _POLYGON_REQUEST_INTERVAL_SECONDS = max(
     0.0,
 )
 _THETA_TICKER_PREFIX = "THETA:"
+_POLYGON_OPTION_TICKER_RE = re.compile(
+    r"^O:([A-Z0-9.]+)(\d{6})([CP])(\d{8})$"
+)
 
 
 def _base_polygon_request_interval() -> float:
@@ -274,6 +277,25 @@ def _parse_theta_contract_ticker(option_ticker: str) -> tuple[str, date, str, fl
         option_type.lower(),
         float(strike_raw),
     )
+
+
+def _parse_polygon_option_ticker(option_ticker: str) -> tuple[str, date, str, float] | None:
+    match = _POLYGON_OPTION_TICKER_RE.match(str(option_ticker or "").strip().upper())
+    if match is None:
+        return None
+    underlying, expiration_raw, right, strike_raw = match.groups()
+    try:
+        year = 2000 + int(expiration_raw[:2])
+        expiration = date(
+            year,
+            int(expiration_raw[2:4]),
+            int(expiration_raw[4:6]),
+        )
+    except ValueError:
+        return None
+    option_type = "call" if right == "C" else "put"
+    strike = int(strike_raw) / 1000.0
+    return underlying, expiration, option_type, strike
 
 
 def _theta_date(value: date) -> str:
@@ -1642,6 +1664,22 @@ def _select_real_contract(
     )
     strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
     strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+    parsed_contract_symbol = _parse_polygon_option_ticker(contract_symbol or "")
+    if parsed_contract_symbol is not None:
+        (
+            parsed_underlying,
+            parsed_expiration,
+            parsed_option_type,
+            parsed_strike,
+        ) = parsed_contract_symbol
+        if (
+            parsed_underlying == underlying.upper()
+            and parsed_option_type == option_type.lower()
+        ):
+            expiry_gte = min(expiry_gte, parsed_expiration)
+            expiry_lte = max(expiry_lte, parsed_expiration)
+            strike_gte = min(strike_gte, round(parsed_strike, 2))
+            strike_lte = max(strike_lte, round(parsed_strike, 2))
 
     contracts = fetch_polygon_option_contracts(
         api_key, underlying, option_type,
@@ -1735,6 +1773,27 @@ def _select_real_contract(
         max_spread_pct=max_spread_pct,
     )
     if selected is None:
+        if contract_symbol:
+            fallback_dte_range = target_dte_range
+            if parsed_contract_symbol is not None:
+                exact_dte = max((parsed_contract_symbol[1] - trade_date).days, 1)
+                fallback_dte_range = (
+                    max(exact_dte - 2, 1),
+                    exact_dte + 2,
+                )
+            selected = select_contract(
+                historical_contracts,
+                spot,
+                strike_preference=strike_preference,
+                expiry_preference=expiry_preference,
+                expression_profile=expression_profile,
+                contract_symbol=None,
+                target_delta_range=target_delta_range,
+                target_dte_range=fallback_dte_range,
+                max_spread_pct=max_spread_pct,
+            )
+            if selected is not None:
+                return raw_by_symbol.get(selected.symbol)
         if reason_out is not None:
             reason_out.append("contract selector rejected all candidates")
         return None
