@@ -75,6 +75,7 @@ from .risk import (
 )
 from .utils import (
     EASTERN_TZ,
+    is_equity_candidate_symbol,
     log,
     now_eastern,
     prioritized_symbol_watchlist,
@@ -543,6 +544,11 @@ def _theta_contracts_from_response(
 def _raise_if_offline(cache: PolygonCache | None, exc: Exception) -> None:
     if cache and cache.offline:
         raise RuntimeError(str(exc)) from exc
+
+
+def _is_offline_cache_miss(exc: Exception) -> bool:
+    message = str(exc)
+    return "offline " in message and "cache miss" in message
 
 
 def fetch_historical_news_window(
@@ -1376,6 +1382,88 @@ def _historical_option_quote(
     return bid, ask, mid
 
 
+def _contract_dte(contract: dict, trade_date: date) -> int:
+    try:
+        expiration = date.fromisoformat(str(contract.get("expiration_date") or ""))
+    except ValueError:
+        return 9999
+    return max((expiration - trade_date).days, 0)
+
+
+def _target_strike_for_preference(
+    spot: float,
+    strike_preference: str,
+    option_type: str,
+) -> float:
+    preference = (strike_preference or "atm").lower()
+    option_side = (option_type or "").lower()
+    if preference == "otm":
+        return spot * (1.03 if option_side == "call" else 0.97)
+    if preference == "itm":
+        return spot * (0.97 if option_side == "call" else 1.03)
+    return spot
+
+
+def _target_dte_for_preference(
+    trade_date: date,
+    expiry_preference: str,
+    default_dte: int,
+    target_dte_range: tuple[int, int] | None,
+) -> float:
+    if target_dte_range is not None:
+        return (min(target_dte_range) + max(target_dte_range)) / 2
+    if expiry_preference == "this_week":
+        days_until_friday = (4 - trade_date.weekday()) % 7
+        return max(days_until_friday, 2)
+    if expiry_preference == "next_week":
+        return 7
+    return float(default_dte)
+
+
+def _rank_contracts_for_hydration(
+    contracts: list[dict],
+    *,
+    spot: float,
+    trade_date: date,
+    strike_preference: str,
+    expiry_preference: str,
+    option_type: str,
+    default_dte: int,
+    contract_symbol: str | None = None,
+    target_dte_range: tuple[int, int] | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Bound expensive option-bar hydration to the most plausible contracts."""
+    if not contracts:
+        return []
+    limit = max(int(limit or len(contracts)), 1)
+    if len(contracts) <= limit:
+        return contracts
+
+    exact_symbol = (contract_symbol or "").strip()
+    target_strike = _target_strike_for_preference(spot, strike_preference, option_type)
+    target_dte = _target_dte_for_preference(
+        trade_date,
+        expiry_preference,
+        default_dte,
+        target_dte_range,
+    )
+
+    def score(contract: dict) -> tuple[float, float, float, str]:
+        symbol = str(contract.get("ticker") or "")
+        exact_penalty = 0.0 if exact_symbol and symbol == exact_symbol else 1.0
+        strike = _float_or_zero(contract.get("strike_price"))
+        dte = _contract_dte(contract, trade_date)
+        return (
+            exact_penalty,
+            abs(dte - target_dte),
+            abs(strike - target_strike),
+            symbol,
+        )
+
+    return sorted(contracts, key=score)[:limit]
+
+
 def _polygon_contract_to_option_contract(
     contract: dict,
     *,
@@ -1502,6 +1590,7 @@ def _select_real_contract(
     max_spread_pct: float | None = None,
     cache: PolygonCache | None = None,
     bar_minutes: int = 5,
+    reason_out: list[str] | None = None,
 ) -> dict | None:
     """Select a real Polygon option contract based on LLM preferences.
 
@@ -1559,11 +1648,28 @@ def _select_real_contract(
         as_of=trade_date, cache=cache,
     )
     if not contracts:
+        if reason_out is not None:
+            reason_out.append("no contracts returned")
         return None
+    contracts = _rank_contracts_for_hydration(
+        contracts,
+        spot=spot,
+        trade_date=trade_date,
+        strike_preference=strike_preference,
+        expiry_preference=expiry_preference,
+        option_type=option_type,
+        default_dte=default_dte,
+        contract_symbol=contract_symbol,
+        target_dte_range=target_dte_range,
+        limit=getattr(config, "BACKTEST_CONTRACT_HYDRATION_LIMIT", 12),
+    )
     as_of = decision_time or trade_date
     historical_contracts: list[OptionContract] = []
     raw_by_symbol: dict[str, dict] = {}
+    hydrated_count = 0
+    quoteable_count = 0
     for contract in contracts:
+        hydrated_count += 1
         option_contract = _polygon_contract_to_option_contract(
             contract,
             api_key=api_key,
@@ -1576,6 +1682,7 @@ def _select_real_contract(
         )
         if option_contract is None or option_contract.ask <= 0:
             continue
+        quoteable_count += 1
         theta_backed = _is_theta_option_ticker(option_contract.symbol)
         if (
             not theta_backed
@@ -1597,6 +1704,12 @@ def _select_real_contract(
         raw_by_symbol[option_contract.symbol] = enriched_contract
 
     if not historical_contracts:
+        if reason_out is not None:
+            reason_out.append(
+                "no contract quote data after hydration"
+                if hydrated_count > 0 and quoteable_count == 0
+                else "no liquid contracts after filters"
+            )
         return None
     if not contract_symbol and target_dte_range is None:
         historical_contracts = filter_contracts_by_expiry_preference(
@@ -1605,6 +1718,8 @@ def _select_real_contract(
             as_of=trade_date,
         )
         if not historical_contracts:
+            if reason_out is not None:
+                reason_out.append("no contracts after expiry preference filter")
             return None
 
     selected = select_contract(
@@ -1619,6 +1734,8 @@ def _select_real_contract(
         max_spread_pct=max_spread_pct,
     )
     if selected is None:
+        if reason_out is not None:
+            reason_out.append("contract selector rejected all candidates")
         return None
     return raw_by_symbol.get(selected.symbol)
 
@@ -1753,6 +1870,10 @@ class PrepareBacktestResult:
     decision_points: int
     cache_db_path: Path
     cache_entries: int
+    cache_entries_before: int = 0
+    cache_entries_added: int = 0
+    option_contracts_warmed: int = 0
+    option_contract_bars_prefetched: int = 0
 
 
 def _trading_days(start: date, end: date) -> list[date]:
@@ -1791,7 +1912,10 @@ def _is_llm_error_message(message: str | None) -> bool:
     return message.strip().lower().startswith("llm error:")
 
 
-def _analysis_to_decisions_json(analysis: MarketAnalysis) -> str:
+def _analysis_to_decisions_json(
+    analysis: MarketAnalysis,
+    llm_diagnostics: dict | None = None,
+) -> str:
     return json.dumps(
         {
             "market_analysis": analysis.analysis,
@@ -1826,6 +1950,7 @@ def _analysis_to_decisions_json(analysis: MarketAnalysis) -> str:
                 for decision in analysis.trades
             ],
             "dropped_trades": analysis.dropped_trades,
+            "llm_diagnostics": llm_diagnostics or {},
         }
     )
 
@@ -2511,7 +2636,7 @@ def _extract_top_news_tickers(
     for article in news:
         for ticker in article.get("tickers", []):
             t = ticker.strip().upper()
-            if t and t not in exclude:
+            if t and t not in exclude and is_equity_candidate_symbol(t):
                 counts[t] += 1
 
     return [t for t, _ in counts.most_common(max_tickers)]
@@ -2556,7 +2681,7 @@ def _build_focus_tickers(
     def _tag_symbols(symbols: list[str], tag: str) -> None:
         for symbol in symbols:
             normalized = symbol.upper()
-            if not normalized:
+            if not normalized or not is_equity_candidate_symbol(normalized):
                 continue
             source_tags_by_symbol.setdefault(normalized, set()).add(tag)
 
@@ -2691,11 +2816,17 @@ def _build_options_context(
         strike_lte = round(spot * 1.03, 2)
 
         for opt_type in ("call", "put"):
-            contracts = fetch_polygon_option_contracts(
-                api_key, ticker, opt_type,
-                expiry_gte, expiry_lte, strike_gte, strike_lte,
-                as_of=trade_date, cache=cache,
-            )
+            try:
+                contracts = fetch_polygon_option_contracts(
+                    api_key, ticker, opt_type,
+                    expiry_gte, expiry_lte, strike_gte, strike_lte,
+                    as_of=trade_date, cache=cache,
+                )
+            except RuntimeError as exc:
+                if _is_offline_cache_miss(exc):
+                    log(f"options context cache miss for {ticker} {opt_type}: {exc}")
+                    continue
+                raise
             if not contracts:
                 continue
             def _shortlist_key(contract: dict) -> tuple[float, int]:
@@ -2738,9 +2869,15 @@ def _build_options_context(
                     found_any = True
                     continue
 
-                session_bars = _session_intraday_bars_before(
-                    api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
-                )
+                try:
+                    session_bars = _session_intraday_bars_before(
+                        api_key, opt_ticker, as_of_dt, cache=cache, multiplier=bar_minutes,
+                    )
+                except RuntimeError as exc:
+                    if _is_offline_cache_miss(exc):
+                        log(f"options context cache miss for {opt_ticker} bars: {exc}")
+                        continue
+                    raise
                 if not session_bars:
                     continue
 
@@ -3423,6 +3560,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     deep_focus_symbols,
                     limit=max(bt_config.prepare_prefetch_symbols, len(options_watchlist or deep_focus_symbols)),
                 )
+                cache_entries_before = cache.store.entry_count() if cache.store else 0
                 warmed_contract_metadata = _warm_prepare_option_metadata(
                     polygon_key,
                     metadata_symbols,
@@ -3434,7 +3572,20 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     max_symbols=bt_config.prepare_prefetch_symbols,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
                 )
+                prefetched_option_bars = _prefetch_prepare_option_data(
+                    polygon_key,
+                    metadata_symbols,
+                    decision_time,
+                    cache,
+                    default_dte=bt_config.default_dte,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                    metrics_cache=metrics_cache,
+                    max_symbols=bt_config.prepare_prefetch_symbols,
+                    contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
+                    strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
+                )
                 cache_entries = cache.store.entry_count() if cache.store else 0
+                cache_entries_added = max(cache_entries - cache_entries_before, 0)
                 result.decision_log.append({
                     "date": trade_date.isoformat(),
                     "decision_time": decision_time.isoformat(),
@@ -3444,14 +3595,17 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "finalists": finalist_symbols,
                     "options_watchlist": options_watchlist or deep_focus_symbols,
                     "warmed_option_contract_metadata": warmed_contract_metadata,
+                    "prefetched_option_contract_bars": prefetched_option_bars,
                     "cache_entries": cache_entries,
+                    "cache_entries_added": cache_entries_added,
                     "open_positions": len(positions),
                 })
                 log(
                     f"  {decision_time.strftime('%H:%M')} PREPARED "
                     f"finalists={len(finalist_symbols)} "
                     f"warmed_contract_metadata={warmed_contract_metadata} "
-                    f"cache_entries={cache_entries}"
+                    f"prefetched_option_bars={prefetched_option_bars} "
+                    f"cache_entries={cache_entries} (+{cache_entries_added})"
                 )
                 continue
 
@@ -3505,7 +3659,10 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         market_analysis=analysis.analysis,
                         news_summary=news_context[:1000],
                         portfolio_state=portfolio_context[:1000],
-                        decisions_json=_analysis_to_decisions_json(analysis),
+                        decisions_json=_analysis_to_decisions_json(
+                            analysis,
+                            run_result.diagnostics,
+                        ),
                         trades_executed=0,
                         llm_provider=run_result.packet.provider,
                         llm_model=run_result.packet.model,
@@ -3858,6 +4015,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     trade_results.append(trade_record)
                     continue
 
+                contract_skip_reasons: list[str] = []
                 contract = _select_real_contract(
                     polygon_key,
                     underlying,
@@ -3875,9 +4033,13 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     max_spread_pct=decision.max_spread_pct,
                     cache=cache,
                     bar_minutes=bt_config.signal_bar_minutes,
+                    reason_out=contract_skip_reasons,
                 )
                 if contract is None:
-                    trade_record["skip_reason"] = "no contract found"
+                    trade_record["skip_reason"] = (
+                        contract_skip_reasons[-1]
+                        if contract_skip_reasons else "no contract found"
+                    )
                     trade_results.append(trade_record)
                     continue
 
@@ -4039,6 +4201,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 "thesis_updates": thesis_updates_serialized,
                 "trades_proposed": trade_results,
                 "dropped_trades": analysis.dropped_trades,
+                "llm_diagnostics": run_result.diagnostics,
                 "trades_executed": sum(1 for t in trade_results if t["status"] == "executed"),
                 "trades_skipped": sum(1 for t in trade_results if t["status"] == "skipped"),
                 "equity": marked_equity,
@@ -4194,15 +4357,27 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         llm_delay_seconds=0.0,
         prepare_only=True,
     )
-    result = run_backtest(prepare_config)
     store = PolygonResponseStore(_historical_cache_path(prepare_config))
+    cache_entries_before = store.entry_count()
+    result = run_backtest(prepare_config)
+    cache_entries = store.entry_count()
     return PrepareBacktestResult(
         start_date=prepare_config.start_date,
         end_date=prepare_config.end_date,
         days_prepared=result.days_tested,
         decision_points=len(result.decision_log),
         cache_db_path=store.db_path,
-        cache_entries=store.entry_count(),
+        cache_entries=cache_entries,
+        cache_entries_before=cache_entries_before,
+        cache_entries_added=max(cache_entries - cache_entries_before, 0),
+        option_contracts_warmed=sum(
+            int(entry.get("warmed_option_contract_metadata") or 0)
+            for entry in result.decision_log
+        ),
+        option_contract_bars_prefetched=sum(
+            int(entry.get("prefetched_option_contract_bars") or 0)
+            for entry in result.decision_log
+        ),
     )
 
 
@@ -4215,6 +4390,9 @@ def _summarize_decision_log(decision_log: list[dict]) -> dict:
     skip_counter: Counter[str] = Counter()
     dropped = 0
     drop_counter: Counter[str] = Counter()
+    provider_retry_cycles = 0
+    provider_retries = 0
+    provider_counter: Counter[str] = Counter()
 
     for entry in decision_log:
         proposed_trades = entry.get("trades_proposed") or []
@@ -4244,6 +4422,19 @@ def _summarize_decision_log(decision_log: list[dict]) -> dict:
                     continue
                 reason = str(trade.get("reason") or "unknown")
                 drop_counter[reason] += 1
+        diagnostics = entry.get("llm_diagnostics") or {}
+        if isinstance(diagnostics, dict):
+            retries = int(diagnostics.get("retries") or 0)
+            if retries > 0:
+                provider_retry_cycles += 1
+                provider_retries += retries
+            events = diagnostics.get("events") or []
+            if isinstance(events, list):
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    reason = str(event.get("reason") or "unknown")
+                    provider_counter[reason] += 1
 
     guardrail_skips = sum(
         count for reason, count in skip_counter.items()
@@ -4255,6 +4446,8 @@ def _summarize_decision_log(decision_log: list[dict]) -> dict:
         "executed": executed,
         "skipped": skipped,
         "dropped": dropped,
+        "provider_retry_cycles": provider_retry_cycles,
+        "provider_retries": provider_retries,
         "guardrail_skips": guardrail_skips,
         "skip_reasons": [
             {"reason": reason, "count": count}
@@ -4263,6 +4456,10 @@ def _summarize_decision_log(decision_log: list[dict]) -> dict:
         "drop_reasons": [
             {"reason": reason, "count": count}
             for reason, count in drop_counter.most_common()
+        ],
+        "provider_retry_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in provider_counter.most_common()
         ],
     }
 
@@ -4290,6 +4487,8 @@ def print_backtest_result(r: BacktestResult) -> None:
         print(f"  Executed props:   {decision_summary['executed']}")
         print(f"  Skipped props:    {decision_summary['skipped']}")
         print(f"  Dropped model:    {decision_summary['dropped']}")
+        if decision_summary["provider_retries"]:
+            print(f"  LLM retries:      {decision_summary['provider_retries']}")
         if decision_summary["guardrail_skips"]:
             print(f"  Guardrail skips:  {decision_summary['guardrail_skips']}")
         top_reasons = decision_summary["skip_reasons"][:3]
@@ -4301,6 +4500,11 @@ def print_backtest_result(r: BacktestResult) -> None:
         if top_drop_reasons:
             print("  Top drop reasons:")
             for row in top_drop_reasons:
+                print(f"    {row['count']}x {row['reason']}")
+        top_retry_reasons = decision_summary["provider_retry_reasons"][:3]
+        if top_retry_reasons:
+            print("  Top LLM retry reasons:")
+            for row in top_retry_reasons:
                 print(f"    {row['count']}x {row['reason']}")
 
     print(f"\n  Max drawdown:     ${r.max_drawdown:,.2f}")
@@ -4339,6 +4543,9 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Decision points:  {r.decision_points}")
     print(f"  Cache DB:         {r.cache_db_path}")
     print(f"  Cache entries:    {r.cache_entries}")
+    print(f"  New cache entries: {r.cache_entries_added}")
+    print(f"  Contracts warmed: {r.option_contracts_warmed}")
+    print(f"  Option bars:      {r.option_contract_bars_prefetched}")
     print("=" * 60)
 
 
@@ -4402,6 +4609,10 @@ def save_prepare_result(r: PrepareBacktestResult, path: Path) -> None:
         "decision_points": r.decision_points,
         "cache_db_path": str(r.cache_db_path),
         "cache_entries": r.cache_entries,
+        "cache_entries_before": r.cache_entries_before,
+        "cache_entries_added": r.cache_entries_added,
+        "option_contracts_warmed": r.option_contracts_warmed,
+        "option_contract_bars_prefetched": r.option_contract_bars_prefetched,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
@@ -4420,13 +4631,18 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         f"Final: ${r.final_equity:,.0f} ({r.total_return_pct:+.1%}) | {win_loss}"
     )
     decision_summary = _summarize_decision_log(r.decision_log)
-    if decision_summary["proposed"] or decision_summary["dropped"]:
+    if (
+        decision_summary["proposed"]
+        or decision_summary["dropped"]
+        or decision_summary["provider_retries"]
+    ):
         lines.append(
             "Decision summary: "
             f"{decision_summary['proposed']} proposed | "
             f"{decision_summary['executed']} executed | "
             f"{decision_summary['skipped']} skipped | "
             f"{decision_summary['dropped']} dropped | "
+            f"{decision_summary['provider_retries']} LLM retries | "
             f"{decision_summary['guardrail_skips']} guardrail skips"
         )
         if decision_summary["skip_reasons"]:
@@ -4436,6 +4652,10 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         if decision_summary["drop_reasons"]:
             lines.append("Top drop reasons:")
             for row in decision_summary["drop_reasons"][:5]:
+                lines.append(f"- {row['count']}x {row['reason']}")
+        if decision_summary["provider_retry_reasons"]:
+            lines.append("Top LLM retry reasons:")
+            for row in decision_summary["provider_retry_reasons"][:5]:
                 lines.append(f"- {row['count']}x {row['reason']}")
     lines.append("")
 
@@ -4450,6 +4670,23 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
         analysis_text = entry.get("market_analysis", "")
         if analysis_text:
             lines.append(f"**Market Analysis:** {analysis_text}")
+            lines.append("")
+
+        llm_diagnostics = entry.get("llm_diagnostics") or {}
+        if isinstance(llm_diagnostics, dict) and llm_diagnostics.get("retries"):
+            reasons = []
+            for event in llm_diagnostics.get("events") or []:
+                if not isinstance(event, dict):
+                    continue
+                reason = event.get("reason") or "unknown"
+                attempt = event.get("attempt") or "?"
+                reasons.append(f"attempt {attempt}: {reason}")
+            lines.append(
+                f"**LLM Diagnostics:** attempts={llm_diagnostics.get('attempts')} "
+                f"retries={llm_diagnostics.get('retries')}"
+            )
+            if reasons:
+                lines.append(f"  {'; '.join(reasons)}")
             lines.append("")
 
         # Thesis updates

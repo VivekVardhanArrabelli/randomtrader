@@ -57,6 +57,7 @@ from .portfolio import get_portfolio_state
 from .risk import PositionRiskAlert, PositionRiskState, assess_position_risk, evaluate_trade_risk
 from .utils import (
     EASTERN_TZ,
+    is_equity_candidate_symbol,
     is_market_open,
     log,
     now_eastern,
@@ -426,7 +427,7 @@ def _build_candidate_context(
     def _tag_symbols(symbols: list[str], tag: str) -> None:
         for symbol in symbols:
             normalized = symbol.upper()
-            if not normalized:
+            if not normalized or not is_equity_candidate_symbol(normalized):
                 continue
             source_tags_by_symbol.setdefault(normalized, set()).add(tag)
 
@@ -728,6 +729,11 @@ def run_cycle(
     analysis = run_result.analysis
 
     log(f"LLM analysis: {analysis.analysis[:200]}")
+    if run_result.diagnostics.get("retries"):
+        log(
+            f"LLM retries before success/error: "
+            f"{run_result.diagnostics.get('retries')}"
+        )
     if analysis.dropped_trades:
         log(f"LLM dropped {len(analysis.dropped_trades)} malformed/low-conviction trade candidates")
 
@@ -765,6 +771,7 @@ def run_cycle(
                 for d in analysis.trades
             ],
             "dropped_trades": analysis.dropped_trades,
+            "llm_diagnostics": run_result.diagnostics,
         }
     )
     decision_id = logger.log_decision(

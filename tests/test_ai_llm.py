@@ -69,6 +69,59 @@ def test_default_llm_model_is_openai_family(monkeypatch):
     assert config.resolved_llm_model() == "gpt-5.4"
 
 
+def test_resolved_llm_max_tokens_uses_deepseek_budget(monkeypatch):
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("DEEPSEEK_LLM_MAX_TOKENS", raising=False)
+
+    assert config.resolved_llm_max_tokens(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 8192
+    assert config.resolved_llm_max_tokens(
+        model="gpt-5.4",
+        provider="openai",
+    ) == 4096
+
+
+def test_resolved_llm_max_tokens_allows_explicit_override(monkeypatch):
+    monkeypatch.setenv("LLM_MAX_TOKENS", "6000")
+
+    assert config.resolved_llm_max_tokens(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 6000
+
+
+def test_resolved_llm_temperature_uses_deepseek_replay_default(monkeypatch):
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+    monkeypatch.delenv("DEEPSEEK_LLM_TEMPERATURE", raising=False)
+
+    assert config.resolved_llm_temperature(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 0.0
+    assert config.resolved_llm_temperature(
+        model="gpt-5.4",
+        provider="openai",
+    ) == 0.3
+
+
+def test_resolved_llm_temperature_allows_provider_and_global_override(monkeypatch):
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+    monkeypatch.setenv("DEEPSEEK_LLM_TEMPERATURE", "0.15")
+
+    assert config.resolved_llm_temperature(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 0.15
+
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.25")
+    assert config.resolved_llm_temperature(
+        model="deepseek-v4-pro",
+        provider="deepseek",
+    ) == 0.25
+
+
 def test_default_historical_options_provider_is_polygon(monkeypatch):
     monkeypatch.delenv("HISTORICAL_OPTIONS_PROVIDER", raising=False)
 
@@ -91,6 +144,19 @@ def test_trading_brain_defaults_to_resolved_model(monkeypatch):
 
     assert brain.model == "gpt-5.4"
     assert brain.provider == "openai"
+
+
+def test_trading_brain_uses_resolved_provider_temperature(monkeypatch):
+    class DummyAdapter:
+        provider = "deepseek"
+
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+    monkeypatch.delenv("DEEPSEEK_LLM_TEMPERATURE", raising=False)
+
+    brain = TradingBrain(adapter=DummyAdapter(), model="deepseek-v4-pro")
+    packet = brain.build_packet("portfolio", "candidates", "news", "market")
+
+    assert packet.temperature == 0.0
 
 
 def test_openai_adapter_passes_reasoning_effort_from_env(monkeypatch):

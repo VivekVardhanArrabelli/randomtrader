@@ -387,17 +387,20 @@ def test_run_packet_marks_missing_tool_call_after_retries_as_llm_error():
     adapter = AlwaysEmptyAdapter()
     brain = TradingBrain(adapter=adapter, model="deepseek-v4-pro")
 
-    analysis = brain.analyze(
+    run_result = brain.run(
         portfolio_context="port",
         candidate_context="candidates",
         news_context="news",
         market_context="market",
         options_context="options",
     )
+    analysis = run_result.analysis
 
     assert adapter.calls >= 1
     assert analysis.analysis.startswith("LLM error: LLM returned no structured tool call")
     assert analysis.trades == []
+    assert run_result.diagnostics["retries"] == adapter.calls - 1
+    assert run_result.diagnostics["events"][0]["reason"] == "missing_tool_call"
 
 
 def test_run_packet_recovers_json_text_block_without_tool_call():
@@ -424,19 +427,22 @@ def test_run_packet_recovers_json_text_block_without_tool_call():
     adapter = TextOnlyAdapter()
     brain = TradingBrain(adapter=adapter, model="deepseek-v4-pro")
 
-    analysis = brain.analyze(
+    run_result = brain.run(
         portfolio_context="port",
         candidate_context="candidates",
         news_context="news",
         market_context="market",
         options_context="options",
     )
+    analysis = run_result.analysis
 
     assert adapter.calls == 1
     assert analysis.analysis == "Recovered JSON"
     assert len(analysis.trades) == 1
     assert analysis.trades[0].action == "buy_call"
     assert analysis.trades[0].underlying == "AAPL"
+    assert run_result.diagnostics["retries"] == 0
+    assert run_result.diagnostics["recovered_from_text"] is True
 
 
 def test_run_packet_retries_once_on_missing_tool_call():
@@ -475,13 +481,19 @@ def test_run_packet_retries_once_on_missing_tool_call():
     adapter = EmptyThenValidAdapter()
     brain = TradingBrain(adapter=adapter, model="gpt-5.4")
 
-    analysis = brain.analyze(
+    run_result = brain.run(
         portfolio_context="port",
         candidate_context="candidates",
         news_context="news",
         market_context="market",
         options_context="options",
     )
+    analysis = run_result.analysis
 
     assert adapter.calls == 2
     assert analysis.analysis == "ok"
+    assert run_result.diagnostics["attempts"] == 2
+    assert run_result.diagnostics["retries"] == 1
+    assert run_result.diagnostics["events"] == [
+        {"attempt": 1, "reason": "missing_tool_call"}
+    ]

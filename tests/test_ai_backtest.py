@@ -8,6 +8,7 @@ import pytest
 from ai_trader.brain import AnalysisRun, MarketAnalysis, TradeDecision
 from ai_trader.backtest import (
     BacktestConfig,
+    PrepareBacktestResult,
     BacktestResult,
     PolygonCache,
     SimPosition,
@@ -43,12 +44,14 @@ from ai_trader.backtest import (
     fetch_polygon_option_contracts,
     print_backtest_result,
     save_backtest_result,
+    save_prepare_result,
     save_debug_log,
 )
 from ai_trader.historical_cache import PolygonResponseStore
 from ai_trader.journal import ThesisUpdate
 from ai_trader.llm import LLMCompletion, LLMDecisionPacket, ToolCall
 from ai_trader.news import NewsEvent
+from ai_trader.options import OptionContract
 from ai_trader.utils import EASTERN_TZ
 
 
@@ -782,6 +785,57 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     assert daily_calls == intraday_calls
 
 
+def test_run_backtest_prepare_prefetches_option_bars_and_logs_cache_delta(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_time = datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ)
+    prefetch_args: dict[str, int] = {}
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: [decision_time])
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("AAPL focus", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+
+    def warm_metadata(api_key, tickers, as_of, cache, **kwargs):
+        cache.store.put("/metadata", {"as_of": as_of.isoformat()}, {"ok": True})
+        return 12
+
+    def prefetch_option_bars(api_key, tickers, as_of, cache, **kwargs):
+        prefetch_args["contracts_per_side"] = kwargs["contracts_per_side"]
+        cache.store.put("/bars", {"as_of": as_of.isoformat()}, {"ok": True})
+        return 4
+
+    monkeypatch.setattr(bt_mod, "_warm_prepare_option_metadata", warm_metadata)
+    monkeypatch.setattr(bt_mod, "_prefetch_prepare_option_data", prefetch_option_bars)
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            prepare_only=True,
+            cache_db_path=tmp_path / "cache.db",
+            prepare_prefetch_contracts_per_side=3,
+        )
+    )
+
+    entry = result.decision_log[0]
+    assert prefetch_args["contracts_per_side"] == 3
+    assert entry["warmed_option_contract_metadata"] == 12
+    assert entry["prefetched_option_contract_bars"] == 4
+    assert entry["cache_entries_added"] == 2
+
+
 def test_build_options_context_fetches_intraday_only_for_primary_contracts(monkeypatch):
     import ai_trader.backtest as bt_mod
 
@@ -860,6 +914,58 @@ def test_build_options_context_fetches_intraday_only_for_primary_contracts(monke
     assert "CALLITM CALL $95.00" in context
     assert "PUTITM PUT $105.00" in context
     assert "premium=$1.50" in context
+
+
+def test_build_options_context_skips_offline_contract_cache_miss(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "trend": "up",
+            "range_label": "mid_range",
+        },
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "_build_ticker_price_context",
+        lambda *args, **kwargs: ("spot=$100.00", 100.0),
+    )
+
+    def fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
+        if ticker == "MU":
+            raise RuntimeError("offline Polygon cache miss for /v3/reference/options/contracts")
+        return [{"ticker": "CALLATM", "strike_price": 100, "expiration_date": "2025-01-24"}]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", fetch_contracts)
+    monkeypatch.setattr(
+        bt_mod,
+        "_session_intraday_bars_before",
+        lambda *args, **kwargs: [
+            {
+                "t": int(datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ).timestamp() * 1000),
+                "c": 1.5,
+                "h": 1.6,
+                "l": 1.4,
+                "v": 10,
+            }
+        ],
+    )
+
+    context = _build_options_context(
+        "fake",
+        ["MU", "AAPL"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(offline=True),
+    )
+
+    assert "AAPL" in context
+    assert "CALLATM" in context
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1172,7 @@ def test_select_real_contract_no_contracts(monkeypatch):
         lambda *args, **kwargs: [],
     )
 
+    reasons: list[str] = []
     result = _select_real_contract(
         api_key="fake",
         underlying="AAPL",
@@ -1075,8 +1182,41 @@ def test_select_real_contract_no_contracts(monkeypatch):
         strike_preference="atm",
         expiry_preference="next_week",
         default_dte=14,
+        reason_out=reasons,
     )
     assert result is None
+    assert reasons == ["no contracts returned"]
+
+
+def test_select_real_contract_reports_missing_quote_data(monkeypatch):
+    """Returns a specific reason when metadata exists but quote hydration fails."""
+    contracts = [
+        _contract("O:AAPL250117C00150000", 150, "2025-01-17", bid=0, ask=0),
+    ]
+    import ai_trader.backtest as bt_mod
+    monkeypatch.setattr(
+        bt_mod, "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+    monkeypatch.setattr(bt_mod, "_current_option_bar", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bt_mod, "_historical_option_session_volume", lambda *args, **kwargs: 0)
+
+    reasons: list[str] = []
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=150.0,
+        trade_date=date(2025, 1, 10),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        cache=PolygonCache(),
+        reason_out=reasons,
+    )
+
+    assert result is None
+    assert reasons == ["no contract quote data after hydration"]
 
 
 def test_select_real_contract_monthly_prefers_target_dte(monkeypatch):
@@ -1180,6 +1320,55 @@ def test_select_real_contract_respects_expression_profile(monkeypatch):
     )
     assert result is not None
     assert result["ticker"] == "O:AAPL250131C00145000"
+
+
+def test_select_real_contract_bounds_expensive_hydration(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    contracts = [
+        _contract(f"O:AAPL250117C{strike:08d}", strike, "2025-01-17")
+        for strike in range(120, 181)
+    ]
+    hydrated: list[str] = []
+    monkeypatch.setattr(
+        bt_mod, "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: contracts,
+    )
+    monkeypatch.setattr(bt_mod.config, "BACKTEST_CONTRACT_HYDRATION_LIMIT", 5)
+
+    def hydrate(contract, **kwargs):
+        hydrated.append(contract["ticker"])
+        return OptionContract(
+            symbol=contract["ticker"],
+            underlying="AAPL",
+            option_type="call",
+            strike=float(contract["strike_price"]),
+            expiration=date.fromisoformat(contract["expiration_date"]),
+            dte=7,
+            bid=1.0,
+            ask=1.2,
+            mid=1.1,
+            volume=25,
+            open_interest=100,
+        )
+
+    monkeypatch.setattr(bt_mod, "_polygon_contract_to_option_contract", hydrate)
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=150.0,
+        trade_date=date(2025, 1, 10),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        cache=PolygonCache(),
+    )
+
+    assert result is not None
+    assert len(hydrated) == 5
+    assert result["strike_price"] == 150
 
 
 # ---------------------------------------------------------------------------
@@ -1420,6 +1609,16 @@ def test_extract_tickers_excludes_indices():
     assert "IWM" not in result
     assert "DIA" not in result
     assert result == ["AAPL"]
+
+
+def test_extract_tickers_excludes_warrant_like_symbols():
+    news = [
+        {"tickers": ["VWAVW", "AAPL"]},
+        {"tickers": ["ABCDU", "AAPL"]},
+        {"tickers": ["XYZRR", "MSFT"]},
+    ]
+    result = _extract_top_news_tickers(news)
+    assert result == ["AAPL", "MSFT"]
 
 
 def test_extract_tickers_empty_news():
@@ -2109,15 +2308,28 @@ def test_summarize_decision_log_counts_skip_reasons():
                 },
             ]
         },
+        {
+            "llm_diagnostics": {
+                "attempts": 3,
+                "retries": 2,
+                "events": [
+                    {"attempt": 1, "reason": "exception"},
+                    {"attempt": 2, "reason": "missing_tool_call"},
+                ],
+            }
+        },
     ])
 
     assert summary["proposed"] == 4
     assert summary["executed"] == 1
     assert summary["skipped"] == 3
     assert summary["dropped"] == 2
+    assert summary["provider_retry_cycles"] == 1
+    assert summary["provider_retries"] == 2
     assert summary["guardrail_skips"] == 1
     assert summary["skip_reasons"][0] == {"reason": "no contract found", "count": 2}
     assert summary["drop_reasons"][0] == {"reason": "conviction 0.00 < 0.6", "count": 1}
+    assert summary["provider_retry_reasons"][0] == {"reason": "exception", "count": 1}
 
 
 def test_backtest_option_loss_streak_guard_blocks_marginal_options():
@@ -2256,6 +2468,14 @@ def test_save_debug_log(tmp_path):
                     {"underlying": "ASTS", "action": "buy_put",
                      "conviction": 0.3, "reason": "conviction 0.30 < 0.6"}
                 ],
+                "llm_diagnostics": {
+                    "attempts": 3,
+                    "retries": 2,
+                    "events": [
+                        {"attempt": 1, "reason": "exception"},
+                        {"attempt": 2, "reason": "missing_tool_call"},
+                    ],
+                },
                 "trades_executed": 1,
                 "trades_skipped": 1,
                 "equity": 95000.0,
@@ -2276,7 +2496,9 @@ def test_save_debug_log(tmp_path):
     assert "no contract found" in content
     assert "Dropped Model Trades" in content
     assert "conviction 0.30 < 0.6" in content
-    assert "Decision summary: 2 proposed | 1 executed | 1 skipped" in content
+    assert "LLM Diagnostics" in content
+    assert "attempt 2: missing_tool_call" in content
+    assert "Decision summary: 2 proposed | 1 executed | 1 skipped | 1 dropped | 2 LLM retries" in content
     assert "$95,000" in content
 
 
@@ -2303,6 +2525,31 @@ def test_save_backtest_result_includes_decision_summary(tmp_path):
     assert data["decision_summary"]["skip_reasons"] == [
         {"reason": "zero volume", "count": 1}
     ]
+
+
+def test_save_prepare_result_includes_cache_and_prefetch_summary(tmp_path):
+    result = PrepareBacktestResult(
+        start_date=date(2025, 1, 6),
+        end_date=date(2025, 1, 7),
+        days_prepared=2,
+        decision_points=4,
+        cache_db_path=tmp_path / "cache.db",
+        cache_entries=20,
+        cache_entries_before=5,
+        cache_entries_added=15,
+        option_contracts_warmed=120,
+        option_contract_bars_prefetched=32,
+    )
+    out_path = tmp_path / "prepare.json"
+
+    save_prepare_result(result, out_path)
+
+    import json
+    data = json.loads(out_path.read_text())
+    assert data["cache_entries_before"] == 5
+    assert data["cache_entries_added"] == 15
+    assert data["option_contracts_warmed"] == 120
+    assert data["option_contract_bars_prefetched"] == 32
 
 
 # ---------------------------------------------------------------------------

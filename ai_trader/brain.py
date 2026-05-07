@@ -67,6 +67,7 @@ class AnalysisRun:
     packet: LLMDecisionPacket
     completion: LLMCompletion
     analysis: MarketAnalysis
+    diagnostics: dict = field(default_factory=dict)
 
 
 SYSTEM_PROMPT = """\
@@ -685,6 +686,23 @@ def _completion_with_text_tool_call(completion: LLMCompletion) -> LLMCompletion:
     return completion
 
 
+def _llm_diagnostics(
+    *,
+    attempts: int,
+    max_attempts: int,
+    events: list[dict],
+) -> dict:
+    return {
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "retries": max(attempts - 1, 0),
+        "events": events,
+        "recovered_from_text": any(
+            event.get("reason") == "recovered_text_json" for event in events
+        ),
+    }
+
+
 class TradingBrain:
     def __init__(
         self,
@@ -767,8 +785,14 @@ class TradingBrain:
             system_prompt=SYSTEM_PROMPT,
             user_message=user_message,
             tool=TRADE_TOOL,
-            max_tokens=config.LLM_MAX_TOKENS,
-            temperature=config.LLM_TEMPERATURE,
+            max_tokens=config.resolved_llm_max_tokens(
+                model=self.model,
+                provider=self.provider,
+            ),
+            temperature=config.resolved_llm_temperature(
+                model=self.model,
+                provider=self.provider,
+            ),
             contexts={
                 "portfolio_context": portfolio_context,
                 "candidate_context": candidate_context,
@@ -787,7 +811,10 @@ class TradingBrain:
         last_exc: Exception | None = None
         completion: LLMCompletion | None = None
         max_attempts = max(config.LLM_MAX_ATTEMPTS, 1)
+        retry_events: list[dict] = []
+        attempts_used = 0
         for attempt in range(max_attempts):
+            attempts_used = attempt + 1
             try:
                 completion = self.adapter.complete_structured(
                     model=request_packet.model,
@@ -797,8 +824,18 @@ class TradingBrain:
                     user_message=request_packet.user_message,
                     tool=request_packet.tool,
                 )
+                had_tool_call = bool(completion.tool_calls)
                 completion = _completion_with_text_tool_call(completion)
+                if not had_tool_call and completion.tool_calls:
+                    retry_events.append({
+                        "attempt": attempt + 1,
+                        "reason": "recovered_text_json",
+                    })
                 if not completion.tool_calls and attempt < max_attempts - 1:
+                    retry_events.append({
+                        "attempt": attempt + 1,
+                        "reason": "missing_tool_call",
+                    })
                     log(
                         f"LLM returned no structured tool call "
                         f"(attempt {attempt + 1}/{max_attempts})"
@@ -807,6 +844,11 @@ class TradingBrain:
                 break
             except Exception as exc:
                 last_exc = exc
+                retry_events.append({
+                    "attempt": attempt + 1,
+                    "reason": "exception",
+                    "message": str(exc)[:500],
+                })
                 if attempt < max_attempts - 1:
                     log(f"LLM API error (attempt {attempt + 1}/{max_attempts}): {exc}")
                     continue
@@ -821,6 +863,11 @@ class TradingBrain:
                         raw_response={"error": str(exc)},
                     ),
                     analysis=analysis,
+                    diagnostics=_llm_diagnostics(
+                        attempts=attempts_used,
+                        max_attempts=max_attempts,
+                        events=retry_events,
+                    ),
                 )
 
         if completion is None:
@@ -835,6 +882,11 @@ class TradingBrain:
                     raw_response={"error": str(exc)},
                 ),
                 analysis=analysis,
+                diagnostics=_llm_diagnostics(
+                    attempts=attempts_used,
+                    max_attempts=max_attempts,
+                    events=retry_events,
+                ),
             )
 
         if not completion.tool_calls:
@@ -848,12 +900,22 @@ class TradingBrain:
                     trades=[],
                     thesis_updates=[],
                 ),
+                diagnostics=_llm_diagnostics(
+                    attempts=attempts_used,
+                    max_attempts=max_attempts,
+                    events=retry_events,
+                ),
             )
 
         return AnalysisRun(
             packet=request_packet,
             completion=completion,
             analysis=self._parse_response(completion),
+            diagnostics=_llm_diagnostics(
+                attempts=attempts_used,
+                max_attempts=max_attempts,
+                events=retry_events,
+            ),
         )
 
     def _build_prompt(

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 EASTERN_TZ = ZoneInfo("America/New_York")
+_EQUITY_CANDIDATE_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,5}$")
+_NON_COMMON_STOCK_SUFFIXES = ("W", "WS", "WT", "U", "R")
 
 
 def now_eastern() -> datetime:
@@ -45,6 +48,17 @@ def parse_timestamp(value) -> datetime | None:
             except ValueError:
                 continue
     return None
+
+
+def is_equity_candidate_symbol(symbol: str) -> bool:
+    """Return True for symbols suitable for stock/options candidate research."""
+    normalized = str(symbol or "").upper().strip()
+    if not normalized or not _EQUITY_CANDIDATE_RE.match(normalized):
+        return False
+    return not (
+        len(normalized) >= 5
+        and any(normalized.endswith(suffix) for suffix in _NON_COMMON_STOCK_SUFFIXES)
+    )
 
 
 def prioritized_symbol_watchlist(*symbol_groups: list[str], limit: int) -> list[str]:

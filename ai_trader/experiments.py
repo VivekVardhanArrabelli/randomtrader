@@ -489,6 +489,10 @@ def _prepare_result_to_dict(result: PrepareBacktestResult | None) -> dict | None
         "decision_points": result.decision_points,
         "cache_db_path": str(result.cache_db_path),
         "cache_entries": result.cache_entries,
+        "cache_entries_before": result.cache_entries_before,
+        "cache_entries_added": result.cache_entries_added,
+        "option_contracts_warmed": result.option_contracts_warmed,
+        "option_contract_bars_prefetched": result.option_contract_bars_prefetched,
     }
 
 
