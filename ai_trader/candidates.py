@@ -60,7 +60,7 @@ class CandidateIdea:
         if self.event_type:
             event = (
                 f"{self.event_type}/{self.freshness}/{self.source_count}src/"
-                f"{self.age_minutes}m"
+                f"{self.age_minutes}min"
             )
         else:
             event = "none"

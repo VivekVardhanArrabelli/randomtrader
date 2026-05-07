@@ -292,7 +292,7 @@ def _build_catalyst_reaction_context(
         )
         lines.append(
             f"  {symbol}: event={event.event_type}/{event.freshness}"
-            f" age={event.age_minutes}m"
+            f" age={event.age_minutes}min"
             f" today({metrics['intraday_chg']:+.1f}%)"
             f" 5d({metrics['five_d_chg']:+.1f}%)"
             f" trend={metrics['trend']}"

@@ -241,6 +241,7 @@ def test_format_symbol_setup_context_exposes_catalyst_and_range():
 
     assert "Setup (NVDA):" in text
     assert "catalyst=hard_catalyst/guidance/fresh/2src" in text
+    assert "age=25min" in text
     assert "reaction=early_move" in text
     assert "range=92% near_10d_high" in text
     assert "trend=up" in text
@@ -305,4 +306,4 @@ def test_format_news_for_llm_uses_reference_time_for_age(monkeypatch):
         focus_symbols=["MSFT"],
         reference_time=now,
     )
-    assert "25m ago" in text
+    assert "25 min ago" in text

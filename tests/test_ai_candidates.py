@@ -56,7 +56,7 @@ def test_build_candidate_ideas_prefers_stronger_direct_catalyst():
     table = format_candidate_table(candidates, max_rows=2)
     assert "Candidate Table" in table
     assert "AAPL" in table
-    assert "event=partnership/breaking/3src/5m" in table
+    assert "event=partnership/breaking/3src/5min" in table
 
 
 def test_select_candidate_finalists_uses_bucket_coverage_before_backfill():
