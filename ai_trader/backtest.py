@@ -272,6 +272,31 @@ def _parse_theta_contract_ticker(option_ticker: str) -> tuple[str, date, str, fl
     )
 
 
+def _parse_polygon_option_ticker(option_ticker: str) -> tuple[str, date, str, float] | None:
+    match = re.match(
+        r"^O:(?P<underlying>.+?)(?P<expiry>\d{6})(?P<cp>[CP])(?P<strike>\d{8})$",
+        str(option_ticker or "").strip().upper(),
+    )
+    if not match:
+        return None
+    expiry_raw = match.group("expiry")
+    try:
+        expiration = date(
+            2000 + int(expiry_raw[:2]),
+            int(expiry_raw[2:4]),
+            int(expiry_raw[4:6]),
+        )
+    except ValueError:
+        return None
+    option_type = "call" if match.group("cp") == "C" else "put"
+    return (
+        match.group("underlying").upper(),
+        expiration,
+        option_type,
+        int(match.group("strike")) / 1000.0,
+    )
+
+
 def _theta_date(value: date) -> str:
     return value.strftime("%Y%m%d")
 
@@ -1568,9 +1593,21 @@ def _select_real_contract(
         target_delta_range=target_delta_range,
         target_dte_range=target_dte_range,
     )
+    exact_contract = _parse_polygon_option_ticker(contract_symbol or "")
+    exact_matches_request = (
+        exact_contract is not None
+        and exact_contract[0] == underlying.upper()
+        and exact_contract[2] == option_type
+    )
 
     # Determine expiry range
-    if target_dte_range is not None:
+    if exact_matches_request:
+        _, exact_expiry, _, exact_strike = exact_contract
+        context_expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
+        context_expiry_lte = trade_date + timedelta(days=default_dte + 7)
+        expiry_gte = min(context_expiry_gte, exact_expiry)
+        expiry_lte = max(context_expiry_lte, exact_expiry)
+    elif target_dte_range is not None:
         resolved_min_dte = max(min(target_dte_range), 1)
         resolved_max_dte = max(target_dte_range)
         resolved_max_dte = max(resolved_max_dte, resolved_min_dte)
@@ -1590,17 +1627,23 @@ def _select_real_contract(
         expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
         expiry_lte = trade_date + timedelta(days=default_dte + 7)
 
-    strike_band_pct = (
-        0.35
-        if (
-            contract_symbol
-            or target_delta_range is not None
-            or expression_profile in {"time_cushion", "stock_proxy", "convex"}
+    if exact_matches_request:
+        context_strike_gte = round(spot * 0.97, 2)
+        context_strike_lte = round(spot * 1.03, 2)
+        strike_gte = round(min(context_strike_gte, exact_strike), 2)
+        strike_lte = round(max(context_strike_lte, exact_strike), 2)
+    else:
+        strike_band_pct = (
+            0.35
+            if (
+                contract_symbol
+                or target_delta_range is not None
+                or expression_profile in {"time_cushion", "stock_proxy", "convex"}
+            )
+            else 0.15
         )
-        else 0.15
-    )
-    strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
-    strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+        strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
+        strike_lte = round(spot * (1.0 + strike_band_pct), 2)
 
     contracts = fetch_polygon_option_contracts(
         api_key, underlying, option_type,
@@ -1613,16 +1656,21 @@ def _select_real_contract(
     historical_contracts: list[OptionContract] = []
     raw_by_symbol: dict[str, dict] = {}
     for contract in contracts:
-        option_contract = _polygon_contract_to_option_contract(
-            contract,
-            api_key=api_key,
-            underlying=underlying,
-            option_type=option_type,
-            trade_date=trade_date,
-            as_of=as_of,
-            cache=cache,
-            bar_minutes=bar_minutes,
-        )
+        try:
+            option_contract = _polygon_contract_to_option_contract(
+                contract,
+                api_key=api_key,
+                underlying=underlying,
+                option_type=option_type,
+                trade_date=trade_date,
+                as_of=as_of,
+                cache=cache,
+                bar_minutes=bar_minutes,
+            )
+        except RuntimeError as exc:
+            if _is_offline_cache_miss(cache, exc):
+                continue
+            raise
         if option_contract is None or option_contract.ask <= 0:
             continue
         theta_backed = _is_theta_option_ticker(option_contract.symbol)
