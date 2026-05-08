@@ -886,6 +886,9 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     assert daily_calls == intraday_calls
     assert stats["attempted_option_contract_bars"] == 4
     assert stats["missing_option_contract_bars"] == 0
+    assert stats["attempted_primary_option_contract_bars"] == 2
+    assert stats["warmed_primary_option_contract_bars"] == 2
+    assert stats["missing_primary_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 0
     assert stats["option_bar_rate_limit_errors"] == 0
 
@@ -1023,10 +1026,21 @@ def test_prefetch_prepare_option_data_records_missing_bar_details(monkeypatch):
 
     assert count == 0
     assert stats["missing_option_contract_bars"] == 1
+    assert stats["attempted_primary_option_contract_bars"] == 1
+    assert stats["warmed_primary_option_contract_bars"] == 0
+    assert stats["missing_primary_option_contract_bars"] == 1
     assert stats["missing_option_contract_bar_details"] == [
         {
             "ticker": "CALLMISS",
             "reason": "offline Polygon cache miss for /v2/aggs/ticker/CALLMISS",
+            "underlying": "NVDA",
+            "option_type": "call",
+            "prefetch_rank": 1,
+            "is_primary_context": True,
+            "strike": 100.0,
+            "moneyness": "atm",
+            "expiration_date": "2025-01-24",
+            "dte": 14,
         }
     ]
 
@@ -1083,6 +1097,9 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(m
     assert count == 0
     assert attempted == ["CALLATM"]
     assert stats["attempted_option_contract_bars"] == 1
+    assert stats["attempted_primary_option_contract_bars"] == 1
+    assert stats["warmed_primary_option_contract_bars"] == 0
+    assert stats["missing_primary_option_contract_bars"] == 0
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 1
     assert stats["option_bar_rate_limit_errors"] == 0
@@ -1140,6 +1157,9 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_rate_limit(monkeypatc
     assert count == 0
     assert attempted == ["CALLATM"]
     assert stats["attempted_option_contract_bars"] == 1
+    assert stats["attempted_primary_option_contract_bars"] == 1
+    assert stats["warmed_primary_option_contract_bars"] == 0
+    assert stats["missing_primary_option_contract_bars"] == 0
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 0
     assert stats["option_bar_rate_limit_errors"] == 1
@@ -1208,6 +1228,9 @@ def test_prefetch_prepare_option_data_warms_both_primary_sides_before_alternativ
 
     assert count == 2
     assert attempted == ["CALLATM", "PUTATM", "CALLALT"]
+    assert stats["attempted_primary_option_contract_bars"] == 2
+    assert stats["warmed_primary_option_contract_bars"] == 2
+    assert stats["missing_primary_option_contract_bars"] == 0
     assert stats["option_bar_rate_limit_errors"] == 1
 
 
@@ -2874,6 +2897,7 @@ def test_backtest_result_to_dict_includes_period_provider_and_decision_summary()
     assert payload["end_date"] == "2025-01-10"
     assert payload["llm_provider"] == "deepseek"
     assert payload["llm_model"] == "deepseek-v4-pro"
+    assert payload["llm_error_messages"] == []
     assert payload["decision_summary"] == {
         "decision_points": 1,
         "proposed": 3,
@@ -2891,6 +2915,23 @@ def test_backtest_result_to_dict_includes_period_provider_and_decision_summary()
     }
 
 
+def test_backtest_result_to_dict_summarizes_llm_error_messages():
+    r = BacktestResult(
+        llm_error_cycles=2,
+        decision_log=[
+            {"market_analysis": "LLM error: DeepSeek 402: Insufficient Balance"},
+            {"market_analysis": "LLM error: DeepSeek 402: Insufficient Balance"},
+            {"market_analysis": "Constructive tape"},
+        ],
+    )
+
+    payload = backtest_result_to_dict(r)
+
+    assert payload["llm_error_messages"] == [
+        {"message": "LLM error: DeepSeek 402: Insufficient Balance", "count": 2}
+    ]
+
+
 def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     result = PrepareBacktestResult(
         start_date=date(2025, 1, 6),
@@ -2905,6 +2946,9 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         warmed_option_contract_bars=3,
         attempted_option_contract_bars=5,
         missing_option_contract_bars=2,
+        attempted_primary_option_contract_bars=2,
+        warmed_primary_option_contract_bars=1,
+        missing_primary_option_contract_bars=1,
         missing_option_contract_bar_details=[
             {"ticker": "CALLMISS", "reason": "offline cache miss"}
         ],
@@ -2918,6 +2962,9 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "warmed_option_contract_bars": 3,
                 "attempted_option_contract_bars": 5,
                 "missing_option_contract_bars": 2,
+                "attempted_primary_option_contract_bars": 2,
+                "warmed_primary_option_contract_bars": 1,
+                "missing_primary_option_contract_bars": 1,
                 "missing_option_contract_bar_details": [
                     {"ticker": "CALLMISS", "reason": "offline cache miss"}
                 ],
@@ -2935,6 +2982,9 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["warmed_option_contract_bars"] == 3
     assert payload["attempted_option_contract_bars"] == 5
     assert payload["missing_option_contract_bars"] == 2
+    assert payload["attempted_primary_option_contract_bars"] == 2
+    assert payload["warmed_primary_option_contract_bars"] == 1
+    assert payload["missing_primary_option_contract_bars"] == 1
     assert payload["missing_option_contract_bar_details"] == [
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
     ]
@@ -2942,6 +2992,11 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
     assert payload["prepare_decisions"][0]["attempted_option_contract_bars"] == 5
     assert payload["prepare_decisions"][0]["missing_option_contract_bars"] == 2
+    assert (
+        payload["prepare_decisions"][0]["attempted_primary_option_contract_bars"] == 2
+    )
+    assert payload["prepare_decisions"][0]["warmed_primary_option_contract_bars"] == 1
+    assert payload["prepare_decisions"][0]["missing_primary_option_contract_bars"] == 1
     assert payload["prepare_decisions"][0]["missing_option_contract_bar_details"] == [
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
     ]

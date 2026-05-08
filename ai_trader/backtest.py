@@ -1868,9 +1868,12 @@ class PrepareBacktestResult:
     warmed_option_contract_bars: int = 0
     attempted_option_contract_bars: int = 0
     missing_option_contract_bars: int = 0
+    attempted_primary_option_contract_bars: int = 0
+    warmed_primary_option_contract_bars: int = 0
+    missing_primary_option_contract_bars: int = 0
     option_bar_authorization_errors: int = 0
     option_bar_rate_limit_errors: int = 0
-    missing_option_contract_bar_details: list[dict[str, str]] = field(
+    missing_option_contract_bar_details: list[dict[str, Any]] = field(
         default_factory=list
     )
     prepare_decisions: list[dict] = field(default_factory=list)
@@ -2967,13 +2970,47 @@ def _record_prepare_option_bar_miss(
     *,
     ticker: str,
     reason: str,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     if stats is None:
         return
     details = stats.setdefault("missing_option_contract_bar_details", [])
     if not isinstance(details, list) or len(details) >= 50:
         return
-    details.append({"ticker": ticker, "reason": reason})
+    detail = {"ticker": ticker, "reason": reason}
+    if metadata:
+        detail.update(metadata)
+    details.append(detail)
+
+
+def _prepare_option_bar_detail_metadata(
+    *,
+    underlying: str,
+    option_type: str,
+    contract: dict,
+    spot: float,
+    trade_date: date,
+    default_dte: int,
+    prefetch_rank: int,
+) -> dict[str, Any]:
+    strike = float(contract.get("strike_price", 0) or 0)
+    expiry_raw = str(contract.get("expiration_date") or "")
+    metadata: dict[str, Any] = {
+        "underlying": underlying.upper(),
+        "option_type": option_type,
+        "prefetch_rank": prefetch_rank,
+        "is_primary_context": prefetch_rank == 1,
+    }
+    if strike > 0:
+        metadata["strike"] = strike
+        metadata["moneyness"] = _contract_moneyness_bucket(option_type, strike, spot)
+    if expiry_raw:
+        metadata["expiration_date"] = expiry_raw
+        try:
+            metadata["dte"] = max((date.fromisoformat(expiry_raw) - trade_date).days, 0)
+        except ValueError:
+            metadata["dte"] = default_dte
+    return metadata
 
 
 def _prefetch_prepare_option_data(
@@ -2997,6 +3034,9 @@ def _prefetch_prepare_option_data(
     if stats is not None:
         stats.setdefault("attempted_option_contract_bars", 0)
         stats.setdefault("missing_option_contract_bars", 0)
+        stats.setdefault("attempted_primary_option_contract_bars", 0)
+        stats.setdefault("warmed_primary_option_contract_bars", 0)
+        stats.setdefault("missing_primary_option_contract_bars", 0)
         stats.setdefault("option_bar_authorization_errors", 0)
         stats.setdefault("option_bar_rate_limit_errors", 0)
 
@@ -3082,8 +3122,11 @@ def _prefetch_prepare_option_data(
                 option_ticker = str(contract.get("ticker") or "")
                 if not option_ticker or option_ticker in prefetched:
                     continue
+                is_primary_context = rank_index == 0
                 if stats is not None:
                     stats["attempted_option_contract_bars"] += 1
+                    if is_primary_context:
+                        stats["attempted_primary_option_contract_bars"] += 1
                 try:
                     fetch_historical_intraday_bars(
                         api_key,
@@ -3119,13 +3162,27 @@ def _prefetch_prepare_option_data(
                         return len(prefetched)
                     if stats is not None:
                         stats["missing_option_contract_bars"] += 1
+                        if is_primary_context:
+                            stats["missing_primary_option_contract_bars"] += 1
+                    detail_metadata = _prepare_option_bar_detail_metadata(
+                        underlying=ticker,
+                        option_type=option_type,
+                        contract=contract,
+                        spot=spot,
+                        trade_date=trade_date,
+                        default_dte=default_dte,
+                        prefetch_rank=rank_index + 1,
+                    )
                     _record_prepare_option_bar_miss(
                         stats,
                         ticker=option_ticker,
                         reason=str(exc),
+                        metadata=detail_metadata,
                     )
                     continue
                 prefetched.add(option_ticker)
+                if stats is not None and is_primary_context:
+                    stats["warmed_primary_option_contract_bars"] += 1
 
     return len(prefetched)
 
@@ -3702,6 +3759,15 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 missing_contract_bars = int(
                     option_bar_stats.get("missing_option_contract_bars") or 0
                 )
+                attempted_primary_contract_bars = int(
+                    option_bar_stats.get("attempted_primary_option_contract_bars") or 0
+                )
+                warmed_primary_contract_bars = int(
+                    option_bar_stats.get("warmed_primary_option_contract_bars") or 0
+                )
+                missing_primary_contract_bars = int(
+                    option_bar_stats.get("missing_primary_option_contract_bars") or 0
+                )
                 option_bar_auth_errors = int(
                     option_bar_stats.get("option_bar_authorization_errors") or 0
                 )
@@ -3724,6 +3790,11 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "warmed_option_contract_bars": warmed_contract_bars,
                     "attempted_option_contract_bars": attempted_contract_bars,
                     "missing_option_contract_bars": missing_contract_bars,
+                    "attempted_primary_option_contract_bars": (
+                        attempted_primary_contract_bars
+                    ),
+                    "warmed_primary_option_contract_bars": warmed_primary_contract_bars,
+                    "missing_primary_option_contract_bars": missing_primary_contract_bars,
                     "missing_option_contract_bar_details": missing_contract_bar_details,
                     "option_bar_authorization_errors": option_bar_auth_errors,
                     "option_bar_rate_limit_errors": option_bar_rate_limit_errors,
@@ -4314,6 +4385,18 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("missing_option_contract_bars") or 0)
         for entry in prepare_decisions
     )
+    attempted_primary_option_contract_bars = sum(
+        int(entry.get("attempted_primary_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
+    warmed_primary_option_contract_bars = sum(
+        int(entry.get("warmed_primary_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
+    missing_primary_option_contract_bars = sum(
+        int(entry.get("missing_primary_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
     missing_option_contract_bar_details = [
         detail
         for entry in prepare_decisions
@@ -4341,6 +4424,9 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         warmed_option_contract_bars=warmed_option_contract_bars,
         attempted_option_contract_bars=attempted_option_contract_bars,
         missing_option_contract_bars=missing_option_contract_bars,
+        attempted_primary_option_contract_bars=attempted_primary_option_contract_bars,
+        warmed_primary_option_contract_bars=warmed_primary_option_contract_bars,
+        missing_primary_option_contract_bars=missing_primary_option_contract_bars,
         missing_option_contract_bar_details=missing_option_contract_bar_details,
         option_bar_authorization_errors=option_bar_authorization_errors,
         option_bar_rate_limit_errors=option_bar_rate_limit_errors,
@@ -4410,10 +4496,19 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Option bars:      {r.warmed_option_contract_bars}")
     print(f"  Bar attempts:     {r.attempted_option_contract_bars}")
     print(f"  Bar misses:       {r.missing_option_contract_bars}")
+    print(
+        "  Primary bars:     "
+        f"{r.warmed_primary_option_contract_bars}/"
+        f"{r.attempted_primary_option_contract_bars} warmed"
+    )
+    if r.missing_primary_option_contract_bars:
+        print(f"  Primary misses:   {r.missing_primary_option_contract_bars}")
     for detail in r.missing_option_contract_bar_details[:3]:
         ticker = detail.get("ticker", "")
+        rank = detail.get("prefetch_rank")
+        rank_label = f" rank={rank}" if rank else ""
         reason = detail.get("reason", "")
-        print(f"    miss: {ticker} ({reason[:100]})")
+        print(f"    miss: {ticker}{rank_label} ({reason[:100]})")
     if r.option_bar_authorization_errors:
         print(f"  Bar auth errors:  {r.option_bar_authorization_errors}")
     if r.option_bar_rate_limit_errors:
@@ -4475,6 +4570,19 @@ def summarize_decisions(r: BacktestResult) -> dict:
     }
 
 
+def summarize_llm_error_messages(r: BacktestResult) -> list[dict]:
+    """Aggregate LLM error text so provider blockers are visible in JSON output."""
+    errors: Counter = Counter()
+    for entry in r.decision_log:
+        message = entry.get("market_analysis")
+        if _is_llm_error_message(message):
+            errors[str(message)] += 1
+    return [
+        {"message": message, "count": count}
+        for message, count in errors.most_common(10)
+    ]
+
+
 def _date_to_json(value: date | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -4498,6 +4606,7 @@ def backtest_result_to_dict(r: BacktestResult) -> dict:
         "days_tested": r.days_tested,
         "llm_error_cycles": r.llm_error_cycles,
         "llm_failure_days": r.llm_failure_days,
+        "llm_error_messages": summarize_llm_error_messages(r),
         "llm_provider": r.llm_provider,
         "llm_model": r.llm_model,
         "historical_options_provider": r.historical_options_provider,
@@ -4557,6 +4666,15 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "missing_option_contract_bars": int(
                 entry.get("missing_option_contract_bars") or 0
             ),
+            "attempted_primary_option_contract_bars": int(
+                entry.get("attempted_primary_option_contract_bars") or 0
+            ),
+            "warmed_primary_option_contract_bars": int(
+                entry.get("warmed_primary_option_contract_bars") or 0
+            ),
+            "missing_primary_option_contract_bars": int(
+                entry.get("missing_primary_option_contract_bars") or 0
+            ),
             "missing_option_contract_bar_details": list(
                 entry.get("missing_option_contract_bar_details") or []
             ),
@@ -4586,6 +4704,11 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         "warmed_option_contract_bars": r.warmed_option_contract_bars,
         "attempted_option_contract_bars": r.attempted_option_contract_bars,
         "missing_option_contract_bars": r.missing_option_contract_bars,
+        "attempted_primary_option_contract_bars": (
+            r.attempted_primary_option_contract_bars
+        ),
+        "warmed_primary_option_contract_bars": r.warmed_primary_option_contract_bars,
+        "missing_primary_option_contract_bars": r.missing_primary_option_contract_bars,
         "missing_option_contract_bar_details": r.missing_option_contract_bar_details,
         "option_bar_authorization_errors": r.option_bar_authorization_errors,
         "option_bar_rate_limit_errors": r.option_bar_rate_limit_errors,
