@@ -8,6 +8,7 @@ import pytest
 from ai_trader.brain import AnalysisRun, MarketAnalysis, TradeDecision
 from ai_trader.backtest import (
     BacktestConfig,
+    PrepareBacktestResult,
     BacktestResult,
     PolygonCache,
     SimPosition,
@@ -41,8 +42,10 @@ from ai_trader.backtest import (
     fetch_option_daily_bar,
     fetch_polygon_option_contracts,
     backtest_result_to_dict,
+    prepare_result_to_dict,
     print_backtest_result,
     save_debug_log,
+    save_prepare_result,
     summarize_decisions,
 )
 from ai_trader.historical_cache import PolygonResponseStore
@@ -2282,6 +2285,40 @@ def test_backtest_result_to_dict_includes_period_provider_and_decision_summary()
     }
 
 
+def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
+    result = PrepareBacktestResult(
+        start_date=date(2025, 1, 6),
+        end_date=date(2025, 1, 6),
+        days_prepared=1,
+        decision_points=1,
+        cache_db_path=tmp_path / "cache.db",
+        cache_entries=12,
+        cache_entries_before=5,
+        cache_entries_added=7,
+        warmed_option_contract_metadata=4,
+        prepare_decisions=[
+            {
+                "decision_time": "2025-01-06T09:35:00-05:00",
+                "finalists": ["AAPL"],
+                "options_watchlist": ["AAPL"],
+                "warmed_option_contract_metadata": 4,
+                "cache_entries": 12,
+            }
+        ],
+    )
+
+    payload = prepare_result_to_dict(result)
+
+    assert payload["cache_entries_before"] == 5
+    assert payload["cache_entries_added"] == 7
+    assert payload["warmed_option_contract_metadata"] == 4
+    assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
+
+    output = tmp_path / "prepare.json"
+    save_prepare_result(result, output)
+    assert '"cache_entries_added": 7' in output.read_text()
+
+
 def test_summarize_decisions_counts_dropped_trades():
     r = BacktestResult(
         decision_log=[
@@ -3055,6 +3092,84 @@ def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch)
                 max_consecutive_llm_errors=2,
             )
         )
+
+
+def test_run_backtest_honors_max_decisions(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    next_trade_day = date(2025, 1, 7)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 10, 5, tzinfo=EASTERN_TZ),
+    ]
+    calls = {"count": 0}
+
+    class FakeBrain:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            calls["count"] += 1
+            return AnalysisRun(
+                packet=LLMDecisionPacket(
+                    provider="deepseek",
+                    model="deepseek-v4-pro",
+                    system_prompt="system",
+                    user_message="prompt",
+                    tool={"name": "submit_trade_decisions", "input_schema": {"type": "object"}},
+                    max_tokens=256,
+                    temperature=0.1,
+                    contexts=kwargs,
+                ),
+                completion=LLMCompletion(
+                    provider="deepseek",
+                    model="deepseek-v4-pro",
+                    tool_calls=[],
+                    raw_response={"id": "resp_1"},
+                ),
+                analysis=MarketAnalysis(
+                    analysis="No trade",
+                    thesis_updates=[],
+                    trades=[],
+                ),
+            )
+
+    monkeypatch.setenv("POLYGON_API_KEY", "test-polygon")
+    monkeypatch.setattr(bt_mod, "TradingBrain", FakeBrain)
+    monkeypatch.setattr(bt_mod, "resolve_api_key", lambda provider, api_key=None: "test-deepseek")
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day, next_trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
+
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=next_trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            max_decisions=1,
+        )
+    )
+
+    assert calls["count"] == 1
+    assert result.days_tested == 1
+    assert len(result.equity_curve) == 1
+    assert result.equity_curve[0][0] == trade_day.isoformat()
+    assert len(result.decision_log) == 1
+    assert result.decision_log[0]["decision_time"] == decision_times[0].isoformat()
 
 
 def test_run_backtest_open_respects_live_limit_fill(tmp_path, monkeypatch):

@@ -1752,6 +1752,7 @@ class BacktestConfig:
     prepare_prefetch_contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE
     prepare_prefetch_strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT
     max_consecutive_llm_errors: int = config.MAX_CONSECUTIVE_LLM_ERROR_CYCLES
+    max_decisions: int = 0
 
 
 @dataclass
@@ -1790,6 +1791,10 @@ class PrepareBacktestResult:
     decision_points: int
     cache_db_path: Path
     cache_entries: int
+    cache_entries_before: int = 0
+    cache_entries_added: int = 0
+    warmed_option_contract_metadata: int = 0
+    prepare_decisions: list[dict] = field(default_factory=list)
 
 
 def _trading_days(start: date, end: date) -> list[date]:
@@ -3198,6 +3203,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     daily_returns: list[float] = []
     llm_failure_dates: set[date] = set()
     consecutive_llm_errors = 0
+    decisions_processed = 0
+    processed_trading_days = 0
+    last_processed_date: date | None = None
 
     # Polygon cache — avoids redundant API calls in-process and across runs.
     cache = PolygonCache(
@@ -3215,18 +3223,25 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
         log(f"mode: offline cache replay ({cache.store.db_path})")
     prior_day_equity = bt_config.initial_equity
     for day_idx, trade_date in enumerate(trading_days):
-        log(
-            f"\n=== {trade_date} (day {day_idx + 1}/{len(trading_days)}) "
-            f"realized_equity=${equity:,.2f} ==="
-        )
         decision_times = _decision_timestamps_for_day(
             trade_date,
             interval_minutes=bt_config.decision_interval_minutes,
             start_delay_minutes=bt_config.no_trade_minutes_after_open,
             end_buffer_minutes=bt_config.no_trade_minutes_before_close,
         )
+        if bt_config.max_decisions > 0:
+            remaining_decisions = bt_config.max_decisions - decisions_processed
+            if remaining_decisions <= 0:
+                log(f"decision limit reached ({bt_config.max_decisions}); stopping backtest")
+                break
+            decision_times = decision_times[:remaining_decisions]
+        log(
+            f"\n=== {trade_date} (day {day_idx + 1}/{len(trading_days)}) "
+            f"realized_equity=${equity:,.2f} ==="
+        )
 
         for decision_time in decision_times:
+            decisions_processed += 1
             remaining: list[SimPosition] = []
             for pos in positions:
                 pos = replace(pos, risk_alert="")
@@ -3925,9 +3940,11 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
         dd = peak_equity - day_close_equity
         if dd > max_dd:
             max_dd = dd
+        processed_trading_days += 1
+        last_processed_date = trade_date
 
     # Close any remaining positions at last day
-    last_date = trading_days[-1] if trading_days else bt_config.end_date
+    last_date = last_processed_date or (trading_days[-1] if trading_days else bt_config.end_date)
     for pos in positions:
         exit_premium = 0.0
         if pos.polygon_ticker:
@@ -3993,7 +4010,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     )
     result.net_pnl = sum(t.pnl for t in result.trades)
     result.max_drawdown = max_dd
-    result.days_tested = len(trading_days)
+    result.days_tested = processed_trading_days
 
     gross_profit = sum(t.pnl for t in result.trades if t.pnl > 0)
     gross_loss = abs(sum(t.pnl for t in result.trades if t.pnl < 0))
@@ -4021,15 +4038,28 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         llm_delay_seconds=0.0,
         prepare_only=True,
     )
+    cache_path = _historical_cache_path(prepare_config)
+    store_before = PolygonResponseStore(cache_path)
+    cache_entries_before = store_before.entry_count()
     result = run_backtest(prepare_config)
-    store = PolygonResponseStore(_historical_cache_path(prepare_config))
+    store = PolygonResponseStore(cache_path)
+    cache_entries = store.entry_count()
+    prepare_decisions = _prepare_decision_summaries(result.decision_log)
+    warmed_option_contract_metadata = sum(
+        int(entry.get("warmed_option_contract_metadata") or 0)
+        for entry in prepare_decisions
+    )
     return PrepareBacktestResult(
         start_date=prepare_config.start_date,
         end_date=prepare_config.end_date,
         days_prepared=result.days_tested,
         decision_points=len(result.decision_log),
         cache_db_path=store.db_path,
-        cache_entries=store.entry_count(),
+        cache_entries=cache_entries,
+        cache_entries_before=cache_entries_before,
+        cache_entries_added=max(cache_entries - cache_entries_before, 0),
+        warmed_option_contract_metadata=warmed_option_contract_metadata,
+        prepare_decisions=prepare_decisions,
     )
 
 
@@ -4090,6 +4120,8 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Decision points:  {r.decision_points}")
     print(f"  Cache DB:         {r.cache_db_path}")
     print(f"  Cache entries:    {r.cache_entries}")
+    print(f"  Cache added:      {r.cache_entries_added}")
+    print(f"  Option metadata:  {r.warmed_option_contract_metadata}")
     print("=" * 60)
 
 
@@ -4207,15 +4239,42 @@ def save_backtest_result(r: BacktestResult, path: Path) -> None:
     log(f"results saved to {path}")
 
 
-def save_prepare_result(r: PrepareBacktestResult, path: Path) -> None:
-    out = {
+def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
+    summaries: list[dict] = []
+    for entry in decision_log:
+        summaries.append({
+            "date": entry.get("date"),
+            "decision_time": entry.get("decision_time"),
+            "news_window_start": entry.get("news_window_start"),
+            "historical_options_provider": entry.get("historical_options_provider"),
+            "finalists": entry.get("finalists", []),
+            "options_watchlist": entry.get("options_watchlist", []),
+            "warmed_option_contract_metadata": int(
+                entry.get("warmed_option_contract_metadata") or 0
+            ),
+            "cache_entries": int(entry.get("cache_entries") or 0),
+            "open_positions": int(entry.get("open_positions") or 0),
+        })
+    return summaries
+
+
+def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
+    return {
         "start_date": r.start_date.isoformat(),
         "end_date": r.end_date.isoformat(),
         "days_prepared": r.days_prepared,
         "decision_points": r.decision_points,
         "cache_db_path": str(r.cache_db_path),
         "cache_entries": r.cache_entries,
+        "cache_entries_before": r.cache_entries_before,
+        "cache_entries_added": r.cache_entries_added,
+        "warmed_option_contract_metadata": r.warmed_option_contract_metadata,
+        "prepare_decisions": r.prepare_decisions,
     }
+
+
+def save_prepare_result(r: PrepareBacktestResult, path: Path) -> None:
+    out = prepare_result_to_dict(r)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
     log(f"prepare summary saved to {path}")
@@ -4410,6 +4469,12 @@ def run() -> None:
         default=None,
         help="Abort after this many consecutive LLM error cycles (0 disables)",
     )
+    parser.add_argument(
+        "--max-decisions",
+        type=int,
+        default=0,
+        help="Stop after this many decision cycles across the backtest (0 disables)",
+    )
     args = parser.parse_args()
 
     env_path = Path(__file__).with_name(".env")
@@ -4439,6 +4504,7 @@ def run() -> None:
         max_consecutive_llm_errors=config.resolved_max_consecutive_llm_error_cycles(
             args.max_consecutive_llm_errors
         ),
+        max_decisions=args.max_decisions,
     )
 
     if args.prepare_data:
