@@ -246,6 +246,48 @@ def test_polygon_request_offline_cache_miss_raises(tmp_path):
         bt_mod._polygon_request("", "/v2/missing", {"ticker": "AAPL"}, store=store, offline=True)
 
 
+def test_polygon_response_store_closes_sqlite_connections(tmp_path, monkeypatch):
+    connections = []
+
+    class DummyConnection:
+        def __init__(self):
+            self.closed = False
+            self.last_query = ""
+
+        def execute(self, query, params=None):
+            self.last_query = str(query)
+            return self
+
+        def fetchone(self):
+            if "COUNT" in self.last_query:
+                return (0,)
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def close(self):
+            self.closed = True
+
+    def fake_connect(self):
+        conn = DummyConnection()
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(PolygonResponseStore, "_connect", fake_connect)
+
+    store = PolygonResponseStore(tmp_path / "historical.db")
+    store.get("/v2/test", {"ticker": "AAPL"})
+    store.put("/v2/test", {"ticker": "AAPL"}, {"results": []})
+    store.entry_count()
+
+    assert connections
+    assert all(conn.closed for conn in connections)
+
+
 def test_polygon_request_adapts_interval_after_429(monkeypatch):
     import ai_trader.backtest as bt_mod
 
