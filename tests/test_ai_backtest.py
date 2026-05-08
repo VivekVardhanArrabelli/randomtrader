@@ -35,6 +35,7 @@ from ai_trader.backtest import (
     _previous_trading_day,
     _session_intraday_bars_before,
     _ticker_price_metrics_as_of,
+    _warm_prepare_option_metadata,
     _select_real_contract,
     _trading_days,
     fetch_historical_intraday_bars,
@@ -814,12 +815,16 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     monkeypatch.setattr(
         bt_mod,
         "fetch_historical_intraday_bars",
-        lambda api_key, ticker, trading_day, multiplier=5, cache=None: intraday_calls.append(ticker) or [],
+        lambda api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs: (
+            intraday_calls.append(ticker) or []
+        ),
     )
     monkeypatch.setattr(
         bt_mod,
         "fetch_option_daily_bar",
-        lambda api_key, ticker, trade_date, cache=None: daily_calls.append(ticker) or None,
+        lambda api_key, ticker, trade_date, cache=None, **kwargs: (
+            daily_calls.append(ticker) or None
+        ),
     )
 
     count = _prefetch_prepare_option_data(
@@ -835,6 +840,139 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     assert count == 4
     assert intraday_calls == ["CALLATM", "CALLITM", "PUTATM", "PUTITM"]
     assert daily_calls == intraday_calls
+
+
+def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: [
+            {"ticker": "CALLATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+            {"ticker": "CALLITM", "strike_price": 95, "expiration_date": "2025-01-24"},
+        ],
+    )
+    attempted: list[str] = []
+
+    def mock_intraday(api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs):
+        attempted.append(ticker)
+        raise RuntimeError("Polygon 403: NOT_AUTHORIZED")
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
+
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=2,
+        max_symbols=1,
+    )
+
+    assert count == 0
+    assert attempted == ["CALLATM"]
+
+
+def test_warm_prepare_option_metadata_warms_exact_options_context_queries(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+    contract_queries: list[tuple[str, date, date, float, float]] = []
+
+    def mock_fetch_contracts(
+        api_key,
+        ticker,
+        option_type,
+        expiry_gte,
+        expiry_lte,
+        strike_gte,
+        strike_lte,
+        as_of=None,
+        cache=None,
+    ):
+        contract_queries.append(
+            (option_type, expiry_gte, expiry_lte, strike_gte, strike_lte)
+        )
+        return [
+            {
+                "ticker": (
+                    f"{option_type.upper()}{expiry_gte.isoformat()}"
+                    f"{strike_gte:.0f}"
+                )
+            }
+        ]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+
+    count = _warm_prepare_option_metadata(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        max_symbols=1,
+        strike_band_pct=0.12,
+    )
+
+    assert count == 10
+    assert (
+        "call", date(2025, 1, 17), date(2025, 1, 31), 97.0, 103.0
+    ) in contract_queries
+    assert (
+        "put", date(2025, 1, 17), date(2025, 1, 31), 97.0, 103.0
+    ) in contract_queries
+    assert (
+        "call", date(2025, 1, 12), date(2025, 1, 17), 85.0, 115.0
+    ) in contract_queries
+    assert (
+        "put", date(2025, 1, 15), date(2025, 1, 19), 85.0, 115.0
+    ) in contract_queries
+    assert (
+        "call", date(2025, 1, 17), date(2025, 1, 31), 85.0, 115.0
+    ) in contract_queries
+    assert (
+        "call", date(2025, 1, 14), date(2025, 2, 14), 88.0, 112.0
+    ) in contract_queries
+    assert (
+        "put", date(2025, 1, 14), date(2025, 2, 14), 88.0, 112.0
+    ) in contract_queries
 
 
 def test_build_options_context_fetches_intraday_only_for_primary_contracts(monkeypatch):
@@ -2296,12 +2434,14 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         cache_entries_before=5,
         cache_entries_added=7,
         warmed_option_contract_metadata=4,
+        warmed_option_contract_bars=3,
         prepare_decisions=[
             {
                 "decision_time": "2025-01-06T09:35:00-05:00",
                 "finalists": ["AAPL"],
                 "options_watchlist": ["AAPL"],
                 "warmed_option_contract_metadata": 4,
+                "warmed_option_contract_bars": 3,
                 "cache_entries": 12,
             }
         ],
@@ -2312,6 +2452,8 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["cache_entries_before"] == 5
     assert payload["cache_entries_added"] == 7
     assert payload["warmed_option_contract_metadata"] == 4
+    assert payload["warmed_option_contract_bars"] == 3
+    assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
 
     output = tmp_path / "prepare.json"

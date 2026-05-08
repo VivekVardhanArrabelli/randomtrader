@@ -551,6 +551,16 @@ def _is_offline_cache_miss(cache: PolygonCache | None, exc: Exception) -> bool:
     return "offline" in message and "cache miss" in message
 
 
+def _is_polygon_authorization_error(exc: Exception) -> bool:
+    """True when Polygon rejects data because the API plan lacks entitlement."""
+    message = str(exc).lower()
+    return (
+        "polygon 403" in message
+        or "not_authorized" in message
+        or "doesn't include this data timeframe" in message
+    )
+
+
 def _ticker_price_metrics_or_none(
     api_key: str,
     ticker: str,
@@ -694,6 +704,7 @@ def fetch_historical_intraday_bars(
     trading_day: date,
     multiplier: int = 5,
     cache: PolygonCache | None = None,
+    raise_on_error: bool = False,
 ) -> list[dict]:
     """Fetch regular-session intraday aggregate bars for one ticker and day."""
     cache_key = (ticker, trading_day.isoformat(), multiplier)
@@ -771,6 +782,8 @@ def fetch_historical_intraday_bars(
         )
     except Exception as exc:
         log(f"intraday bars fetch error for {ticker} on {trading_day}: {exc}")
+        if raise_on_error:
+            raise RuntimeError(str(exc)) from exc
         _raise_if_offline(cache, exc)
         return []
 
@@ -1024,6 +1037,7 @@ def fetch_option_daily_bar(
     option_ticker: str,
     trade_date: date,
     cache: PolygonCache | None = None,
+    raise_on_error: bool = False,
 ) -> dict | None:
     """Get a single-day OHLCV bar for an option contract. Checks cache first."""
     date_key = trade_date.isoformat()
@@ -1075,6 +1089,8 @@ def fetch_option_daily_bar(
         )
     except Exception as exc:
         log(f"option bar fetch error for {option_ticker} on {trade_date}: {exc}")
+        if raise_on_error:
+            raise RuntimeError(str(exc)) from exc
         _raise_if_offline(cache, exc)
         return None
 
@@ -1794,6 +1810,7 @@ class PrepareBacktestResult:
     cache_entries_before: int = 0
     cache_entries_added: int = 0
     warmed_option_contract_metadata: int = 0
+    warmed_option_contract_bars: int = 0
     prepare_decisions: list[dict] = field(default_factory=list)
 
 
@@ -2947,19 +2964,30 @@ def _prefetch_prepare_option_data(
                 option_ticker = str(contract.get("ticker") or "")
                 if not option_ticker or option_ticker in prefetched:
                     continue
-                fetch_historical_intraday_bars(
-                    api_key,
-                    option_ticker,
-                    trade_date,
-                    multiplier=bar_minutes,
-                    cache=cache,
-                )
-                fetch_option_daily_bar(
-                    api_key,
-                    option_ticker,
-                    trade_date,
-                    cache=cache,
-                )
+                try:
+                    fetch_historical_intraday_bars(
+                        api_key,
+                        option_ticker,
+                        trade_date,
+                        multiplier=bar_minutes,
+                        cache=cache,
+                        raise_on_error=True,
+                    )
+                    fetch_option_daily_bar(
+                        api_key,
+                        option_ticker,
+                        trade_date,
+                        cache=cache,
+                        raise_on_error=True,
+                    )
+                except RuntimeError as exc:
+                    if _is_polygon_authorization_error(exc):
+                        log(
+                            "prepare option bar prefetch disabled: "
+                            f"Polygon is not authorized for {option_ticker} bars"
+                        )
+                        return len(prefetched)
+                    continue
                 prefetched.add(option_ticker)
 
     return len(prefetched)
@@ -2986,8 +3014,26 @@ def _warm_prepare_option_metadata(
 
     as_of_dt = _coerce_eastern_datetime(as_of)
     trade_date = as_of_dt.date()
-    expiry_gte = trade_date + timedelta(days=max(config.PREFERRED_DTE_MIN, default_dte - 10))
-    expiry_lte = trade_date + timedelta(days=min(config.PREFERRED_DTE_MAX, default_dte + 21))
+    context_expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
+    context_expiry_lte = trade_date + timedelta(days=default_dte + 7)
+    context_strike_band_pct = 0.03
+    this_week_days_until_friday = (4 - trade_date.weekday()) % 7
+    if this_week_days_until_friday < 2:
+        this_week_days_until_friday += 7
+    next_week_days_until_friday = (4 - trade_date.weekday()) % 7 + 7
+    selection_windows = [
+        (
+            trade_date + timedelta(days=2),
+            trade_date + timedelta(days=this_week_days_until_friday),
+        ),
+        (
+            trade_date + timedelta(days=5),
+            trade_date + timedelta(days=next_week_days_until_friday + 2),
+        ),
+        (context_expiry_gte, context_expiry_lte),
+    ]
+    metadata_expiry_gte = trade_date + timedelta(days=max(config.PREFERRED_DTE_MIN, default_dte - 10))
+    metadata_expiry_lte = trade_date + timedelta(days=min(config.PREFERRED_DTE_MAX, default_dte + 21))
     warmed_contracts: set[str] = set()
 
     for ticker in tickers[:max_symbols]:
@@ -3002,24 +3048,55 @@ def _warm_prepare_option_metadata(
         if spot <= 0:
             continue
 
-        strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
-        strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+        metadata_strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
+        metadata_strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+        selection_strike_gte = round(spot * 0.85, 2)
+        selection_strike_lte = round(spot * 1.15, 2)
+        query_windows = [
+            (
+                context_expiry_gte,
+                context_expiry_lte,
+                round(spot * (1.0 - context_strike_band_pct), 2),
+                round(spot * (1.0 + context_strike_band_pct), 2),
+            ),
+            *(
+                (
+                    expiry_gte,
+                    expiry_lte,
+                    selection_strike_gte,
+                    selection_strike_lte,
+                )
+                for expiry_gte, expiry_lte in selection_windows
+            ),
+            (
+                metadata_expiry_gte,
+                metadata_expiry_lte,
+                metadata_strike_gte,
+                metadata_strike_lte,
+            ),
+        ]
         for option_type in ("call", "put"):
-            contracts = fetch_polygon_option_contracts(
-                api_key,
-                ticker,
-                option_type,
-                expiry_gte,
-                expiry_lte,
-                strike_gte,
-                strike_lte,
-                as_of=trade_date,
-                cache=cache,
-            )
-            for contract in contracts:
-                option_ticker = str(contract.get("ticker") or "")
-                if option_ticker:
-                    warmed_contracts.add(option_ticker)
+            queried: set[tuple[date, date, float, float]] = set()
+            for expiry_gte, expiry_lte, strike_gte, strike_lte in query_windows:
+                query_key = (expiry_gte, expiry_lte, strike_gte, strike_lte)
+                if query_key in queried:
+                    continue
+                queried.add(query_key)
+                contracts = fetch_polygon_option_contracts(
+                    api_key,
+                    ticker,
+                    option_type,
+                    expiry_gte,
+                    expiry_lte,
+                    strike_gte,
+                    strike_lte,
+                    as_of=trade_date,
+                    cache=cache,
+                )
+                for contract in contracts:
+                    option_ticker = str(contract.get("ticker") or "")
+                    if option_ticker:
+                        warmed_contracts.add(option_ticker)
 
     return len(warmed_contracts)
 
@@ -3468,6 +3545,18 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     max_symbols=bt_config.prepare_prefetch_symbols,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
                 )
+                warmed_contract_bars = _prefetch_prepare_option_data(
+                    polygon_key,
+                    metadata_symbols,
+                    decision_time,
+                    cache,
+                    default_dte=bt_config.default_dte,
+                    bar_minutes=bt_config.signal_bar_minutes,
+                    metrics_cache=metrics_cache,
+                    max_symbols=bt_config.prepare_prefetch_symbols,
+                    contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
+                    strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
+                )
                 cache_entries = cache.store.entry_count() if cache.store else 0
                 result.decision_log.append({
                     "date": trade_date.isoformat(),
@@ -3478,6 +3567,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "finalists": finalist_symbols,
                     "options_watchlist": options_watchlist or deep_focus_symbols,
                     "warmed_option_contract_metadata": warmed_contract_metadata,
+                    "warmed_option_contract_bars": warmed_contract_bars,
                     "cache_entries": cache_entries,
                     "open_positions": len(positions),
                 })
@@ -3485,6 +3575,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     f"  {decision_time.strftime('%H:%M')} PREPARED "
                     f"finalists={len(finalist_symbols)} "
                     f"warmed_contract_metadata={warmed_contract_metadata} "
+                    f"warmed_contract_bars={warmed_contract_bars} "
                     f"cache_entries={cache_entries}"
                 )
                 continue
@@ -4049,6 +4140,10 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("warmed_option_contract_metadata") or 0)
         for entry in prepare_decisions
     )
+    warmed_option_contract_bars = sum(
+        int(entry.get("warmed_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
     return PrepareBacktestResult(
         start_date=prepare_config.start_date,
         end_date=prepare_config.end_date,
@@ -4059,6 +4154,7 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         cache_entries_before=cache_entries_before,
         cache_entries_added=max(cache_entries - cache_entries_before, 0),
         warmed_option_contract_metadata=warmed_option_contract_metadata,
+        warmed_option_contract_bars=warmed_option_contract_bars,
         prepare_decisions=prepare_decisions,
     )
 
@@ -4122,6 +4218,7 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Cache entries:    {r.cache_entries}")
     print(f"  Cache added:      {r.cache_entries_added}")
     print(f"  Option metadata:  {r.warmed_option_contract_metadata}")
+    print(f"  Option bars:      {r.warmed_option_contract_bars}")
     print("=" * 60)
 
 
@@ -4252,6 +4349,9 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "warmed_option_contract_metadata": int(
                 entry.get("warmed_option_contract_metadata") or 0
             ),
+            "warmed_option_contract_bars": int(
+                entry.get("warmed_option_contract_bars") or 0
+            ),
             "cache_entries": int(entry.get("cache_entries") or 0),
             "open_positions": int(entry.get("open_positions") or 0),
         })
@@ -4269,6 +4369,7 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         "cache_entries_before": r.cache_entries_before,
         "cache_entries_added": r.cache_entries_added,
         "warmed_option_contract_metadata": r.warmed_option_contract_metadata,
+        "warmed_option_contract_bars": r.warmed_option_contract_bars,
         "prepare_decisions": r.prepare_decisions,
     }
 
