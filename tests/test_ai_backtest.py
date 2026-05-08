@@ -882,12 +882,95 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     )
 
     assert count == 4
-    assert intraday_calls == ["CALLATM", "CALLITM", "PUTATM", "PUTITM"]
+    assert intraday_calls == ["CALLATM", "PUTATM", "CALLITM", "PUTITM"]
     assert daily_calls == intraday_calls
     assert stats["attempted_option_contract_bars"] == 4
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 0
     assert stats["option_bar_rate_limit_errors"] == 0
+
+
+def test_prefetch_prepare_option_data_includes_context_primary_contracts(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 700.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 702.0,
+            "session_low": 695.0,
+            "recent_high": 705.0,
+            "recent_low": 690.0,
+            "range_pos_pct": 67.0,
+            "range_label": "upper_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+    contract_queries: list[tuple[str, float, float]] = []
+
+    def mock_fetch_contracts(
+        api_key,
+        ticker,
+        option_type,
+        expiry_gte,
+        expiry_lte,
+        strike_gte,
+        strike_lte,
+        **kwargs,
+    ):
+        contract_queries.append((option_type, strike_gte, strike_lte))
+        if strike_gte >= 679:
+            return [
+                {
+                    "ticker": f"{option_type.upper()}ATM",
+                    "strike_price": 700,
+                    "expiration_date": "2025-01-24",
+                }
+            ]
+        return [
+            {
+                "ticker": f"{option_type.upper()}FARITM",
+                "strike_price": 616,
+                "expiration_date": "2025-01-24",
+            }
+        ]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+    warmed: list[str] = []
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_historical_intraday_bars",
+        lambda api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs: (
+            warmed.append(ticker) or [{"c": 1.0}]
+        ),
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_option_daily_bar",
+        lambda *args, **kwargs: {"c": 1.0},
+    )
+
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["QQQ"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=1,
+        max_symbols=1,
+        strike_band_pct=0.12,
+        stats={},
+    )
+
+    assert count == 2
+    assert warmed == ["CALLATM", "PUTATM"]
+    assert ("call", 679.0, 721.0) in contract_queries
+    assert ("put", 679.0, 721.0) in contract_queries
 
 
 def test_prefetch_prepare_option_data_records_missing_bar_details(monkeypatch):
@@ -1059,6 +1142,72 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_rate_limit(monkeypatc
     assert stats["attempted_option_contract_bars"] == 1
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 0
+    assert stats["option_bar_rate_limit_errors"] == 1
+
+
+def test_prefetch_prepare_option_data_warms_both_primary_sides_before_alternatives(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+
+    def mock_fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
+        if option_type == "call":
+            return [
+                {"ticker": "CALLATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+                {"ticker": "CALLALT", "strike_price": 95, "expiration_date": "2025-01-24"},
+            ]
+        return [
+            {"ticker": "PUTATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+            {"ticker": "PUTALT", "strike_price": 105, "expiration_date": "2025-01-24"},
+        ]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+    attempted: list[str] = []
+
+    def mock_intraday(api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs):
+        attempted.append(ticker)
+        if ticker == "CALLALT":
+            raise RuntimeError("Polygon 429: exceeded the maximum requests per minute")
+        return [{"c": 1.0}]
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_option_daily_bar",
+        lambda *args, **kwargs: {"c": 1.0},
+    )
+
+    stats: dict[str, int] = {}
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=2,
+        max_symbols=1,
+        stats=stats,
+    )
+
+    assert count == 2
+    assert attempted == ["CALLATM", "PUTATM", "CALLALT"]
     assert stats["option_bar_rate_limit_errors"] == 1
 
 

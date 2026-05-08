@@ -2,6 +2,7 @@
 
 import json
 
+import pytest
 import requests
 
 from ai_trader import config
@@ -189,6 +190,40 @@ def test_deepseek_chat_adapter_omits_tool_choice():
 
     assert "tool_choice" not in session.last_json
     assert completion.tool_calls[0].input["market_analysis"] == "ok"
+
+
+def test_deepseek_chat_adapter_error_names_provider():
+    class DummyResponse:
+        status_code = 402
+        text = '{"error":{"message":"Insufficient Balance"}}'
+
+        def json(self):  # pragma: no cover - error path does not parse JSON
+            return {}
+
+    class DummySession:
+        def post(self, url, headers, json, timeout):
+            return DummyResponse()
+
+    adapter = OpenAIAdapter(
+        api_key="test-deepseek-key",
+        base_url="https://api.deepseek.com",
+        provider="deepseek",
+        session=DummySession(),
+    )
+
+    with pytest.raises(RuntimeError, match=r"DeepSeek 402"):
+        adapter.complete_structured(
+            model="deepseek-v4-pro",
+            system_prompt="system",
+            user_message="user",
+            tool={
+                "name": "submit_trade_decisions",
+                "description": "desc",
+                "input_schema": {"type": "object"},
+            },
+            max_tokens=100,
+            temperature=0.0,
+        )
 
 
 def test_chat_adapter_recovers_tool_json_with_trailing_data():

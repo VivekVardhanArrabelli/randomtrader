@@ -24,6 +24,15 @@ def _to_openai_tool(tool: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _provider_display_name(provider: str) -> str:
+    normalized = provider.strip().lower()
+    if normalized == "deepseek":
+        return "DeepSeek"
+    if normalized == "openai":
+        return "OpenAI"
+    return provider.strip() or "LLM provider"
+
+
 def _chat_tool_choice(provider: str, tool_name: str) -> str | dict[str, Any] | None:
     if provider.strip().lower() == "deepseek":
         return None
@@ -183,21 +192,21 @@ def _extract_response_tool_calls(output: Any) -> list[ToolCall]:
     return tool_calls
 
 
-def _parse_tool_arguments(arguments: str) -> dict[str, Any]:
+def _parse_tool_arguments(arguments: str, *, provider_label: str = "OpenAI") -> dict[str, Any]:
     decoder = json.JSONDecoder()
     try:
         parsed_arguments = json.loads(arguments)
     except json.JSONDecodeError as exc:
         if exc.msg != "Extra data":
-            raise RuntimeError(f"OpenAI returned invalid tool JSON: {exc}") from exc
+            raise RuntimeError(f"{provider_label} returned invalid tool JSON: {exc}") from exc
         try:
             parsed_arguments, _ = decoder.raw_decode(arguments)
         except json.JSONDecodeError as raw_exc:
             raise RuntimeError(
-                f"OpenAI returned invalid tool JSON: {raw_exc}"
+                f"{provider_label} returned invalid tool JSON: {raw_exc}"
             ) from raw_exc
     if not isinstance(parsed_arguments, dict):
-        raise RuntimeError("OpenAI tool JSON was not an object")
+        raise RuntimeError(f"{provider_label} tool JSON was not an object")
     return dict(parsed_arguments)
 
 
@@ -205,6 +214,8 @@ def _extract_response_text_tool_call(
     output: Any,
     tool_name: str,
     raw_response: dict[str, Any] | None = None,
+    *,
+    provider_label: str = "OpenAI",
 ) -> list[ToolCall]:
     text_parts = _extract_response_text(output, raw_response)
     if not text_parts:
@@ -241,10 +252,10 @@ def _extract_response_text_tool_call(
     except json.JSONDecodeError as exc:
         preview = raw_text[:200].replace("\n", "\\n")
         raise RuntimeError(
-            f"OpenAI returned invalid structured JSON: {exc}; preview={preview}"
+            f"{provider_label} returned invalid structured JSON: {exc}; preview={preview}"
         ) from exc
     if not isinstance(parsed_arguments, dict):
-        raise RuntimeError("OpenAI structured output was not a JSON object")
+        raise RuntimeError(f"{provider_label} structured output was not a JSON object")
     return [ToolCall(name=tool_name, input=dict(parsed_arguments))]
 
 
@@ -286,6 +297,10 @@ class OpenAIAdapter:
         self.base_url = base_url.rstrip("/")
         self.session = session or requests.Session()
 
+    @property
+    def _provider_label(self) -> str:
+        return _provider_display_name(self.provider)
+
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> requests.Response:
         timeout = _request_timeout_seconds()
         last_error: requests.RequestException | None = None
@@ -310,7 +325,9 @@ class OpenAIAdapter:
                 last_error = exc
         if last_response is not None:
             return last_response
-        raise RuntimeError(f"OpenAI request failed after retries: {last_error}") from last_error
+        raise RuntimeError(
+            f"{self._provider_label} request failed after retries: {last_error}"
+        ) from last_error
 
     def complete_structured(
         self,
@@ -359,7 +376,7 @@ class OpenAIAdapter:
             response = self._post_json("/responses", payload)
             if response.status_code >= 400:
                 raise RuntimeError(
-                    f"OpenAI {response.status_code}: {response.text[:300]}"
+                    f"{self._provider_label} {response.status_code}: {response.text[:300]}"
                 )
 
             data = response.json()
@@ -369,20 +386,25 @@ class OpenAIAdapter:
                 provider=self.provider,
                 model=str(data.get("model") or model),
                 text_blocks=text_blocks,
-                tool_calls=_extract_response_text_tool_call(output, tool["name"], data),
+                tool_calls=_extract_response_text_tool_call(
+                    output,
+                    tool["name"],
+                    data,
+                    provider_label=self._provider_label,
+                ),
                 raw_response=data,
             )
 
         response = self._post_json("/chat/completions", payload)
         if response.status_code >= 400:
             raise RuntimeError(
-                f"OpenAI {response.status_code}: {response.text[:300]}"
+                f"{self._provider_label} {response.status_code}: {response.text[:300]}"
             )
 
         data = response.json()
         choices = data.get("choices") or []
         if not choices:
-            raise RuntimeError("OpenAI returned no choices")
+            raise RuntimeError(f"{self._provider_label} returned no choices")
 
         message = dict((choices[0] or {}).get("message") or {})
         tool_calls: list[ToolCall] = []
@@ -392,7 +414,10 @@ class OpenAIAdapter:
             tool_calls.append(
                 ToolCall(
                     name=str(function.get("name") or ""),
-                    input=_parse_tool_arguments(arguments),
+                    input=_parse_tool_arguments(
+                        arguments,
+                        provider_label=self._provider_label,
+                    ),
                 )
             )
 

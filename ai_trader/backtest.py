@@ -3005,6 +3005,9 @@ def _prefetch_prepare_option_data(
 
     as_of_dt = _coerce_eastern_datetime(as_of)
     trade_date = as_of_dt.date()
+    context_expiry_gte = trade_date + timedelta(days=max(7, default_dte - 7))
+    context_expiry_lte = trade_date + timedelta(days=default_dte + 7)
+    context_strike_band_pct = 0.03
     expiry_gte = trade_date + timedelta(days=max(config.PREFERRED_DTE_MIN, default_dte - 10))
     expiry_lte = trade_date + timedelta(days=min(config.PREFERRED_DTE_MAX, default_dte + 21))
     prefetched: set[str] = set()
@@ -3023,27 +3026,59 @@ def _prefetch_prepare_option_data(
 
         strike_gte = round(spot * max(0.05, 1.0 - strike_band_pct), 2)
         strike_lte = round(spot * (1.0 + strike_band_pct), 2)
+        ranked_by_side: dict[str, list[dict]] = {}
         for option_type in ("call", "put"):
-            contracts = fetch_polygon_option_contracts(
-                api_key,
-                ticker,
-                option_type,
-                expiry_gte,
-                expiry_lte,
-                strike_gte,
-                strike_lte,
-                as_of=trade_date,
-                cache=cache,
-            )
+            query_windows = [
+                (
+                    context_expiry_gte,
+                    context_expiry_lte,
+                    round(spot * (1.0 - context_strike_band_pct), 2),
+                    round(spot * (1.0 + context_strike_band_pct), 2),
+                ),
+                (expiry_gte, expiry_lte, strike_gte, strike_lte),
+            ]
+            contracts_by_ticker: dict[str, dict] = {}
+            queried: set[tuple[date, date, float, float]] = set()
+            for query_expiry_gte, query_expiry_lte, query_strike_gte, query_strike_lte in query_windows:
+                query_key = (
+                    query_expiry_gte,
+                    query_expiry_lte,
+                    query_strike_gte,
+                    query_strike_lte,
+                )
+                if query_key in queried:
+                    continue
+                queried.add(query_key)
+                for contract in fetch_polygon_option_contracts(
+                    api_key,
+                    ticker,
+                    option_type,
+                    query_expiry_gte,
+                    query_expiry_lte,
+                    query_strike_gte,
+                    query_strike_lte,
+                    as_of=trade_date,
+                    cache=cache,
+                ):
+                    option_ticker = str(contract.get("ticker") or "")
+                    if option_ticker:
+                        contracts_by_ticker.setdefault(option_ticker, contract)
             ranked_contracts = _rank_prefetch_contracts(
-                contracts,
+                list(contracts_by_ticker.values()),
                 spot=spot,
                 trade_date=trade_date,
                 default_dte=default_dte,
                 option_type=option_type,
                 limit=contracts_per_side,
             )
-            for contract in ranked_contracts:
+            ranked_by_side[option_type] = ranked_contracts
+
+        for rank_index in range(contracts_per_side):
+            for option_type in ("call", "put"):
+                side_contracts = ranked_by_side.get(option_type) or []
+                if rank_index >= len(side_contracts):
+                    continue
+                contract = side_contracts[rank_index]
                 option_ticker = str(contract.get("ticker") or "")
                 if not option_ticker or option_ticker in prefetched:
                     continue
