@@ -4704,6 +4704,15 @@ def print_backtest_result(r: BacktestResult) -> None:
         print(f"  Profit factor:    {r.profit_factor:.2f}")
     print(f"  LLM failure days: {r.llm_failure_days}")
     print(f"  LLM error cycles: {r.llm_error_cycles}")
+    for item in summarize_llm_error_categories(r)[:3]:
+        retry_label = "retryable" if item["retryable"] else "non-retryable"
+        status_label = (
+            f" status={item['status_code']}" if item["status_code"] else ""
+        )
+        print(
+            f"    {item['category']}: {item['count']} "
+            f"({retry_label}{status_label})"
+        )
     if r.log_db_path:
         print(f"  Log DB:           {r.log_db_path}")
     print(f"  Avg conviction:   {r.avg_conviction:.2f}")
@@ -4838,6 +4847,85 @@ def summarize_llm_error_messages(r: BacktestResult) -> list[dict]:
     ]
 
 
+def _classify_llm_error_message(message: str) -> dict:
+    text = message.lower()
+    status_match = re.search(r"\b([45]\d\d)\b", message)
+    status_code = int(status_match.group(1)) if status_match else None
+
+    if (
+        status_code == 402
+        or "insufficient balance" in text
+        or "insufficient_quota" in text
+        or "quota" in text
+        or "billing" in text
+        or "credit" in text
+    ):
+        category = "billing_quota"
+        retryable = False
+    elif (
+        status_code in {401, 403}
+        or "unauthorized" in text
+        or "not authorized" in text
+        or "invalid api key" in text
+        or "permission" in text
+    ):
+        category = "authorization"
+        retryable = False
+    elif status_code == 429 or "rate limit" in text or "rate_limit" in text:
+        category = "rate_limit"
+        retryable = True
+    elif status_code in {408, 500, 502, 503, 504}:
+        category = "provider_unavailable"
+        retryable = True
+    elif (
+        "timeout" in text
+        or "timed out" in text
+        or "connection" in text
+        or "dns" in text
+        or "name resolution" in text
+    ):
+        category = "network"
+        retryable = True
+    else:
+        category = "unknown"
+        retryable = False
+
+    return {
+        "category": category,
+        "retryable": retryable,
+        "status_code": status_code,
+    }
+
+
+def summarize_llm_error_categories(r: BacktestResult) -> list[dict]:
+    """Aggregate LLM failures into machine-readable blocker categories."""
+    errors: Counter = Counter()
+    samples: dict[tuple[str, bool, int | None], str] = {}
+    for entry in r.decision_log:
+        message = entry.get("market_analysis")
+        if not _is_llm_error_message(message):
+            continue
+        classification = _classify_llm_error_message(str(message))
+        key = (
+            classification["category"],
+            classification["retryable"],
+            classification["status_code"],
+        )
+        errors[key] += 1
+        samples.setdefault(key, str(message))
+
+    return [
+        {
+            "category": category,
+            "count": count,
+            "retryable": retryable,
+            "status_code": status_code,
+            "sample": samples[(category, retryable, status_code)],
+        }
+        for (category, retryable, status_code), count in errors.most_common(10)
+    ]
+
+
 def _date_to_json(value: date | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -4862,6 +4950,7 @@ def backtest_result_to_dict(r: BacktestResult) -> dict:
         "llm_error_cycles": r.llm_error_cycles,
         "llm_failure_days": r.llm_failure_days,
         "llm_error_messages": summarize_llm_error_messages(r),
+        "llm_error_categories": summarize_llm_error_categories(r),
         "llm_provider": r.llm_provider,
         "llm_model": r.llm_model,
         "historical_options_provider": r.historical_options_provider,
@@ -5039,6 +5128,20 @@ def save_debug_log(r: BacktestResult, path: Path) -> None:
             lines.append("Top skip reasons:")
             for item in summary["skip_reasons"][:5]:
                 lines.append(f"- {item['count']}x {item['reason']}")
+        llm_error_categories = summarize_llm_error_categories(r)
+        if llm_error_categories:
+            lines.append("LLM error categories:")
+            for item in llm_error_categories[:5]:
+                retry_label = "retryable" if item["retryable"] else "non-retryable"
+                status_label = (
+                    f" status={item['status_code']}"
+                    if item["status_code"]
+                    else ""
+                )
+                lines.append(
+                    f"- {item['count']}x {item['category']} "
+                    f"({retry_label}{status_label})"
+                )
     lines.append("")
 
     for entry in r.decision_log:

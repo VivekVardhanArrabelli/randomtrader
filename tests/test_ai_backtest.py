@@ -48,6 +48,7 @@ from ai_trader.backtest import (
     save_debug_log,
     save_prepare_result,
     summarize_decisions,
+    summarize_llm_error_categories,
 )
 from ai_trader.historical_cache import PolygonResponseStore
 from ai_trader.journal import ThesisJournal, ThesisUpdate
@@ -3069,6 +3070,7 @@ def test_backtest_result_to_dict_includes_period_provider_and_decision_summary()
     assert payload["llm_provider"] == "deepseek"
     assert payload["llm_model"] == "deepseek-v4-pro"
     assert payload["llm_error_messages"] == []
+    assert payload["llm_error_categories"] == []
     assert payload["decision_summary"] == {
         "decision_points": 1,
         "proposed": 3,
@@ -3100,6 +3102,52 @@ def test_backtest_result_to_dict_summarizes_llm_error_messages():
 
     assert payload["llm_error_messages"] == [
         {"message": "LLM error: DeepSeek 402: Insufficient Balance", "count": 2}
+    ]
+    assert payload["llm_error_categories"] == [
+        {
+            "category": "billing_quota",
+            "count": 2,
+            "retryable": False,
+            "status_code": 402,
+            "sample": "LLM error: DeepSeek 402: Insufficient Balance",
+        }
+    ]
+
+
+def test_summarize_llm_error_categories_separates_retryable_errors():
+    r = BacktestResult(
+        llm_error_cycles=3,
+        decision_log=[
+            {"market_analysis": "LLM error: OpenAI 429 insufficient_quota"},
+            {"market_analysis": "LLM error: OpenAI 429 rate limit exceeded"},
+            {"market_analysis": "LLM error: OpenAI 503 Service Unavailable"},
+        ],
+    )
+
+    summary = summarize_llm_error_categories(r)
+
+    assert summary == [
+        {
+            "category": "billing_quota",
+            "count": 1,
+            "retryable": False,
+            "status_code": 429,
+            "sample": "LLM error: OpenAI 429 insufficient_quota",
+        },
+        {
+            "category": "rate_limit",
+            "count": 1,
+            "retryable": True,
+            "status_code": 429,
+            "sample": "LLM error: OpenAI 429 rate limit exceeded",
+        },
+        {
+            "category": "provider_unavailable",
+            "count": 1,
+            "retryable": True,
+            "status_code": 503,
+            "sample": "LLM error: OpenAI 503 Service Unavailable",
+        },
     ]
 
 
