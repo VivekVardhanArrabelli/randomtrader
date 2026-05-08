@@ -1162,6 +1162,22 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_rate_limit(monkeypatc
     assert stats["warmed_primary_option_contract_bars"] == 0
     assert stats["missing_primary_option_contract_bars"] == 0
     assert stats["missing_option_contract_bars"] == 0
+    assert stats["deferred_option_contract_bars"] == 1
+    assert stats["deferred_primary_option_contract_bars"] == 1
+    assert stats["deferred_option_contract_bar_details"] == [
+        {
+            "ticker": "CALLATM",
+            "reason": "Polygon 429: exceeded the maximum requests per minute",
+            "underlying": "NVDA",
+            "option_type": "call",
+            "prefetch_rank": 1,
+            "is_primary_context": True,
+            "strike": 100.0,
+            "moneyness": "atm",
+            "expiration_date": "2025-01-24",
+            "dte": 14,
+        }
+    ]
     assert stats["option_bar_authorization_errors"] == 0
     assert stats["option_bar_rate_limit_errors"] == 1
 
@@ -1232,6 +1248,22 @@ def test_prefetch_prepare_option_data_warms_both_primary_sides_before_alternativ
     assert stats["attempted_primary_option_contract_bars"] == 2
     assert stats["warmed_primary_option_contract_bars"] == 2
     assert stats["missing_primary_option_contract_bars"] == 0
+    assert stats["deferred_option_contract_bars"] == 1
+    assert stats["deferred_primary_option_contract_bars"] == 0
+    assert stats["deferred_option_contract_bar_details"] == [
+        {
+            "ticker": "CALLALT",
+            "reason": "Polygon 429: exceeded the maximum requests per minute",
+            "underlying": "NVDA",
+            "option_type": "call",
+            "prefetch_rank": 2,
+            "is_primary_context": False,
+            "strike": 95.0,
+            "moneyness": "itm",
+            "expiration_date": "2025-01-24",
+            "dte": 14,
+        }
+    ]
     assert stats["option_bar_rate_limit_errors"] == 1
 
 
@@ -3174,8 +3206,13 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         attempted_primary_option_contract_bars=2,
         warmed_primary_option_contract_bars=1,
         missing_primary_option_contract_bars=1,
+        deferred_option_contract_bars=1,
+        deferred_primary_option_contract_bars=1,
         missing_option_contract_bar_details=[
             {"ticker": "CALLMISS", "reason": "offline cache miss"}
+        ],
+        deferred_option_contract_bar_details=[
+            {"ticker": "CALLDEFER", "reason": "Polygon 429"}
         ],
         option_bar_rate_limit_errors=1,
         offline_news_cache_misses=1,
@@ -3203,8 +3240,13 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "attempted_primary_option_contract_bars": 2,
                 "warmed_primary_option_contract_bars": 1,
                 "missing_primary_option_contract_bars": 1,
+                "deferred_option_contract_bars": 1,
+                "deferred_primary_option_contract_bars": 1,
                 "missing_option_contract_bar_details": [
                     {"ticker": "CALLMISS", "reason": "offline cache miss"}
+                ],
+                "deferred_option_contract_bar_details": [
+                    {"ticker": "CALLDEFER", "reason": "Polygon 429"}
                 ],
                 "option_bar_rate_limit_errors": 1,
                 "offline_news_cache_miss": False,
@@ -3242,8 +3284,13 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["attempted_primary_option_contract_bars"] == 2
     assert payload["warmed_primary_option_contract_bars"] == 1
     assert payload["missing_primary_option_contract_bars"] == 1
+    assert payload["deferred_option_contract_bars"] == 1
+    assert payload["deferred_primary_option_contract_bars"] == 1
     assert payload["missing_option_contract_bar_details"] == [
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
+    ]
+    assert payload["deferred_option_contract_bar_details"] == [
+        {"ticker": "CALLDEFER", "reason": "Polygon 429"}
     ]
     assert payload["option_bar_rate_limit_errors"] == 1
     assert payload["offline_news_cache_misses"] == 1
@@ -3274,8 +3321,15 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     )
     assert payload["prepare_decisions"][0]["warmed_primary_option_contract_bars"] == 1
     assert payload["prepare_decisions"][0]["missing_primary_option_contract_bars"] == 1
+    assert payload["prepare_decisions"][0]["deferred_option_contract_bars"] == 1
+    assert (
+        payload["prepare_decisions"][0]["deferred_primary_option_contract_bars"] == 1
+    )
     assert payload["prepare_decisions"][0]["missing_option_contract_bar_details"] == [
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
+    ]
+    assert payload["prepare_decisions"][0]["deferred_option_contract_bar_details"] == [
+        {"ticker": "CALLDEFER", "reason": "Polygon 429"}
     ]
     assert payload["prepare_decisions"][0]["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]

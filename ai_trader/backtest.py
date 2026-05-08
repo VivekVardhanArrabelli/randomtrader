@@ -1873,6 +1873,8 @@ class PrepareBacktestResult:
     attempted_primary_option_contract_bars: int = 0
     warmed_primary_option_contract_bars: int = 0
     missing_primary_option_contract_bars: int = 0
+    deferred_option_contract_bars: int = 0
+    deferred_primary_option_contract_bars: int = 0
     option_metadata_authorization_errors: int = 0
     option_metadata_rate_limit_errors: int = 0
     missing_option_contract_metadata_details: list[dict[str, Any]] = field(
@@ -1881,6 +1883,9 @@ class PrepareBacktestResult:
     option_bar_authorization_errors: int = 0
     option_bar_rate_limit_errors: int = 0
     missing_option_contract_bar_details: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+    deferred_option_contract_bar_details: list[dict[str, Any]] = field(
         default_factory=list
     )
     offline_news_cache_misses: int = 0
@@ -2994,6 +2999,24 @@ def _record_prepare_option_bar_miss(
     details.append(detail)
 
 
+def _record_prepare_option_bar_deferred(
+    stats: dict[str, Any] | None,
+    *,
+    ticker: str,
+    reason: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if stats is None:
+        return
+    details = stats.setdefault("deferred_option_contract_bar_details", [])
+    if not isinstance(details, list) or len(details) >= 50:
+        return
+    detail = {"ticker": ticker, "reason": reason}
+    if metadata:
+        detail.update(metadata)
+    details.append(detail)
+
+
 def _record_prepare_option_metadata_miss(
     stats: dict[str, Any] | None,
     *,
@@ -3035,6 +3058,8 @@ def _init_prepare_option_stats(stats: dict[str, Any] | None) -> None:
     stats.setdefault("attempted_primary_option_contract_bars", 0)
     stats.setdefault("warmed_primary_option_contract_bars", 0)
     stats.setdefault("missing_primary_option_contract_bars", 0)
+    stats.setdefault("deferred_option_contract_bars", 0)
+    stats.setdefault("deferred_primary_option_contract_bars", 0)
     stats.setdefault("option_bar_authorization_errors", 0)
     stats.setdefault("option_bar_rate_limit_errors", 0)
 
@@ -3239,6 +3264,24 @@ def _prefetch_prepare_option_data(
                     if _is_polygon_rate_limit_error(exc):
                         if stats is not None:
                             stats["option_bar_rate_limit_errors"] += 1
+                            stats["deferred_option_contract_bars"] += 1
+                            if is_primary_context:
+                                stats["deferred_primary_option_contract_bars"] += 1
+                        detail_metadata = _prepare_option_bar_detail_metadata(
+                            underlying=ticker,
+                            option_type=option_type,
+                            contract=contract,
+                            spot=spot,
+                            trade_date=trade_date,
+                            default_dte=default_dte,
+                            prefetch_rank=rank_index + 1,
+                        )
+                        _record_prepare_option_bar_deferred(
+                            stats,
+                            ticker=option_ticker,
+                            reason=str(exc),
+                            metadata=detail_metadata,
+                        )
                         log(
                             "prepare option bar prefetch paused: "
                             f"Polygon rate limited {option_ticker} bar warmup"
@@ -3946,6 +3989,12 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 missing_primary_contract_bars = int(
                     option_prefetch_stats.get("missing_primary_option_contract_bars") or 0
                 )
+                deferred_contract_bars = int(
+                    option_prefetch_stats.get("deferred_option_contract_bars") or 0
+                )
+                deferred_primary_contract_bars = int(
+                    option_prefetch_stats.get("deferred_primary_option_contract_bars") or 0
+                )
                 option_bar_auth_errors = int(
                     option_prefetch_stats.get("option_bar_authorization_errors") or 0
                 )
@@ -3954,6 +4003,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 )
                 missing_contract_bar_details = list(
                     option_prefetch_stats.get("missing_option_contract_bar_details") or []
+                )
+                deferred_contract_bar_details = list(
+                    option_prefetch_stats.get("deferred_option_contract_bar_details") or []
                 )
                 cache_entries = cache.store.entry_count() if cache.store else 0
                 result.decision_log.append({
@@ -3988,7 +4040,14 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     ),
                     "warmed_primary_option_contract_bars": warmed_primary_contract_bars,
                     "missing_primary_option_contract_bars": missing_primary_contract_bars,
+                    "deferred_option_contract_bars": deferred_contract_bars,
+                    "deferred_primary_option_contract_bars": (
+                        deferred_primary_contract_bars
+                    ),
                     "missing_option_contract_bar_details": missing_contract_bar_details,
+                    "deferred_option_contract_bar_details": (
+                        deferred_contract_bar_details
+                    ),
                     "option_bar_authorization_errors": option_bar_auth_errors,
                     "option_bar_rate_limit_errors": option_bar_rate_limit_errors,
                     "cache_entries": cache_entries,
@@ -4617,10 +4676,24 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("missing_primary_option_contract_bars") or 0)
         for entry in prepare_decisions
     )
+    deferred_option_contract_bars = sum(
+        int(entry.get("deferred_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
+    deferred_primary_option_contract_bars = sum(
+        int(entry.get("deferred_primary_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
     missing_option_contract_bar_details = [
         detail
         for entry in prepare_decisions
         for detail in entry.get("missing_option_contract_bar_details", [])
+        if isinstance(detail, dict)
+    ][:50]
+    deferred_option_contract_bar_details = [
+        detail
+        for entry in prepare_decisions
+        for detail in entry.get("deferred_option_contract_bar_details", [])
         if isinstance(detail, dict)
     ][:50]
     option_bar_authorization_errors = sum(
@@ -4667,7 +4740,10 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         attempted_primary_option_contract_bars=attempted_primary_option_contract_bars,
         warmed_primary_option_contract_bars=warmed_primary_option_contract_bars,
         missing_primary_option_contract_bars=missing_primary_option_contract_bars,
+        deferred_option_contract_bars=deferred_option_contract_bars,
+        deferred_primary_option_contract_bars=deferred_primary_option_contract_bars,
         missing_option_contract_bar_details=missing_option_contract_bar_details,
+        deferred_option_contract_bar_details=deferred_option_contract_bar_details,
         option_bar_authorization_errors=option_bar_authorization_errors,
         option_bar_rate_limit_errors=option_bar_rate_limit_errors,
         offline_news_cache_misses=offline_news_cache_misses,
@@ -4756,6 +4832,10 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     )
     if r.missing_primary_option_contract_bars:
         print(f"  Primary misses:   {r.missing_primary_option_contract_bars}")
+    if r.deferred_option_contract_bars:
+        print(f"  Bar deferred:     {r.deferred_option_contract_bars}")
+    if r.deferred_primary_option_contract_bars:
+        print(f"  Primary deferred: {r.deferred_primary_option_contract_bars}")
     for detail in r.missing_option_contract_metadata_details[:3]:
         underlying = detail.get("underlying", "")
         option_type = detail.get("option_type", "")
@@ -4767,6 +4847,12 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
         rank_label = f" rank={rank}" if rank else ""
         reason = detail.get("reason", "")
         print(f"    miss: {ticker}{rank_label} ({reason[:100]})")
+    for detail in r.deferred_option_contract_bar_details[:3]:
+        ticker = detail.get("ticker", "")
+        rank = detail.get("prefetch_rank")
+        rank_label = f" rank={rank}" if rank else ""
+        reason = detail.get("reason", "")
+        print(f"    deferred: {ticker}{rank_label} ({reason[:100]})")
     if r.option_metadata_authorization_errors:
         print(f"  Metadata auth:    {r.option_metadata_authorization_errors}")
     if r.option_metadata_rate_limit_errors:
@@ -5034,8 +5120,17 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "missing_primary_option_contract_bars": int(
                 entry.get("missing_primary_option_contract_bars") or 0
             ),
+            "deferred_option_contract_bars": int(
+                entry.get("deferred_option_contract_bars") or 0
+            ),
+            "deferred_primary_option_contract_bars": int(
+                entry.get("deferred_primary_option_contract_bars") or 0
+            ),
             "missing_option_contract_bar_details": list(
                 entry.get("missing_option_contract_bar_details") or []
+            ),
+            "deferred_option_contract_bar_details": list(
+                entry.get("deferred_option_contract_bar_details") or []
             ),
             "option_bar_authorization_errors": int(
                 entry.get("option_bar_authorization_errors") or 0
@@ -5086,7 +5181,14 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         ),
         "warmed_primary_option_contract_bars": r.warmed_primary_option_contract_bars,
         "missing_primary_option_contract_bars": r.missing_primary_option_contract_bars,
+        "deferred_option_contract_bars": r.deferred_option_contract_bars,
+        "deferred_primary_option_contract_bars": (
+            r.deferred_primary_option_contract_bars
+        ),
         "missing_option_contract_bar_details": r.missing_option_contract_bar_details,
+        "deferred_option_contract_bar_details": (
+            r.deferred_option_contract_bar_details
+        ),
         "option_bar_authorization_errors": r.option_bar_authorization_errors,
         "option_bar_rate_limit_errors": r.option_bar_rate_limit_errors,
         "offline_news_cache_misses": r.offline_news_cache_misses,
