@@ -3782,11 +3782,10 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                         "open_positions": len(positions),
                     })
                     log(
-                        f"  {decision_time.strftime('%H:%M')} PREPARE STOP "
+                        f"  {decision_time.strftime('%H:%M')} PREPARE SKIP "
                         f"offline_news_cache_miss: {exc}"
                     )
-                    stop_backtest = True
-                    break
+                    continue
                 raise
             news = _filter_news_quality(news_raw)
             log(

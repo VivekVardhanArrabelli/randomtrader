@@ -3174,14 +3174,15 @@ def test_offline_prepare_records_news_cache_miss_and_returns_summary(tmp_path, m
     decision_times = [
         datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
         datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 10, 5, tzinfo=EASTERN_TZ),
     ]
     news_calls = {"count": 0}
 
     def fake_news_window(*args, **kwargs):
         news_calls["count"] += 1
-        if news_calls["count"] == 1:
-            return []
-        raise RuntimeError("offline Polygon cache miss for /v2/reference/news")
+        if news_calls["count"] == 2:
+            raise RuntimeError("offline Polygon cache miss for /v2/reference/news")
+        return []
 
     def fake_warm(*args, stats=None, **kwargs):
         if stats is not None:
@@ -3221,9 +3222,10 @@ def test_offline_prepare_records_news_cache_miss_and_returns_summary(tmp_path, m
     )
 
     assert result.days_prepared == 1
-    assert result.decision_points == 2
-    assert result.warmed_option_contract_metadata == 1
-    assert result.warmed_option_contract_bars == 1
+    assert result.decision_points == 3
+    assert news_calls["count"] == 3
+    assert result.warmed_option_contract_metadata == 2
+    assert result.warmed_option_contract_bars == 2
     assert result.offline_news_cache_misses == 1
     assert result.offline_news_cache_miss_details == [
         {
@@ -3237,6 +3239,7 @@ def test_offline_prepare_records_news_cache_miss_and_returns_summary(tmp_path, m
     ]
     assert result.prepare_decisions[0]["offline_news_cache_miss"] is False
     assert result.prepare_decisions[1]["offline_news_cache_miss"] is True
+    assert result.prepare_decisions[2]["offline_news_cache_miss"] is False
 
 
 def test_summarize_decisions_counts_dropped_trades():
