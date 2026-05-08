@@ -586,6 +586,12 @@ def _is_polygon_authorization_error(exc: Exception) -> bool:
     )
 
 
+def _is_polygon_rate_limit_error(exc: Exception) -> bool:
+    """True when Polygon rate limiting remains after request-level retries."""
+    message = str(exc).lower()
+    return "polygon 429" in message or "maximum requests per minute" in message
+
+
 def _ticker_price_metrics_or_none(
     api_key: str,
     ticker: str,
@@ -1862,6 +1868,7 @@ class PrepareBacktestResult:
     attempted_option_contract_bars: int = 0
     missing_option_contract_bars: int = 0
     option_bar_authorization_errors: int = 0
+    option_bar_rate_limit_errors: int = 0
     prepare_decisions: list[dict] = field(default_factory=list)
 
 
@@ -2973,6 +2980,7 @@ def _prefetch_prepare_option_data(
         stats.setdefault("attempted_option_contract_bars", 0)
         stats.setdefault("missing_option_contract_bars", 0)
         stats.setdefault("option_bar_authorization_errors", 0)
+        stats.setdefault("option_bar_rate_limit_errors", 0)
 
     if not tickers or max_symbols <= 0 or contracts_per_side <= 0:
         return 0
@@ -3040,6 +3048,14 @@ def _prefetch_prepare_option_data(
                         raise_on_error=True,
                     )
                 except RuntimeError as exc:
+                    if _is_polygon_rate_limit_error(exc):
+                        if stats is not None:
+                            stats["option_bar_rate_limit_errors"] += 1
+                        log(
+                            "prepare option bar prefetch paused: "
+                            f"Polygon rate limited {option_ticker} bar warmup"
+                        )
+                        return len(prefetched)
                     if _is_polygon_authorization_error(exc):
                         if stats is not None:
                             stats["option_bar_authorization_errors"] += 1
@@ -3631,6 +3647,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 option_bar_auth_errors = int(
                     option_bar_stats.get("option_bar_authorization_errors") or 0
                 )
+                option_bar_rate_limit_errors = int(
+                    option_bar_stats.get("option_bar_rate_limit_errors") or 0
+                )
                 cache_entries = cache.store.entry_count() if cache.store else 0
                 result.decision_log.append({
                     "date": trade_date.isoformat(),
@@ -3645,6 +3664,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "attempted_option_contract_bars": attempted_contract_bars,
                     "missing_option_contract_bars": missing_contract_bars,
                     "option_bar_authorization_errors": option_bar_auth_errors,
+                    "option_bar_rate_limit_errors": option_bar_rate_limit_errors,
                     "cache_entries": cache_entries,
                     "open_positions": len(positions),
                 })
@@ -3655,6 +3675,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     f"warmed_contract_bars={warmed_contract_bars} "
                     f"attempted_contract_bars={attempted_contract_bars} "
                     f"missing_contract_bars={missing_contract_bars} "
+                    f"rate_limit_errors={option_bar_rate_limit_errors} "
                     f"cache_entries={cache_entries}"
                 )
                 continue
@@ -4235,6 +4256,10 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("option_bar_authorization_errors") or 0)
         for entry in prepare_decisions
     )
+    option_bar_rate_limit_errors = sum(
+        int(entry.get("option_bar_rate_limit_errors") or 0)
+        for entry in prepare_decisions
+    )
     return PrepareBacktestResult(
         start_date=prepare_config.start_date,
         end_date=prepare_config.end_date,
@@ -4249,6 +4274,7 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         attempted_option_contract_bars=attempted_option_contract_bars,
         missing_option_contract_bars=missing_option_contract_bars,
         option_bar_authorization_errors=option_bar_authorization_errors,
+        option_bar_rate_limit_errors=option_bar_rate_limit_errors,
         prepare_decisions=prepare_decisions,
     )
 
@@ -4317,6 +4343,8 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Bar misses:       {r.missing_option_contract_bars}")
     if r.option_bar_authorization_errors:
         print(f"  Bar auth errors:  {r.option_bar_authorization_errors}")
+    if r.option_bar_rate_limit_errors:
+        print(f"  Bar 429 errors:   {r.option_bar_rate_limit_errors}")
     print("=" * 60)
 
 
@@ -4459,6 +4487,9 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "option_bar_authorization_errors": int(
                 entry.get("option_bar_authorization_errors") or 0
             ),
+            "option_bar_rate_limit_errors": int(
+                entry.get("option_bar_rate_limit_errors") or 0
+            ),
             "cache_entries": int(entry.get("cache_entries") or 0),
             "open_positions": int(entry.get("open_positions") or 0),
         })
@@ -4480,6 +4511,7 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         "attempted_option_contract_bars": r.attempted_option_contract_bars,
         "missing_option_contract_bars": r.missing_option_contract_bars,
         "option_bar_authorization_errors": r.option_bar_authorization_errors,
+        "option_bar_rate_limit_errors": r.option_bar_rate_limit_errors,
         "prepare_decisions": r.prepare_decisions,
     }
 

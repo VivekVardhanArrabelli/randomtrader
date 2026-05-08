@@ -845,6 +845,7 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     assert stats["attempted_option_contract_bars"] == 4
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 0
+    assert stats["option_bar_rate_limit_errors"] == 0
 
 
 def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(monkeypatch):
@@ -901,6 +902,64 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(m
     assert stats["attempted_option_contract_bars"] == 1
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 1
+    assert stats["option_bar_rate_limit_errors"] == 0
+
+
+def test_prefetch_prepare_option_data_stops_on_polygon_bar_rate_limit(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_polygon_option_contracts",
+        lambda *args, **kwargs: [
+            {"ticker": "CALLATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+            {"ticker": "CALLITM", "strike_price": 95, "expiration_date": "2025-01-24"},
+        ],
+    )
+    attempted: list[str] = []
+
+    def mock_intraday(api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs):
+        attempted.append(ticker)
+        raise RuntimeError("Polygon 429: exceeded the maximum requests per minute")
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
+
+    stats: dict[str, int] = {}
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=2,
+        max_symbols=1,
+        stats=stats,
+    )
+
+    assert count == 0
+    assert attempted == ["CALLATM"]
+    assert stats["attempted_option_contract_bars"] == 1
+    assert stats["missing_option_contract_bars"] == 0
+    assert stats["option_bar_authorization_errors"] == 0
+    assert stats["option_bar_rate_limit_errors"] == 1
 
 
 def test_warm_prepare_option_metadata_warms_exact_options_context_queries(monkeypatch):
@@ -2597,6 +2656,7 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         warmed_option_contract_bars=3,
         attempted_option_contract_bars=5,
         missing_option_contract_bars=2,
+        option_bar_rate_limit_errors=1,
         prepare_decisions=[
             {
                 "decision_time": "2025-01-06T09:35:00-05:00",
@@ -2606,6 +2666,7 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "warmed_option_contract_bars": 3,
                 "attempted_option_contract_bars": 5,
                 "missing_option_contract_bars": 2,
+                "option_bar_rate_limit_errors": 1,
                 "cache_entries": 12,
             }
         ],
@@ -2619,9 +2680,11 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["warmed_option_contract_bars"] == 3
     assert payload["attempted_option_contract_bars"] == 5
     assert payload["missing_option_contract_bars"] == 2
+    assert payload["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
     assert payload["prepare_decisions"][0]["attempted_option_contract_bars"] == 5
     assert payload["prepare_decisions"][0]["missing_option_contract_bars"] == 2
+    assert payload["prepare_decisions"][0]["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
 
     output = tmp_path / "prepare.json"
