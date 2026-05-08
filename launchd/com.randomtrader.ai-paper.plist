@@ -6,7 +6,7 @@
     <string>com.randomtrader.ai-paper</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-main</string>
+    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-git</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -46,9 +46,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-main/ai_trader/logs/launchd_ai_paper.out</string>
+    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-git/ai_trader/logs/launchd_ai_paper.out</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-main/ai_trader/logs/launchd_ai_paper.err</string>
+    <string>/Users/vivekvardhanarrabelli/Downloads/randomtrader-git/ai_trader/logs/launchd_ai_paper.err</string>
   </dict>
 </plist>

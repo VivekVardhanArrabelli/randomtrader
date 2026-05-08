@@ -492,6 +492,10 @@ def _prepare_result_to_dict(result: PrepareBacktestResult | None) -> dict | None
         "cache_entries_before": result.cache_entries_before,
         "cache_entries_added": result.cache_entries_added,
         "warmed_option_contract_metadata": result.warmed_option_contract_metadata,
+        "warmed_option_contract_bars": result.warmed_option_contract_bars,
+        "attempted_option_contract_bars": result.attempted_option_contract_bars,
+        "missing_option_contract_bars": result.missing_option_contract_bars,
+        "option_bar_authorization_errors": result.option_bar_authorization_errors,
         "prepare_decisions": result.prepare_decisions,
     }
 

@@ -1811,6 +1811,9 @@ class PrepareBacktestResult:
     cache_entries_added: int = 0
     warmed_option_contract_metadata: int = 0
     warmed_option_contract_bars: int = 0
+    attempted_option_contract_bars: int = 0
+    missing_option_contract_bars: int = 0
+    option_bar_authorization_errors: int = 0
     prepare_decisions: list[dict] = field(default_factory=list)
 
 
@@ -2911,12 +2914,18 @@ def _prefetch_prepare_option_data(
     max_symbols: int = config.PREPARE_PREFETCH_SYMBOLS,
     contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE,
     strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT,
+    stats: dict[str, int] | None = None,
 ) -> int:
     """Warm a broader option universe for offline backtests.
 
     This is only used in prepare mode so the cold vendor cost is paid once,
     outside the actual model/backtest comparison loop.
     """
+    if stats is not None:
+        stats.setdefault("attempted_option_contract_bars", 0)
+        stats.setdefault("missing_option_contract_bars", 0)
+        stats.setdefault("option_bar_authorization_errors", 0)
+
     if not tickers or max_symbols <= 0 or contracts_per_side <= 0:
         return 0
 
@@ -2964,6 +2973,8 @@ def _prefetch_prepare_option_data(
                 option_ticker = str(contract.get("ticker") or "")
                 if not option_ticker or option_ticker in prefetched:
                     continue
+                if stats is not None:
+                    stats["attempted_option_contract_bars"] += 1
                 try:
                     fetch_historical_intraday_bars(
                         api_key,
@@ -2982,11 +2993,15 @@ def _prefetch_prepare_option_data(
                     )
                 except RuntimeError as exc:
                     if _is_polygon_authorization_error(exc):
+                        if stats is not None:
+                            stats["option_bar_authorization_errors"] += 1
                         log(
                             "prepare option bar prefetch disabled: "
                             f"Polygon is not authorized for {option_ticker} bars"
                         )
                         return len(prefetched)
+                    if stats is not None:
+                        stats["missing_option_contract_bars"] += 1
                     continue
                 prefetched.add(option_ticker)
 
@@ -3545,6 +3560,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     max_symbols=bt_config.prepare_prefetch_symbols,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
                 )
+                option_bar_stats: dict[str, int] = {}
                 warmed_contract_bars = _prefetch_prepare_option_data(
                     polygon_key,
                     metadata_symbols,
@@ -3556,6 +3572,16 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     max_symbols=bt_config.prepare_prefetch_symbols,
                     contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
+                    stats=option_bar_stats,
+                )
+                attempted_contract_bars = int(
+                    option_bar_stats.get("attempted_option_contract_bars") or 0
+                )
+                missing_contract_bars = int(
+                    option_bar_stats.get("missing_option_contract_bars") or 0
+                )
+                option_bar_auth_errors = int(
+                    option_bar_stats.get("option_bar_authorization_errors") or 0
                 )
                 cache_entries = cache.store.entry_count() if cache.store else 0
                 result.decision_log.append({
@@ -3568,6 +3594,9 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "options_watchlist": options_watchlist or deep_focus_symbols,
                     "warmed_option_contract_metadata": warmed_contract_metadata,
                     "warmed_option_contract_bars": warmed_contract_bars,
+                    "attempted_option_contract_bars": attempted_contract_bars,
+                    "missing_option_contract_bars": missing_contract_bars,
+                    "option_bar_authorization_errors": option_bar_auth_errors,
                     "cache_entries": cache_entries,
                     "open_positions": len(positions),
                 })
@@ -3576,6 +3605,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     f"finalists={len(finalist_symbols)} "
                     f"warmed_contract_metadata={warmed_contract_metadata} "
                     f"warmed_contract_bars={warmed_contract_bars} "
+                    f"attempted_contract_bars={attempted_contract_bars} "
+                    f"missing_contract_bars={missing_contract_bars} "
                     f"cache_entries={cache_entries}"
                 )
                 continue
@@ -4144,6 +4175,18 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("warmed_option_contract_bars") or 0)
         for entry in prepare_decisions
     )
+    attempted_option_contract_bars = sum(
+        int(entry.get("attempted_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
+    missing_option_contract_bars = sum(
+        int(entry.get("missing_option_contract_bars") or 0)
+        for entry in prepare_decisions
+    )
+    option_bar_authorization_errors = sum(
+        int(entry.get("option_bar_authorization_errors") or 0)
+        for entry in prepare_decisions
+    )
     return PrepareBacktestResult(
         start_date=prepare_config.start_date,
         end_date=prepare_config.end_date,
@@ -4155,6 +4198,9 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         cache_entries_added=max(cache_entries - cache_entries_before, 0),
         warmed_option_contract_metadata=warmed_option_contract_metadata,
         warmed_option_contract_bars=warmed_option_contract_bars,
+        attempted_option_contract_bars=attempted_option_contract_bars,
+        missing_option_contract_bars=missing_option_contract_bars,
+        option_bar_authorization_errors=option_bar_authorization_errors,
         prepare_decisions=prepare_decisions,
     )
 
@@ -4219,6 +4265,10 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Cache added:      {r.cache_entries_added}")
     print(f"  Option metadata:  {r.warmed_option_contract_metadata}")
     print(f"  Option bars:      {r.warmed_option_contract_bars}")
+    print(f"  Bar attempts:     {r.attempted_option_contract_bars}")
+    print(f"  Bar misses:       {r.missing_option_contract_bars}")
+    if r.option_bar_authorization_errors:
+        print(f"  Bar auth errors:  {r.option_bar_authorization_errors}")
     print("=" * 60)
 
 
@@ -4352,6 +4402,15 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "warmed_option_contract_bars": int(
                 entry.get("warmed_option_contract_bars") or 0
             ),
+            "attempted_option_contract_bars": int(
+                entry.get("attempted_option_contract_bars") or 0
+            ),
+            "missing_option_contract_bars": int(
+                entry.get("missing_option_contract_bars") or 0
+            ),
+            "option_bar_authorization_errors": int(
+                entry.get("option_bar_authorization_errors") or 0
+            ),
             "cache_entries": int(entry.get("cache_entries") or 0),
             "open_positions": int(entry.get("open_positions") or 0),
         })
@@ -4370,6 +4429,9 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         "cache_entries_added": r.cache_entries_added,
         "warmed_option_contract_metadata": r.warmed_option_contract_metadata,
         "warmed_option_contract_bars": r.warmed_option_contract_bars,
+        "attempted_option_contract_bars": r.attempted_option_contract_bars,
+        "missing_option_contract_bars": r.missing_option_contract_bars,
+        "option_bar_authorization_errors": r.option_bar_authorization_errors,
         "prepare_decisions": r.prepare_decisions,
     }
 

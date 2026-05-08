@@ -827,6 +827,7 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
         ),
     )
 
+    stats: dict[str, int] = {}
     count = _prefetch_prepare_option_data(
         "fake",
         ["NVDA"],
@@ -835,11 +836,15 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
         default_dte=14,
         contracts_per_side=2,
         max_symbols=1,
+        stats=stats,
     )
 
     assert count == 4
     assert intraday_calls == ["CALLATM", "CALLITM", "PUTATM", "PUTITM"]
     assert daily_calls == intraday_calls
+    assert stats["attempted_option_contract_bars"] == 4
+    assert stats["missing_option_contract_bars"] == 0
+    assert stats["option_bar_authorization_errors"] == 0
 
 
 def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(monkeypatch):
@@ -879,6 +884,7 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(m
 
     monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
 
+    stats: dict[str, int] = {}
     count = _prefetch_prepare_option_data(
         "fake",
         ["NVDA"],
@@ -887,10 +893,14 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(m
         default_dte=14,
         contracts_per_side=2,
         max_symbols=1,
+        stats=stats,
     )
 
     assert count == 0
     assert attempted == ["CALLATM"]
+    assert stats["attempted_option_contract_bars"] == 1
+    assert stats["missing_option_contract_bars"] == 0
+    assert stats["option_bar_authorization_errors"] == 1
 
 
 def test_warm_prepare_option_metadata_warms_exact_options_context_queries(monkeypatch):
@@ -2435,6 +2445,8 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         cache_entries_added=7,
         warmed_option_contract_metadata=4,
         warmed_option_contract_bars=3,
+        attempted_option_contract_bars=5,
+        missing_option_contract_bars=2,
         prepare_decisions=[
             {
                 "decision_time": "2025-01-06T09:35:00-05:00",
@@ -2442,6 +2454,8 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "options_watchlist": ["AAPL"],
                 "warmed_option_contract_metadata": 4,
                 "warmed_option_contract_bars": 3,
+                "attempted_option_contract_bars": 5,
+                "missing_option_contract_bars": 2,
                 "cache_entries": 12,
             }
         ],
@@ -2453,7 +2467,11 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["cache_entries_added"] == 7
     assert payload["warmed_option_contract_metadata"] == 4
     assert payload["warmed_option_contract_bars"] == 3
+    assert payload["attempted_option_contract_bars"] == 5
+    assert payload["missing_option_contract_bars"] == 2
     assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
+    assert payload["prepare_decisions"][0]["attempted_option_contract_bars"] == 5
+    assert payload["prepare_decisions"][0]["missing_option_contract_bars"] == 2
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
 
     output = tmp_path / "prepare.json"
