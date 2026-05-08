@@ -1883,6 +1883,10 @@ class PrepareBacktestResult:
     missing_option_contract_bar_details: list[dict[str, Any]] = field(
         default_factory=list
     )
+    offline_news_cache_misses: int = 0
+    offline_news_cache_miss_details: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     prepare_decisions: list[dict] = field(default_factory=list)
 
 
@@ -3748,13 +3752,42 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             )
 
             news_window_start = decision_time - timedelta(hours=bt_config.news_lookback_hours)
-            news_raw = fetch_historical_news_window(
-                polygon_key,
-                news_window_start,
-                decision_time,
-                limit=50,
-                cache=cache,
-            )
+            try:
+                news_raw = fetch_historical_news_window(
+                    polygon_key,
+                    news_window_start,
+                    decision_time,
+                    limit=50,
+                    cache=cache,
+                )
+            except RuntimeError as exc:
+                if bt_config.prepare_only and _is_offline_cache_miss(cache, exc):
+                    cache_entries = cache.store.entry_count() if cache.store else 0
+                    miss_detail = {
+                        "date": trade_date.isoformat(),
+                        "decision_time": decision_time.isoformat(),
+                        "news_window_start": news_window_start.isoformat(),
+                        "reason": str(exc),
+                    }
+                    result.decision_log.append({
+                        "date": trade_date.isoformat(),
+                        "decision_time": decision_time.isoformat(),
+                        "news_window_start": news_window_start.isoformat(),
+                        "prepared_only": True,
+                        "historical_options_provider": historical_options_provider,
+                        "offline_news_cache_miss": True,
+                        "offline_news_cache_miss_details": [miss_detail],
+                        "skip_reason": str(exc),
+                        "cache_entries": cache_entries,
+                        "open_positions": len(positions),
+                    })
+                    log(
+                        f"  {decision_time.strftime('%H:%M')} PREPARE STOP "
+                        f"offline_news_cache_miss: {exc}"
+                    )
+                    stop_backtest = True
+                    break
+                raise
             news = _filter_news_quality(news_raw)
             log(
                 f"  {decision_time.strftime('%H:%M')}: "
@@ -4595,6 +4628,15 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("option_bar_rate_limit_errors") or 0)
         for entry in prepare_decisions
     )
+    offline_news_cache_misses = sum(
+        1 for entry in prepare_decisions if entry.get("offline_news_cache_miss")
+    )
+    offline_news_cache_miss_details = [
+        detail
+        for entry in prepare_decisions
+        for detail in entry.get("offline_news_cache_miss_details", [])
+        if isinstance(detail, dict)
+    ][:50]
     return PrepareBacktestResult(
         start_date=prepare_config.start_date,
         end_date=prepare_config.end_date,
@@ -4625,6 +4667,8 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         missing_option_contract_bar_details=missing_option_contract_bar_details,
         option_bar_authorization_errors=option_bar_authorization_errors,
         option_bar_rate_limit_errors=option_bar_rate_limit_errors,
+        offline_news_cache_misses=offline_news_cache_misses,
+        offline_news_cache_miss_details=offline_news_cache_miss_details,
         prepare_decisions=prepare_decisions,
     )
 
@@ -4719,6 +4763,8 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
         print(f"  Bar auth errors:  {r.option_bar_authorization_errors}")
     if r.option_bar_rate_limit_errors:
         print(f"  Bar 429 errors:   {r.option_bar_rate_limit_errors}")
+    if r.offline_news_cache_misses:
+        print(f"  News cache miss:  {r.offline_news_cache_misses}")
     print("=" * 60)
 
 
@@ -4905,6 +4951,11 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "option_bar_rate_limit_errors": int(
                 entry.get("option_bar_rate_limit_errors") or 0
             ),
+            "offline_news_cache_miss": bool(entry.get("offline_news_cache_miss")),
+            "offline_news_cache_miss_details": list(
+                entry.get("offline_news_cache_miss_details") or []
+            ),
+            "skip_reason": str(entry.get("skip_reason") or ""),
             "cache_entries": int(entry.get("cache_entries") or 0),
             "open_positions": int(entry.get("open_positions") or 0),
         })
@@ -4946,6 +4997,8 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         "missing_option_contract_bar_details": r.missing_option_contract_bar_details,
         "option_bar_authorization_errors": r.option_bar_authorization_errors,
         "option_bar_rate_limit_errors": r.option_bar_rate_limit_errors,
+        "offline_news_cache_misses": r.offline_news_cache_misses,
+        "offline_news_cache_miss_details": r.offline_news_cache_miss_details,
         "prepare_decisions": r.prepare_decisions,
     }
 

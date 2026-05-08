@@ -3054,6 +3054,13 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
             {"ticker": "CALLMISS", "reason": "offline cache miss"}
         ],
         option_bar_rate_limit_errors=1,
+        offline_news_cache_misses=1,
+        offline_news_cache_miss_details=[
+            {
+                "decision_time": "2025-01-06T09:50:00-05:00",
+                "reason": "offline Polygon cache miss for /v2/reference/news",
+            }
+        ],
         prepare_decisions=[
             {
                 "decision_time": "2025-01-06T09:35:00-05:00",
@@ -3076,6 +3083,19 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                     {"ticker": "CALLMISS", "reason": "offline cache miss"}
                 ],
                 "option_bar_rate_limit_errors": 1,
+                "offline_news_cache_miss": False,
+                "cache_entries": 12,
+            },
+            {
+                "decision_time": "2025-01-06T09:50:00-05:00",
+                "offline_news_cache_miss": True,
+                "offline_news_cache_miss_details": [
+                    {
+                        "decision_time": "2025-01-06T09:50:00-05:00",
+                        "reason": "offline Polygon cache miss for /v2/reference/news",
+                    }
+                ],
+                "skip_reason": "offline Polygon cache miss for /v2/reference/news",
                 "cache_entries": 12,
             }
         ],
@@ -3102,6 +3122,13 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
     ]
     assert payload["option_bar_rate_limit_errors"] == 1
+    assert payload["offline_news_cache_misses"] == 1
+    assert payload["offline_news_cache_miss_details"] == [
+        {
+            "decision_time": "2025-01-06T09:50:00-05:00",
+            "reason": "offline Polygon cache miss for /v2/reference/news",
+        }
+    ]
     assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
     assert (
         payload["prepare_decisions"][0][
@@ -3128,10 +3155,88 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     ]
     assert payload["prepare_decisions"][0]["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
+    assert payload["prepare_decisions"][1]["offline_news_cache_miss"] is True
+    assert (
+        payload["prepare_decisions"][1]["skip_reason"]
+        == "offline Polygon cache miss for /v2/reference/news"
+    )
 
     output = tmp_path / "prepare.json"
     save_prepare_result(result, output)
     assert '"cache_entries_added": 7' in output.read_text()
+    assert '"offline_news_cache_misses": 1' in output.read_text()
+
+
+def test_offline_prepare_records_news_cache_miss_and_returns_summary(tmp_path, monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    trade_day = date(2025, 1, 6)
+    decision_times = [
+        datetime(2025, 1, 6, 9, 35, tzinfo=EASTERN_TZ),
+        datetime(2025, 1, 6, 9, 50, tzinfo=EASTERN_TZ),
+    ]
+    news_calls = {"count": 0}
+
+    def fake_news_window(*args, **kwargs):
+        news_calls["count"] += 1
+        if news_calls["count"] == 1:
+            return []
+        raise RuntimeError("offline Polygon cache miss for /v2/reference/news")
+
+    def fake_warm(*args, stats=None, **kwargs):
+        if stats is not None:
+            stats["attempted_option_contract_metadata_queries"] = 1
+        return 1
+
+    def fake_prefetch(*args, stats=None, **kwargs):
+        if stats is not None:
+            stats["attempted_option_contract_bars"] = 1
+            stats["attempted_primary_option_contract_bars"] = 1
+            stats["warmed_primary_option_contract_bars"] = 1
+        return 1
+
+    monkeypatch.setattr(bt_mod, "_trading_days", lambda start, end: [trade_day])
+    monkeypatch.setattr(bt_mod, "_decision_timestamps_for_day", lambda *args, **kwargs: decision_times)
+    monkeypatch.setattr(bt_mod, "_mark_to_market_equity", lambda equity, *args, **kwargs: (equity, 0.0))
+    monkeypatch.setattr(bt_mod, "fetch_historical_news_window", fake_news_window)
+    monkeypatch.setattr(bt_mod, "_filter_news_quality", lambda news: news)
+    monkeypatch.setattr(bt_mod, "_news_items_from_backtest_articles", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "build_news_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bt_mod, "_build_focus_tickers", lambda *args, **kwargs: ("", ["AAPL"]))
+    monkeypatch.setattr(bt_mod, "_format_news_for_backtest", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_catalyst_reaction_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_build_market_trend_context", lambda *args, **kwargs: "market")
+    monkeypatch.setattr(bt_mod, "_build_enriched_portfolio_context", lambda *args, **kwargs: "portfolio")
+    monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
+    monkeypatch.setattr(bt_mod, "_warm_prepare_option_metadata", fake_warm)
+    monkeypatch.setattr(bt_mod, "_prefetch_prepare_option_data", fake_prefetch)
+
+    result = bt_mod.prepare_backtest_data(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            offline=True,
+            cache_db_path=tmp_path / "cache.db",
+        )
+    )
+
+    assert result.days_prepared == 1
+    assert result.decision_points == 2
+    assert result.warmed_option_contract_metadata == 1
+    assert result.warmed_option_contract_bars == 1
+    assert result.offline_news_cache_misses == 1
+    assert result.offline_news_cache_miss_details == [
+        {
+            "date": trade_day.isoformat(),
+            "decision_time": decision_times[1].isoformat(),
+            "news_window_start": (
+                decision_times[1] - timedelta(hours=bt_mod.config.NEWS_LOOKBACK_HOURS)
+            ).isoformat(),
+            "reason": "offline Polygon cache miss for /v2/reference/news",
+        }
+    ]
+    assert result.prepare_decisions[0]["offline_news_cache_miss"] is False
+    assert result.prepare_decisions[1]["offline_news_cache_miss"] is True
 
 
 def test_summarize_decisions_counts_dropped_trades():
