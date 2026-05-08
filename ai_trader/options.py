@@ -143,6 +143,10 @@ def _distance_to_range(value: float, value_range: tuple[float, float] | None) ->
     return 0.0
 
 
+def _normalized_exact_symbol(symbol: str | None) -> str:
+    return str(symbol or "").strip().upper().removeprefix("O:")
+
+
 def resolve_expression_profile(
     strike_preference: str,
     expiry_preference: str,
@@ -467,8 +471,10 @@ def rank_contracts(
         return []
 
     if contract_symbol:
+        requested_symbol = _normalized_exact_symbol(contract_symbol)
         exact_matches = [
-            c for c in contracts if c.symbol.upper() == contract_symbol.upper()
+            c for c in contracts
+            if _normalized_exact_symbol(c.symbol) == requested_symbol
         ]
         return exact_matches[:1]
 

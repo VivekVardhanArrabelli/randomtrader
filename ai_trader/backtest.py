@@ -274,7 +274,7 @@ def _parse_theta_contract_ticker(option_ticker: str) -> tuple[str, date, str, fl
 
 def _parse_polygon_option_ticker(option_ticker: str) -> tuple[str, date, str, float] | None:
     match = re.match(
-        r"^O:(?P<underlying>.+?)(?P<expiry>\d{6})(?P<cp>[CP])(?P<strike>\d{8})$",
+        r"^(?:O:)?(?P<underlying>.+?)(?P<expiry>\d{6})(?P<cp>[CP])(?P<strike>\d{8})$",
         str(option_ticker or "").strip().upper(),
     )
     if not match:

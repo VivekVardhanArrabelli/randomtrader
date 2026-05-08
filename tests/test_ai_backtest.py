@@ -1554,6 +1554,54 @@ def test_select_real_contract_exact_symbol_expands_query_to_symbol_expiry(monkey
     }
 
 
+def test_select_real_contract_accepts_exact_symbol_without_polygon_prefix(monkeypatch):
+    import ai_trader.backtest as bt_mod
+    recorded: dict[str, object] = {}
+
+    def fake_fetch(
+        api_key,
+        underlying,
+        contract_type,
+        expiry_gte,
+        expiry_lte,
+        strike_gte,
+        strike_lte,
+        **kwargs,
+    ):
+        recorded.update(
+            {
+                "expiry_gte": expiry_gte,
+                "expiry_lte": expiry_lte,
+                "strike_gte": strike_gte,
+                "strike_lte": strike_lte,
+            }
+        )
+        return [_contract("O:AAPL250207C00155000", 155, "2025-02-07")]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", fake_fetch)
+
+    result = _select_real_contract(
+        api_key="fake",
+        underlying="AAPL",
+        option_type="call",
+        spot=150.0,
+        trade_date=date(2025, 1, 10),
+        strike_preference="atm",
+        expiry_preference="next_week",
+        default_dte=14,
+        contract_symbol="AAPL250207C00155000",
+    )
+
+    assert result is not None
+    assert result["ticker"] == "O:AAPL250207C00155000"
+    assert recorded == {
+        "expiry_gte": date(2025, 1, 17),
+        "expiry_lte": date(2025, 2, 7),
+        "strike_gte": 145.5,
+        "strike_lte": 155.0,
+    }
+
+
 def test_select_real_contract_respects_target_dte_range(monkeypatch):
     contracts = [
         _contract("O:AAPL250117C00150000", 150, "2025-01-17"),

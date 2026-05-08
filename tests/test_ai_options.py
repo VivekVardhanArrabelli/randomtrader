@@ -120,6 +120,22 @@ def test_select_contract_exact_symbol_overrides_bucket_heuristics():
     assert result.symbol == "C155"
 
 
+def test_select_contract_exact_symbol_matches_optional_polygon_prefix():
+    contracts = [
+        _make_contract(symbol="O:AAPL250321C00150000", strike=150.0, dte=20),
+        _make_contract(symbol="O:AAPL250321C00155000", strike=155.0, dte=20),
+    ]
+    result = select_contract(
+        contracts,
+        underlying_price=150.0,
+        strike_preference="atm",
+        expiry_preference="next_week",
+        contract_symbol="AAPL250321C00155000",
+    )
+    assert result is not None
+    assert result.symbol == "O:AAPL250321C00155000"
+
+
 def test_select_contract_respects_delta_and_dte_ranges():
     contracts = [
         _make_contract(symbol="C150_FAST", strike=150.0, dte=5),
