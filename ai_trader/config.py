@@ -56,7 +56,8 @@ CANDIDATE_TABLE_SIZE = 12          # broad triage rows shown to the LLM
 CANDIDATE_FINALISTS = 6            # finalists that get rich news/options context
 POSITION_CHECK_INTERVAL_SECONDS = 60
 PREPARE_PREFETCH_SYMBOLS = 8       # broader option-prefetch symbol cap for offline backtests
-PREPARE_PREFETCH_CONTRACTS_PER_SIDE = 8
+PREPARE_PREFETCH_CONTRACTS_PER_SIDE = 1
+PREPARE_PREFETCH_BAR_SYMBOLS = 1   # keep bar warmups inside Polygon minute caps
 PREPARE_PREFETCH_STRIKE_BAND_PCT = 0.12
 
 # ---------------------------------------------------------------------------

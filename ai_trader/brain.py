@@ -44,6 +44,25 @@ class AnalysisRun:
     analysis: MarketAnalysis
 
 
+def _is_non_retryable_llm_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            " 400",
+            " 401",
+            " 402",
+            " 403",
+            "insufficient balance",
+            "insufficient_quota",
+            "invalid api key",
+            "authentication",
+            "unauthorized",
+            "forbidden",
+        )
+    )
+
+
 SYSTEM_PROMPT = """\
 You are an autonomous AI options trader. Your job is to analyze real-time market \
 news and data, then make profitable options trading decisions.
@@ -640,6 +659,23 @@ class TradingBrain:
                 break
             except Exception as exc:
                 last_exc = exc
+                if _is_non_retryable_llm_error(exc):
+                    log(f"LLM API non-retryable error: {exc}")
+                    analysis = MarketAnalysis(
+                        analysis=f"LLM error: {exc}",
+                        trades=[],
+                        thesis_updates=[],
+                    )
+                    return AnalysisRun(
+                        packet=request_packet,
+                        completion=LLMCompletion(
+                            provider=self.provider,
+                            model=self.model,
+                            text_blocks=[str(exc)],
+                            raw_response={"error": str(exc)},
+                        ),
+                        analysis=analysis,
+                    )
                 if attempt < max_attempts - 1:
                     log(f"LLM API error (attempt {attempt + 1}/{max_attempts}): {exc}")
                     continue

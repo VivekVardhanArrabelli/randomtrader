@@ -4,6 +4,18 @@ from ai_trader.llm.types import LLMCompletion, ToolCall
 from ai_trader.brain import TradingBrain, TradeDecision, MarketAnalysis, SYSTEM_PROMPT, TRADE_TOOL
 
 
+class _FailingAdapter:
+    provider = "deepseek"
+
+    def __init__(self, error: Exception):
+        self.error = error
+        self.calls = 0
+
+    def complete_structured(self, **kwargs):
+        self.calls += 1
+        raise self.error
+
+
 def test_trade_decision_fields():
     d = TradeDecision(
         action="buy_call",
@@ -116,6 +128,32 @@ def test_build_prompt_adds_calibration_and_fast_decay_instructions():
     assert "Calibrate conviction to actual edge" in prompt
     assert "prefer a longer-DTE" in prompt
     assert "change the expression before changing nothing else" in prompt
+
+
+def test_run_packet_does_not_retry_non_retryable_llm_errors(monkeypatch):
+    monkeypatch.setattr("ai_trader.config.LLM_MAX_ATTEMPTS", 3)
+    adapter = _FailingAdapter(
+        RuntimeError('DeepSeek 402: {"error":{"message":"Insufficient Balance"}}')
+    )
+    brain = TradingBrain(
+        api_key="fake",
+        provider="deepseek",
+        model="deepseek-v4-pro",
+        adapter=adapter,
+    )
+
+    run = brain.run(
+        portfolio_context="portfolio",
+        candidate_context="",
+        news_context="news",
+        market_context="market",
+    )
+
+    assert adapter.calls == 1
+    assert "DeepSeek 402" in run.analysis.analysis
+    assert run.completion.raw_response == {
+        "error": 'DeepSeek 402: {"error":{"message":"Insufficient Balance"}}'
+    }
 
 
 def test_run_packet_retries_once_on_adapter_error():

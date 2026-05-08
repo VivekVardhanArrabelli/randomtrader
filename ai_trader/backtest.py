@@ -1821,6 +1821,7 @@ class BacktestConfig:
     log_db_path: Path | None = None
     prepare_prefetch_symbols: int = config.PREPARE_PREFETCH_SYMBOLS
     prepare_prefetch_contracts_per_side: int = config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE
+    prepare_prefetch_bar_symbols: int = config.PREPARE_PREFETCH_BAR_SYMBOLS
     prepare_prefetch_strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT
     max_consecutive_llm_errors: int = config.MAX_CONSECUTIVE_LLM_ERROR_CYCLES
     max_decisions: int = 0
@@ -3954,7 +3955,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     default_dte=bt_config.default_dte,
                     bar_minutes=bt_config.signal_bar_minutes,
                     metrics_cache=metrics_cache,
-                    max_symbols=bt_config.prepare_prefetch_symbols,
+                    max_symbols=bt_config.prepare_prefetch_bar_symbols,
                     contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
                     stats=option_prefetch_stats,
@@ -5399,7 +5400,13 @@ def run() -> None:
     )
     parser.add_argument(
         "--prepare-prefetch-contracts", type=int, default=config.PREPARE_PREFETCH_CONTRACTS_PER_SIDE,
-        help="In prepare-data mode, contracts per side to prefetch for each symbol",
+        help="In prepare-data mode, option-bar contracts per side to warm",
+    )
+    parser.add_argument(
+        "--prepare-prefetch-bar-symbols",
+        type=int,
+        default=config.PREPARE_PREFETCH_BAR_SYMBOLS,
+        help="In prepare-data mode, number of symbols to warm option bars for",
     )
     parser.add_argument(
         "--max-consecutive-llm-errors",
@@ -5439,6 +5446,7 @@ def run() -> None:
         ),
         prepare_prefetch_symbols=args.prepare_prefetch_symbols,
         prepare_prefetch_contracts_per_side=args.prepare_prefetch_contracts,
+        prepare_prefetch_bar_symbols=args.prepare_prefetch_bar_symbols,
         max_consecutive_llm_errors=config.resolved_max_consecutive_llm_error_cycles(
             args.max_consecutive_llm_errors
         ),
