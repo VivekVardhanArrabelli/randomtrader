@@ -1316,6 +1316,101 @@ def test_warm_prepare_option_metadata_warms_exact_options_context_queries(monkey
     ) in contract_queries
 
 
+def test_warm_prepare_option_metadata_records_offline_metadata_misses(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+
+    def mock_fetch_contracts(*args, **kwargs):
+        raise RuntimeError("offline Polygon cache miss for /v3/reference/options/contracts")
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+
+    stats: dict[str, object] = {}
+    count = _warm_prepare_option_metadata(
+        "fake",
+        ["INTC"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(offline=True),
+        default_dte=14,
+        max_symbols=1,
+        stats=stats,
+    )
+
+    assert count == 0
+    assert stats["attempted_option_contract_metadata_queries"] == 10
+    assert stats["missing_option_contract_metadata_queries"] == 10
+    details = stats["missing_option_contract_metadata_details"]
+    assert len(details) == 10
+    assert details[0]["underlying"] == "INTC"
+    assert details[0]["phase"] == "metadata_warm"
+
+
+def test_prefetch_prepare_option_data_records_offline_contract_selection_misses(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+
+    def mock_fetch_contracts(*args, **kwargs):
+        raise RuntimeError("offline Polygon cache miss for /v3/reference/options/contracts")
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+
+    stats: dict[str, object] = {}
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["INTC"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(offline=True),
+        default_dte=14,
+        contracts_per_side=2,
+        max_symbols=1,
+        stats=stats,
+    )
+
+    assert count == 0
+    assert stats["attempted_option_contract_metadata_queries"] == 4
+    assert stats["missing_option_contract_metadata_queries"] == 4
+    assert stats["attempted_option_contract_bars"] == 0
+    details = stats["missing_option_contract_metadata_details"]
+    assert len(details) == 4
+    assert {d["phase"] for d in details} == {"bar_prefetch_contract_selection"}
+
+
 def test_build_options_context_fetches_intraday_only_for_primary_contracts(monkeypatch):
     import ai_trader.backtest as bt_mod
 
@@ -2943,6 +3038,12 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         cache_entries_before=5,
         cache_entries_added=7,
         warmed_option_contract_metadata=4,
+        attempted_option_contract_metadata_queries=6,
+        missing_option_contract_metadata_queries=1,
+        missing_option_contract_metadata_details=[
+            {"underlying": "AAPL", "reason": "offline metadata miss"}
+        ],
+        option_metadata_rate_limit_errors=1,
         warmed_option_contract_bars=3,
         attempted_option_contract_bars=5,
         missing_option_contract_bars=2,
@@ -2959,6 +3060,12 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "finalists": ["AAPL"],
                 "options_watchlist": ["AAPL"],
                 "warmed_option_contract_metadata": 4,
+                "attempted_option_contract_metadata_queries": 6,
+                "missing_option_contract_metadata_queries": 1,
+                "missing_option_contract_metadata_details": [
+                    {"underlying": "AAPL", "reason": "offline metadata miss"}
+                ],
+                "option_metadata_rate_limit_errors": 1,
                 "warmed_option_contract_bars": 3,
                 "attempted_option_contract_bars": 5,
                 "missing_option_contract_bars": 2,
@@ -2979,6 +3086,12 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["cache_entries_before"] == 5
     assert payload["cache_entries_added"] == 7
     assert payload["warmed_option_contract_metadata"] == 4
+    assert payload["attempted_option_contract_metadata_queries"] == 6
+    assert payload["missing_option_contract_metadata_queries"] == 1
+    assert payload["missing_option_contract_metadata_details"] == [
+        {"underlying": "AAPL", "reason": "offline metadata miss"}
+    ]
+    assert payload["option_metadata_rate_limit_errors"] == 1
     assert payload["warmed_option_contract_bars"] == 3
     assert payload["attempted_option_contract_bars"] == 5
     assert payload["missing_option_contract_bars"] == 2
@@ -2990,6 +3103,19 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     ]
     assert payload["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
+    assert (
+        payload["prepare_decisions"][0][
+            "attempted_option_contract_metadata_queries"
+        ] == 6
+    )
+    assert (
+        payload["prepare_decisions"][0]["missing_option_contract_metadata_queries"]
+        == 1
+    )
+    assert payload["prepare_decisions"][0][
+        "missing_option_contract_metadata_details"
+    ] == [{"underlying": "AAPL", "reason": "offline metadata miss"}]
+    assert payload["prepare_decisions"][0]["option_metadata_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["attempted_option_contract_bars"] == 5
     assert payload["prepare_decisions"][0]["missing_option_contract_bars"] == 2
     assert (
@@ -3715,7 +3841,7 @@ def test_run_backtest_keeps_acted_on_thesis_when_trade_skips(tmp_path, monkeypat
     assert result.decision_log[0]["trades_proposed"][0]["skip_reason"] == "no contract found"
 
 
-def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch):
+def test_run_backtest_stops_after_consecutive_llm_errors(tmp_path, monkeypatch):
     import ai_trader.backtest as bt_mod
 
     trade_day = date(2025, 1, 6)
@@ -3771,16 +3897,19 @@ def test_run_backtest_aborts_after_consecutive_llm_errors(tmp_path, monkeypatch)
     monkeypatch.setattr(bt_mod, "_build_performance_summary", lambda *args, **kwargs: "")
     monkeypatch.setattr(bt_mod, "_build_options_context", lambda *args, **kwargs: "options")
 
-    with pytest.raises(RuntimeError, match="2 consecutive LLM error cycles"):
-        bt_mod.run_backtest(
-            BacktestConfig(
-                start_date=trade_day,
-                end_date=trade_day,
-                llm_delay_seconds=0.0,
-                cache_db_path=tmp_path / "cache.db",
-                max_consecutive_llm_errors=2,
-            )
+    result = bt_mod.run_backtest(
+        BacktestConfig(
+            start_date=trade_day,
+            end_date=trade_day,
+            llm_delay_seconds=0.0,
+            cache_db_path=tmp_path / "cache.db",
+            max_consecutive_llm_errors=2,
         )
+    )
+
+    assert result.llm_error_cycles == 2
+    assert len(result.decision_log) == 2
+    assert result.days_tested == 1
 
 
 def test_run_backtest_honors_max_decisions(tmp_path, monkeypatch):

@@ -1865,12 +1865,19 @@ class PrepareBacktestResult:
     cache_entries_before: int = 0
     cache_entries_added: int = 0
     warmed_option_contract_metadata: int = 0
+    attempted_option_contract_metadata_queries: int = 0
+    missing_option_contract_metadata_queries: int = 0
     warmed_option_contract_bars: int = 0
     attempted_option_contract_bars: int = 0
     missing_option_contract_bars: int = 0
     attempted_primary_option_contract_bars: int = 0
     warmed_primary_option_contract_bars: int = 0
     missing_primary_option_contract_bars: int = 0
+    option_metadata_authorization_errors: int = 0
+    option_metadata_rate_limit_errors: int = 0
+    missing_option_contract_metadata_details: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     option_bar_authorization_errors: int = 0
     option_bar_rate_limit_errors: int = 0
     missing_option_contract_bar_details: list[dict[str, Any]] = field(
@@ -2983,6 +2990,51 @@ def _record_prepare_option_bar_miss(
     details.append(detail)
 
 
+def _record_prepare_option_metadata_miss(
+    stats: dict[str, Any] | None,
+    *,
+    underlying: str,
+    option_type: str,
+    expiry_gte: date,
+    expiry_lte: date,
+    strike_gte: float,
+    strike_lte: float,
+    reason: str,
+    phase: str,
+) -> None:
+    if stats is None:
+        return
+    details = stats.setdefault("missing_option_contract_metadata_details", [])
+    if not isinstance(details, list) or len(details) >= 50:
+        return
+    details.append({
+        "underlying": underlying.upper(),
+        "option_type": option_type,
+        "expiration_date_gte": expiry_gte.isoformat(),
+        "expiration_date_lte": expiry_lte.isoformat(),
+        "strike_gte": strike_gte,
+        "strike_lte": strike_lte,
+        "phase": phase,
+        "reason": reason,
+    })
+
+
+def _init_prepare_option_stats(stats: dict[str, Any] | None) -> None:
+    if stats is None:
+        return
+    stats.setdefault("attempted_option_contract_metadata_queries", 0)
+    stats.setdefault("missing_option_contract_metadata_queries", 0)
+    stats.setdefault("option_metadata_authorization_errors", 0)
+    stats.setdefault("option_metadata_rate_limit_errors", 0)
+    stats.setdefault("attempted_option_contract_bars", 0)
+    stats.setdefault("missing_option_contract_bars", 0)
+    stats.setdefault("attempted_primary_option_contract_bars", 0)
+    stats.setdefault("warmed_primary_option_contract_bars", 0)
+    stats.setdefault("missing_primary_option_contract_bars", 0)
+    stats.setdefault("option_bar_authorization_errors", 0)
+    stats.setdefault("option_bar_rate_limit_errors", 0)
+
+
 def _prepare_option_bar_detail_metadata(
     *,
     underlying: str,
@@ -3031,14 +3083,7 @@ def _prefetch_prepare_option_data(
     This is only used in prepare mode so the cold vendor cost is paid once,
     outside the actual model/backtest comparison loop.
     """
-    if stats is not None:
-        stats.setdefault("attempted_option_contract_bars", 0)
-        stats.setdefault("missing_option_contract_bars", 0)
-        stats.setdefault("attempted_primary_option_contract_bars", 0)
-        stats.setdefault("warmed_primary_option_contract_bars", 0)
-        stats.setdefault("missing_primary_option_contract_bars", 0)
-        stats.setdefault("option_bar_authorization_errors", 0)
-        stats.setdefault("option_bar_rate_limit_errors", 0)
+    _init_prepare_option_stats(stats)
 
     if not tickers or max_symbols <= 0 or contracts_per_side <= 0:
         return 0
@@ -3089,17 +3134,56 @@ def _prefetch_prepare_option_data(
                 if query_key in queried:
                     continue
                 queried.add(query_key)
-                for contract in fetch_polygon_option_contracts(
-                    api_key,
-                    ticker,
-                    option_type,
-                    query_expiry_gte,
-                    query_expiry_lte,
-                    query_strike_gte,
-                    query_strike_lte,
-                    as_of=trade_date,
-                    cache=cache,
-                ):
+                if stats is not None:
+                    stats["attempted_option_contract_metadata_queries"] += 1
+                try:
+                    contracts = fetch_polygon_option_contracts(
+                        api_key,
+                        ticker,
+                        option_type,
+                        query_expiry_gte,
+                        query_expiry_lte,
+                        query_strike_gte,
+                        query_strike_lte,
+                        as_of=trade_date,
+                        cache=cache,
+                    )
+                except RuntimeError as exc:
+                    if _is_polygon_rate_limit_error(exc):
+                        if stats is not None:
+                            stats["option_metadata_rate_limit_errors"] += 1
+                        log(
+                            "prepare option metadata prefetch paused: "
+                            f"Polygon rate limited {ticker.upper()} {option_type}"
+                        )
+                        return len(prefetched)
+                    if _is_polygon_authorization_error(exc):
+                        if stats is not None:
+                            stats["option_metadata_authorization_errors"] += 1
+                        log(
+                            "prepare option metadata prefetch disabled: "
+                            f"Polygon is not authorized for {ticker.upper()} {option_type}"
+                        )
+                        return len(prefetched)
+                    if stats is not None:
+                        stats["missing_option_contract_metadata_queries"] += 1
+                    _record_prepare_option_metadata_miss(
+                        stats,
+                        underlying=ticker,
+                        option_type=option_type,
+                        expiry_gte=query_expiry_gte,
+                        expiry_lte=query_expiry_lte,
+                        strike_gte=query_strike_gte,
+                        strike_lte=query_strike_lte,
+                        phase="bar_prefetch_contract_selection",
+                        reason=str(exc),
+                    )
+                    log(
+                        "prepare option metadata cache miss during bar prefetch "
+                        f"for {ticker.upper()} {option_type}: {exc}"
+                    )
+                    continue
+                for contract in contracts:
                     option_ticker = str(contract.get("ticker") or "")
                     if option_ticker:
                         contracts_by_ticker.setdefault(option_ticker, contract)
@@ -3197,12 +3281,15 @@ def _warm_prepare_option_metadata(
     metrics_cache: dict[str, dict | None] | None = None,
     max_symbols: int = config.PREPARE_PREFETCH_SYMBOLS,
     strike_band_pct: float = config.PREPARE_PREFETCH_STRIKE_BAND_PCT,
+    stats: dict[str, Any] | None = None,
 ) -> int:
     """Warm option chain metadata without hydrating contract bars.
 
     Prepare mode should accelerate later runs, not define the option surface
     the model is allowed to reason over.
     """
+    _init_prepare_option_stats(stats)
+
     if not tickers or max_symbols <= 0:
         return 0
 
@@ -3276,17 +3363,55 @@ def _warm_prepare_option_metadata(
                 if query_key in queried:
                     continue
                 queried.add(query_key)
-                contracts = fetch_polygon_option_contracts(
-                    api_key,
-                    ticker,
-                    option_type,
-                    expiry_gte,
-                    expiry_lte,
-                    strike_gte,
-                    strike_lte,
-                    as_of=trade_date,
-                    cache=cache,
-                )
+                if stats is not None:
+                    stats["attempted_option_contract_metadata_queries"] += 1
+                try:
+                    contracts = fetch_polygon_option_contracts(
+                        api_key,
+                        ticker,
+                        option_type,
+                        expiry_gte,
+                        expiry_lte,
+                        strike_gte,
+                        strike_lte,
+                        as_of=trade_date,
+                        cache=cache,
+                    )
+                except RuntimeError as exc:
+                    if _is_polygon_rate_limit_error(exc):
+                        if stats is not None:
+                            stats["option_metadata_rate_limit_errors"] += 1
+                        log(
+                            "prepare option metadata warmup paused: "
+                            f"Polygon rate limited {ticker.upper()} {option_type}"
+                        )
+                        return len(warmed_contracts)
+                    if _is_polygon_authorization_error(exc):
+                        if stats is not None:
+                            stats["option_metadata_authorization_errors"] += 1
+                        log(
+                            "prepare option metadata warmup disabled: "
+                            f"Polygon is not authorized for {ticker.upper()} {option_type}"
+                        )
+                        return len(warmed_contracts)
+                    if stats is not None:
+                        stats["missing_option_contract_metadata_queries"] += 1
+                    _record_prepare_option_metadata_miss(
+                        stats,
+                        underlying=ticker,
+                        option_type=option_type,
+                        expiry_gte=expiry_gte,
+                        expiry_lte=expiry_lte,
+                        strike_gte=strike_gte,
+                        strike_lte=strike_lte,
+                        phase="metadata_warm",
+                        reason=str(exc),
+                    )
+                    log(
+                        "prepare option metadata cache miss "
+                        f"for {ticker.upper()} {option_type}: {exc}"
+                    )
+                    continue
                 for contract in contracts:
                     option_ticker = str(contract.get("ticker") or "")
                     if option_ticker:
@@ -3477,6 +3602,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
     decisions_processed = 0
     processed_trading_days = 0
     last_processed_date: date | None = None
+    stop_backtest = False
 
     # Polygon cache — avoids redundant API calls in-process and across runs.
     cache = PolygonCache(
@@ -3728,6 +3854,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     deep_focus_symbols,
                     limit=max(bt_config.prepare_prefetch_symbols, len(options_watchlist or deep_focus_symbols)),
                 )
+                option_prefetch_stats: dict[str, Any] = {}
                 warmed_contract_metadata = _warm_prepare_option_metadata(
                     polygon_key,
                     metadata_symbols,
@@ -3738,8 +3865,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     metrics_cache=metrics_cache,
                     max_symbols=bt_config.prepare_prefetch_symbols,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
+                    stats=option_prefetch_stats,
                 )
-                option_bar_stats: dict[str, Any] = {}
                 warmed_contract_bars = _prefetch_prepare_option_data(
                     polygon_key,
                     metadata_symbols,
@@ -3751,31 +3878,46 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     max_symbols=bt_config.prepare_prefetch_symbols,
                     contracts_per_side=bt_config.prepare_prefetch_contracts_per_side,
                     strike_band_pct=bt_config.prepare_prefetch_strike_band_pct,
-                    stats=option_bar_stats,
+                    stats=option_prefetch_stats,
+                )
+                attempted_metadata_queries = int(
+                    option_prefetch_stats.get("attempted_option_contract_metadata_queries") or 0
+                )
+                missing_metadata_queries = int(
+                    option_prefetch_stats.get("missing_option_contract_metadata_queries") or 0
+                )
+                option_metadata_auth_errors = int(
+                    option_prefetch_stats.get("option_metadata_authorization_errors") or 0
+                )
+                option_metadata_rate_limit_errors = int(
+                    option_prefetch_stats.get("option_metadata_rate_limit_errors") or 0
+                )
+                missing_contract_metadata_details = list(
+                    option_prefetch_stats.get("missing_option_contract_metadata_details") or []
                 )
                 attempted_contract_bars = int(
-                    option_bar_stats.get("attempted_option_contract_bars") or 0
+                    option_prefetch_stats.get("attempted_option_contract_bars") or 0
                 )
                 missing_contract_bars = int(
-                    option_bar_stats.get("missing_option_contract_bars") or 0
+                    option_prefetch_stats.get("missing_option_contract_bars") or 0
                 )
                 attempted_primary_contract_bars = int(
-                    option_bar_stats.get("attempted_primary_option_contract_bars") or 0
+                    option_prefetch_stats.get("attempted_primary_option_contract_bars") or 0
                 )
                 warmed_primary_contract_bars = int(
-                    option_bar_stats.get("warmed_primary_option_contract_bars") or 0
+                    option_prefetch_stats.get("warmed_primary_option_contract_bars") or 0
                 )
                 missing_primary_contract_bars = int(
-                    option_bar_stats.get("missing_primary_option_contract_bars") or 0
+                    option_prefetch_stats.get("missing_primary_option_contract_bars") or 0
                 )
                 option_bar_auth_errors = int(
-                    option_bar_stats.get("option_bar_authorization_errors") or 0
+                    option_prefetch_stats.get("option_bar_authorization_errors") or 0
                 )
                 option_bar_rate_limit_errors = int(
-                    option_bar_stats.get("option_bar_rate_limit_errors") or 0
+                    option_prefetch_stats.get("option_bar_rate_limit_errors") or 0
                 )
                 missing_contract_bar_details = list(
-                    option_bar_stats.get("missing_option_contract_bar_details") or []
+                    option_prefetch_stats.get("missing_option_contract_bar_details") or []
                 )
                 cache_entries = cache.store.entry_count() if cache.store else 0
                 result.decision_log.append({
@@ -3787,6 +3929,21 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     "finalists": finalist_symbols,
                     "options_watchlist": options_watchlist or deep_focus_symbols,
                     "warmed_option_contract_metadata": warmed_contract_metadata,
+                    "attempted_option_contract_metadata_queries": (
+                        attempted_metadata_queries
+                    ),
+                    "missing_option_contract_metadata_queries": (
+                        missing_metadata_queries
+                    ),
+                    "missing_option_contract_metadata_details": (
+                        missing_contract_metadata_details
+                    ),
+                    "option_metadata_authorization_errors": (
+                        option_metadata_auth_errors
+                    ),
+                    "option_metadata_rate_limit_errors": (
+                        option_metadata_rate_limit_errors
+                    ),
                     "warmed_option_contract_bars": warmed_contract_bars,
                     "attempted_option_contract_bars": attempted_contract_bars,
                     "missing_option_contract_bars": missing_contract_bars,
@@ -3805,6 +3962,7 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                     f"  {decision_time.strftime('%H:%M')} PREPARED "
                     f"finalists={len(finalist_symbols)} "
                     f"warmed_contract_metadata={warmed_contract_metadata} "
+                    f"missing_metadata_queries={missing_metadata_queries} "
                     f"warmed_contract_bars={warmed_contract_bars} "
                     f"attempted_contract_bars={attempted_contract_bars} "
                     f"missing_contract_bars={missing_contract_bars} "
@@ -4241,10 +4399,12 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
                 bt_config.max_consecutive_llm_errors > 0
                 and consecutive_llm_errors >= bt_config.max_consecutive_llm_errors
             ):
-                raise RuntimeError(
-                    "aborting backtest after "
+                log(
+                    "stopping backtest after "
                     f"{consecutive_llm_errors} consecutive LLM error cycles"
                 )
+                stop_backtest = True
+                break
 
         day_close_equity, _ = _mark_to_market_equity(
             equity,
@@ -4266,6 +4426,8 @@ def run_backtest(bt_config: BacktestConfig) -> BacktestResult:
             max_dd = dd
         processed_trading_days += 1
         last_processed_date = trade_date
+        if stop_backtest:
+            break
 
     # Close any remaining positions at last day
     last_date = last_processed_date or (trading_days[-1] if trading_days else bt_config.end_date)
@@ -4373,6 +4535,28 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         int(entry.get("warmed_option_contract_metadata") or 0)
         for entry in prepare_decisions
     )
+    attempted_option_contract_metadata_queries = sum(
+        int(entry.get("attempted_option_contract_metadata_queries") or 0)
+        for entry in prepare_decisions
+    )
+    missing_option_contract_metadata_queries = sum(
+        int(entry.get("missing_option_contract_metadata_queries") or 0)
+        for entry in prepare_decisions
+    )
+    missing_option_contract_metadata_details = [
+        detail
+        for entry in prepare_decisions
+        for detail in entry.get("missing_option_contract_metadata_details", [])
+        if isinstance(detail, dict)
+    ][:50]
+    option_metadata_authorization_errors = sum(
+        int(entry.get("option_metadata_authorization_errors") or 0)
+        for entry in prepare_decisions
+    )
+    option_metadata_rate_limit_errors = sum(
+        int(entry.get("option_metadata_rate_limit_errors") or 0)
+        for entry in prepare_decisions
+    )
     warmed_option_contract_bars = sum(
         int(entry.get("warmed_option_contract_bars") or 0)
         for entry in prepare_decisions
@@ -4421,6 +4605,17 @@ def prepare_backtest_data(bt_config: BacktestConfig) -> PrepareBacktestResult:
         cache_entries_before=cache_entries_before,
         cache_entries_added=max(cache_entries - cache_entries_before, 0),
         warmed_option_contract_metadata=warmed_option_contract_metadata,
+        attempted_option_contract_metadata_queries=(
+            attempted_option_contract_metadata_queries
+        ),
+        missing_option_contract_metadata_queries=(
+            missing_option_contract_metadata_queries
+        ),
+        missing_option_contract_metadata_details=(
+            missing_option_contract_metadata_details
+        ),
+        option_metadata_authorization_errors=option_metadata_authorization_errors,
+        option_metadata_rate_limit_errors=option_metadata_rate_limit_errors,
         warmed_option_contract_bars=warmed_option_contract_bars,
         attempted_option_contract_bars=attempted_option_contract_bars,
         missing_option_contract_bars=missing_option_contract_bars,
@@ -4493,6 +4688,8 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     print(f"  Cache entries:    {r.cache_entries}")
     print(f"  Cache added:      {r.cache_entries_added}")
     print(f"  Option metadata:  {r.warmed_option_contract_metadata}")
+    print(f"  Metadata queries: {r.attempted_option_contract_metadata_queries}")
+    print(f"  Metadata misses:  {r.missing_option_contract_metadata_queries}")
     print(f"  Option bars:      {r.warmed_option_contract_bars}")
     print(f"  Bar attempts:     {r.attempted_option_contract_bars}")
     print(f"  Bar misses:       {r.missing_option_contract_bars}")
@@ -4503,12 +4700,21 @@ def print_prepare_result(r: PrepareBacktestResult) -> None:
     )
     if r.missing_primary_option_contract_bars:
         print(f"  Primary misses:   {r.missing_primary_option_contract_bars}")
+    for detail in r.missing_option_contract_metadata_details[:3]:
+        underlying = detail.get("underlying", "")
+        option_type = detail.get("option_type", "")
+        reason = detail.get("reason", "")
+        print(f"    metadata miss: {underlying} {option_type} ({reason[:100]})")
     for detail in r.missing_option_contract_bar_details[:3]:
         ticker = detail.get("ticker", "")
         rank = detail.get("prefetch_rank")
         rank_label = f" rank={rank}" if rank else ""
         reason = detail.get("reason", "")
         print(f"    miss: {ticker}{rank_label} ({reason[:100]})")
+    if r.option_metadata_authorization_errors:
+        print(f"  Metadata auth:    {r.option_metadata_authorization_errors}")
+    if r.option_metadata_rate_limit_errors:
+        print(f"  Metadata 429s:    {r.option_metadata_rate_limit_errors}")
     if r.option_bar_authorization_errors:
         print(f"  Bar auth errors:  {r.option_bar_authorization_errors}")
     if r.option_bar_rate_limit_errors:
@@ -4657,6 +4863,21 @@ def _prepare_decision_summaries(decision_log: list[dict]) -> list[dict]:
             "warmed_option_contract_metadata": int(
                 entry.get("warmed_option_contract_metadata") or 0
             ),
+            "attempted_option_contract_metadata_queries": int(
+                entry.get("attempted_option_contract_metadata_queries") or 0
+            ),
+            "missing_option_contract_metadata_queries": int(
+                entry.get("missing_option_contract_metadata_queries") or 0
+            ),
+            "missing_option_contract_metadata_details": list(
+                entry.get("missing_option_contract_metadata_details") or []
+            ),
+            "option_metadata_authorization_errors": int(
+                entry.get("option_metadata_authorization_errors") or 0
+            ),
+            "option_metadata_rate_limit_errors": int(
+                entry.get("option_metadata_rate_limit_errors") or 0
+            ),
             "warmed_option_contract_bars": int(
                 entry.get("warmed_option_contract_bars") or 0
             ),
@@ -4701,6 +4922,19 @@ def prepare_result_to_dict(r: PrepareBacktestResult) -> dict:
         "cache_entries_before": r.cache_entries_before,
         "cache_entries_added": r.cache_entries_added,
         "warmed_option_contract_metadata": r.warmed_option_contract_metadata,
+        "attempted_option_contract_metadata_queries": (
+            r.attempted_option_contract_metadata_queries
+        ),
+        "missing_option_contract_metadata_queries": (
+            r.missing_option_contract_metadata_queries
+        ),
+        "missing_option_contract_metadata_details": (
+            r.missing_option_contract_metadata_details
+        ),
+        "option_metadata_authorization_errors": (
+            r.option_metadata_authorization_errors
+        ),
+        "option_metadata_rate_limit_errors": r.option_metadata_rate_limit_errors,
         "warmed_option_contract_bars": r.warmed_option_contract_bars,
         "attempted_option_contract_bars": r.attempted_option_contract_bars,
         "missing_option_contract_bars": r.missing_option_contract_bars,
