@@ -3100,6 +3100,7 @@ def _prefetch_prepare_option_data(
     expiry_gte = trade_date + timedelta(days=max(config.PREFERRED_DTE_MIN, default_dte - 10))
     expiry_lte = trade_date + timedelta(days=min(config.PREFERRED_DTE_MAX, default_dte + 21))
     prefetched: set[str] = set()
+    ranked_by_ticker: list[tuple[str, float, dict[str, list[dict]]]] = []
 
     for ticker in tickers[:max_symbols]:
         _, spot = _build_ticker_price_context(
@@ -3201,7 +3202,10 @@ def _prefetch_prepare_option_data(
             )
             ranked_by_side[option_type] = ranked_contracts
 
-        for rank_index in range(contracts_per_side):
+        ranked_by_ticker.append((ticker, spot, ranked_by_side))
+
+    for rank_index in range(contracts_per_side):
+        for ticker, spot, ranked_by_side in ranked_by_ticker:
             for option_type in ("call", "put"):
                 side_contracts = ranked_by_side.get(option_type) or []
                 if rank_index >= len(side_contracts):

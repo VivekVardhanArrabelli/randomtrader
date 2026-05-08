@@ -1234,6 +1234,82 @@ def test_prefetch_prepare_option_data_warms_both_primary_sides_before_alternativ
     assert stats["option_bar_rate_limit_errors"] == 1
 
 
+def test_prefetch_prepare_option_data_warms_all_symbol_primaries_before_alternatives(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+
+    def mock_fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
+        prefix = f"{ticker}_{option_type.upper()}"
+        if option_type == "call":
+            return [
+                {"ticker": f"{prefix}_ATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+                {"ticker": f"{prefix}_ALT", "strike_price": 95, "expiration_date": "2025-01-24"},
+            ]
+        return [
+            {"ticker": f"{prefix}_ATM", "strike_price": 100, "expiration_date": "2025-01-24"},
+            {"ticker": f"{prefix}_ALT", "strike_price": 105, "expiration_date": "2025-01-24"},
+        ]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+    attempted: list[str] = []
+
+    def mock_intraday(api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs):
+        attempted.append(ticker)
+        if ticker == "NVDA_CALL_ALT":
+            raise RuntimeError("Polygon 429: exceeded the maximum requests per minute")
+        return [{"c": 1.0}]
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_option_daily_bar",
+        lambda *args, **kwargs: {"c": 1.0},
+    )
+
+    stats: dict[str, int] = {}
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["NVDA", "MSFT"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=2,
+        max_symbols=2,
+        stats=stats,
+    )
+
+    assert count == 4
+    assert attempted == [
+        "NVDA_CALL_ATM",
+        "NVDA_PUT_ATM",
+        "MSFT_CALL_ATM",
+        "MSFT_PUT_ATM",
+        "NVDA_CALL_ALT",
+    ]
+    assert stats["attempted_primary_option_contract_bars"] == 4
+    assert stats["warmed_primary_option_contract_bars"] == 4
+    assert stats["missing_primary_option_contract_bars"] == 0
+    assert stats["option_bar_rate_limit_errors"] == 1
+
+
 def test_warm_prepare_option_metadata_warms_exact_options_context_queries(monkeypatch):
     import ai_trader.backtest as bt_mod
 
