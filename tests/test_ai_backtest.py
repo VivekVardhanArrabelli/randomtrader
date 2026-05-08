@@ -890,6 +890,64 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
     assert stats["option_bar_rate_limit_errors"] == 0
 
 
+def test_prefetch_prepare_option_data_records_missing_bar_details(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+
+    def mock_fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
+        if option_type != "call":
+            return []
+        return [
+            {"ticker": "CALLMISS", "strike_price": 100, "expiration_date": "2025-01-24"}
+        ]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+
+    def mock_intraday(*args, **kwargs):
+        raise RuntimeError("offline Polygon cache miss for /v2/aggs/ticker/CALLMISS")
+
+    monkeypatch.setattr(bt_mod, "fetch_historical_intraday_bars", mock_intraday)
+
+    stats: dict = {}
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=1,
+        max_symbols=1,
+        stats=stats,
+    )
+
+    assert count == 0
+    assert stats["missing_option_contract_bars"] == 1
+    assert stats["missing_option_contract_bar_details"] == [
+        {
+            "ticker": "CALLMISS",
+            "reason": "offline Polygon cache miss for /v2/aggs/ticker/CALLMISS",
+        }
+    ]
+
+
 def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(monkeypatch):
     import ai_trader.backtest as bt_mod
 
@@ -2698,6 +2756,9 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         warmed_option_contract_bars=3,
         attempted_option_contract_bars=5,
         missing_option_contract_bars=2,
+        missing_option_contract_bar_details=[
+            {"ticker": "CALLMISS", "reason": "offline cache miss"}
+        ],
         option_bar_rate_limit_errors=1,
         prepare_decisions=[
             {
@@ -2708,6 +2769,9 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "warmed_option_contract_bars": 3,
                 "attempted_option_contract_bars": 5,
                 "missing_option_contract_bars": 2,
+                "missing_option_contract_bar_details": [
+                    {"ticker": "CALLMISS", "reason": "offline cache miss"}
+                ],
                 "option_bar_rate_limit_errors": 1,
                 "cache_entries": 12,
             }
@@ -2722,10 +2786,16 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["warmed_option_contract_bars"] == 3
     assert payload["attempted_option_contract_bars"] == 5
     assert payload["missing_option_contract_bars"] == 2
+    assert payload["missing_option_contract_bar_details"] == [
+        {"ticker": "CALLMISS", "reason": "offline cache miss"}
+    ]
     assert payload["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["warmed_option_contract_bars"] == 3
     assert payload["prepare_decisions"][0]["attempted_option_contract_bars"] == 5
     assert payload["prepare_decisions"][0]["missing_option_contract_bars"] == 2
+    assert payload["prepare_decisions"][0]["missing_option_contract_bar_details"] == [
+        {"ticker": "CALLMISS", "reason": "offline cache miss"}
+    ]
     assert payload["prepare_decisions"][0]["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
 
