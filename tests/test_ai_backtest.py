@@ -870,7 +870,7 @@ def test_prefetch_prepare_option_data_fetches_broader_contract_bars(monkeypatch)
         ),
     )
 
-    stats: dict[str, int] = {}
+    stats: dict = {}
     count = _prefetch_prepare_option_data(
         "fake",
         ["NVDA"],
@@ -1046,6 +1046,88 @@ def test_prefetch_prepare_option_data_records_missing_bar_details(monkeypatch):
     ]
 
 
+def test_prefetch_prepare_option_data_reports_bar_budget_skipped_symbols(monkeypatch):
+    import ai_trader.backtest as bt_mod
+
+    monkeypatch.setattr(
+        bt_mod,
+        "_ticker_price_metrics_as_of",
+        lambda *args, **kwargs: {
+            "price": 100.0,
+            "intraday_chg": 0.5,
+            "five_d_chg": 2.0,
+            "ten_d_chg": 3.0,
+            "session_high": 101.0,
+            "session_low": 99.0,
+            "recent_high": 102.0,
+            "recent_low": 98.0,
+            "range_pos_pct": 50.0,
+            "range_label": "mid_range",
+            "trend": "up",
+            "is_intraday": True,
+        },
+    )
+
+    def mock_fetch_contracts(api_key, ticker, option_type, *args, **kwargs):
+        return [
+            {
+                "ticker": f"{ticker}{option_type.upper()}",
+                "strike_price": 100,
+                "expiration_date": "2025-01-24",
+            }
+        ]
+
+    monkeypatch.setattr(bt_mod, "fetch_polygon_option_contracts", mock_fetch_contracts)
+    warmed: list[str] = []
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_historical_intraday_bars",
+        lambda api_key, ticker, trading_day, multiplier=5, cache=None, **kwargs: (
+            warmed.append(ticker) or [{"c": 1.0}]
+        ),
+    )
+    monkeypatch.setattr(
+        bt_mod,
+        "fetch_option_daily_bar",
+        lambda *args, **kwargs: {"c": 1.0},
+    )
+
+    stats: dict = {}
+    count = _prefetch_prepare_option_data(
+        "fake",
+        ["AAPL", "MSFT", "NVDA"],
+        datetime(2025, 1, 10, 9, 35, tzinfo=EASTERN_TZ),
+        PolygonCache(),
+        default_dte=14,
+        contracts_per_side=1,
+        max_symbols=1,
+        stats=stats,
+    )
+
+    assert count == 2
+    assert warmed == ["AAPLCALL", "AAPLPUT"]
+    assert stats["budget_skipped_option_bar_symbols"] == 2
+    assert stats["budget_skipped_primary_option_contract_bars"] == 4
+    assert stats["budget_skipped_option_bar_details"] == [
+        {
+            "underlying": "MSFT",
+            "reason": (
+                "prepare_prefetch_bar_symbols budget excluded this focus "
+                "ticker from primary call/put bar warmup"
+            ),
+            "skipped_primary_option_contract_bars": 2,
+        },
+        {
+            "underlying": "NVDA",
+            "reason": (
+                "prepare_prefetch_bar_symbols budget excluded this focus "
+                "ticker from primary call/put bar warmup"
+            ),
+            "skipped_primary_option_contract_bars": 2,
+        },
+    ]
+
+
 def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(monkeypatch):
     import ai_trader.backtest as bt_mod
 
@@ -1103,6 +1185,20 @@ def test_prefetch_prepare_option_data_stops_on_polygon_bar_authorization_error(m
     assert stats["missing_primary_option_contract_bars"] == 0
     assert stats["missing_option_contract_bars"] == 0
     assert stats["option_bar_authorization_errors"] == 1
+    assert stats["option_bar_authorization_error_details"] == [
+        {
+            "ticker": "CALLATM",
+            "reason": "Polygon 403: NOT_AUTHORIZED",
+            "underlying": "NVDA",
+            "option_type": "call",
+            "prefetch_rank": 1,
+            "is_primary_context": True,
+            "strike": 100.0,
+            "moneyness": "atm",
+            "expiration_date": "2025-01-24",
+            "dte": 14,
+        }
+    ]
     assert stats["option_bar_rate_limit_errors"] == 0
 
 
@@ -3206,13 +3302,26 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
         attempted_primary_option_contract_bars=2,
         warmed_primary_option_contract_bars=1,
         missing_primary_option_contract_bars=1,
+        budget_skipped_option_bar_symbols=1,
+        budget_skipped_primary_option_contract_bars=2,
         deferred_option_contract_bars=1,
         deferred_primary_option_contract_bars=1,
         missing_option_contract_bar_details=[
             {"ticker": "CALLMISS", "reason": "offline cache miss"}
         ],
+        budget_skipped_option_bar_details=[
+            {
+                "underlying": "MSFT",
+                "reason": "prepare_prefetch_bar_symbols budget excluded",
+                "skipped_primary_option_contract_bars": 2,
+            }
+        ],
         deferred_option_contract_bar_details=[
             {"ticker": "CALLDEFER", "reason": "Polygon 429"}
+        ],
+        option_bar_authorization_errors=1,
+        option_bar_authorization_error_details=[
+            {"ticker": "CALLAUTH", "reason": "Polygon 403"}
         ],
         option_bar_rate_limit_errors=1,
         offline_news_cache_misses=1,
@@ -3240,13 +3349,26 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
                 "attempted_primary_option_contract_bars": 2,
                 "warmed_primary_option_contract_bars": 1,
                 "missing_primary_option_contract_bars": 1,
+                "budget_skipped_option_bar_symbols": 1,
+                "budget_skipped_primary_option_contract_bars": 2,
                 "deferred_option_contract_bars": 1,
                 "deferred_primary_option_contract_bars": 1,
                 "missing_option_contract_bar_details": [
                     {"ticker": "CALLMISS", "reason": "offline cache miss"}
                 ],
+                "budget_skipped_option_bar_details": [
+                    {
+                        "underlying": "MSFT",
+                        "reason": "prepare_prefetch_bar_symbols budget excluded",
+                        "skipped_primary_option_contract_bars": 2,
+                    }
+                ],
                 "deferred_option_contract_bar_details": [
                     {"ticker": "CALLDEFER", "reason": "Polygon 429"}
+                ],
+                "option_bar_authorization_errors": 1,
+                "option_bar_authorization_error_details": [
+                    {"ticker": "CALLAUTH", "reason": "Polygon 403"}
                 ],
                 "option_bar_rate_limit_errors": 1,
                 "offline_news_cache_miss": False,
@@ -3284,13 +3406,26 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["attempted_primary_option_contract_bars"] == 2
     assert payload["warmed_primary_option_contract_bars"] == 1
     assert payload["missing_primary_option_contract_bars"] == 1
+    assert payload["budget_skipped_option_bar_symbols"] == 1
+    assert payload["budget_skipped_primary_option_contract_bars"] == 2
     assert payload["deferred_option_contract_bars"] == 1
     assert payload["deferred_primary_option_contract_bars"] == 1
     assert payload["missing_option_contract_bar_details"] == [
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
     ]
+    assert payload["budget_skipped_option_bar_details"] == [
+        {
+            "underlying": "MSFT",
+            "reason": "prepare_prefetch_bar_symbols budget excluded",
+            "skipped_primary_option_contract_bars": 2,
+        }
+    ]
     assert payload["deferred_option_contract_bar_details"] == [
         {"ticker": "CALLDEFER", "reason": "Polygon 429"}
+    ]
+    assert payload["option_bar_authorization_errors"] == 1
+    assert payload["option_bar_authorization_error_details"] == [
+        {"ticker": "CALLAUTH", "reason": "Polygon 403"}
     ]
     assert payload["option_bar_rate_limit_errors"] == 1
     assert payload["offline_news_cache_misses"] == 1
@@ -3321,6 +3456,12 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     )
     assert payload["prepare_decisions"][0]["warmed_primary_option_contract_bars"] == 1
     assert payload["prepare_decisions"][0]["missing_primary_option_contract_bars"] == 1
+    assert payload["prepare_decisions"][0]["budget_skipped_option_bar_symbols"] == 1
+    assert (
+        payload["prepare_decisions"][0][
+            "budget_skipped_primary_option_contract_bars"
+        ] == 2
+    )
     assert payload["prepare_decisions"][0]["deferred_option_contract_bars"] == 1
     assert (
         payload["prepare_decisions"][0]["deferred_primary_option_contract_bars"] == 1
@@ -3328,9 +3469,20 @@ def test_prepare_result_to_dict_includes_cache_warmup_evidence(tmp_path):
     assert payload["prepare_decisions"][0]["missing_option_contract_bar_details"] == [
         {"ticker": "CALLMISS", "reason": "offline cache miss"}
     ]
+    assert payload["prepare_decisions"][0]["budget_skipped_option_bar_details"] == [
+        {
+            "underlying": "MSFT",
+            "reason": "prepare_prefetch_bar_symbols budget excluded",
+            "skipped_primary_option_contract_bars": 2,
+        }
+    ]
     assert payload["prepare_decisions"][0]["deferred_option_contract_bar_details"] == [
         {"ticker": "CALLDEFER", "reason": "Polygon 429"}
     ]
+    assert payload["prepare_decisions"][0]["option_bar_authorization_errors"] == 1
+    assert payload["prepare_decisions"][0][
+        "option_bar_authorization_error_details"
+    ] == [{"ticker": "CALLAUTH", "reason": "Polygon 403"}]
     assert payload["prepare_decisions"][0]["option_bar_rate_limit_errors"] == 1
     assert payload["prepare_decisions"][0]["finalists"] == ["AAPL"]
     assert payload["prepare_decisions"][1]["offline_news_cache_miss"] is True
