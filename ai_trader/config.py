@@ -188,6 +188,38 @@ def resolved_llm_temperature(
     return LLM_TEMPERATURE
 
 
+def resolved_max_risk_per_trade() -> float:
+    """Live risk-rail cap on premium per trade, overridable via env.
+
+    Defaults to MAX_RISK_PER_TRADE. Set MAX_RISK_PER_TRADE in the environment
+    (or ai_trader/.env) to run live/paper trading at a more conservative size
+    without touching code. Backtest defaults are captured separately and are
+    not affected unless the env var is set for the backtest process too.
+    """
+    return _env_float(
+        "MAX_RISK_PER_TRADE", MAX_RISK_PER_TRADE, minimum=0.0, maximum=1.0
+    )
+
+
+def resolved_max_total_exposure() -> float:
+    """Live cap on total open notional as a fraction of equity."""
+    return _env_float(
+        "MAX_TOTAL_EXPOSURE", MAX_TOTAL_EXPOSURE, minimum=0.0, maximum=1.0
+    )
+
+
+def resolved_daily_loss_limit() -> float:
+    """Live daily loss halt as a fraction of equity."""
+    return _env_float(
+        "DAILY_LOSS_LIMIT", DAILY_LOSS_LIMIT, minimum=0.0, maximum=1.0
+    )
+
+
+def resolved_max_open_positions() -> int:
+    """Live cap on simultaneous open positions."""
+    return _env_int("MAX_OPEN_POSITIONS", MAX_OPEN_POSITIONS, minimum=1)
+
+
 def resolved_max_consecutive_llm_error_cycles(value: int | None = None) -> int:
     """Resolve the LLM error fail-fast threshold after .env loading."""
     if value is not None:

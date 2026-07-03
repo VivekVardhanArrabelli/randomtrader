@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r ai_trader/requirements.txt pytest
+      - name: Import smoke check (live trading modules)
+        run: |
+          python -c "import ai_trader.loop, ai_trader.executor, ai_trader.paper_runner, ai_trader.backtest, ai_trader.replay, ai_trader.experiments, ai_trader.report"
+      - name: Run test suite
+        run: |
+          python -m pytest tests/ -q

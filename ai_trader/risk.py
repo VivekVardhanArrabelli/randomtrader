@@ -1,6 +1,7 @@
 """Risk management for the AI trader.
 
-Core rule: each trade risks at most 40% of portfolio equity.
+Core rule: each trade risks at most MAX_RISK_PER_TRADE of portfolio equity
+(default 40%, overridable via the MAX_RISK_PER_TRADE env var for live runs).
 For long options, max loss = premium paid, so:
   max_premium = equity * MAX_RISK_PER_TRADE
 """
@@ -47,21 +48,21 @@ def evaluate_trade_risk(
     """Check whether a proposed trade passes all risk rules."""
 
     # Daily loss limit
-    if equity > 0 and day_pl <= -(equity * config.DAILY_LOSS_LIMIT):
+    if equity > 0 and day_pl <= -(equity * config.resolved_daily_loss_limit()):
         return RiskCheck(False, "daily loss limit reached", 0, 0.0)
 
     # Max open positions
-    if open_positions >= config.MAX_OPEN_POSITIONS:
+    if open_positions >= config.resolved_max_open_positions():
         return RiskCheck(False, "max open positions reached", 0, 0.0)
 
     # Max total exposure
-    max_exposure = equity * config.MAX_TOTAL_EXPOSURE
+    max_exposure = equity * config.resolved_max_total_exposure()
     remaining_exposure = max_exposure - current_exposure
     if remaining_exposure <= 0:
         return RiskCheck(False, "max total exposure reached", 0, 0.0)
 
-    # Max risk per trade: 40% of equity
-    max_premium = equity * config.MAX_RISK_PER_TRADE
+    # Max premium per trade as a fraction of equity
+    max_premium = equity * config.resolved_max_risk_per_trade()
 
     # Also cap by remaining exposure budget and available cash
     max_premium = min(max_premium, remaining_exposure, cash)
@@ -103,18 +104,18 @@ def evaluate_stock_trade_risk(
 ) -> StockRiskCheck:
     """Check whether a proposed stock trade passes the same hard risk rails."""
 
-    if equity > 0 and day_pl <= -(equity * config.DAILY_LOSS_LIMIT):
+    if equity > 0 and day_pl <= -(equity * config.resolved_daily_loss_limit()):
         return StockRiskCheck(False, "daily loss limit reached", 0, 0.0)
 
-    if open_positions >= config.MAX_OPEN_POSITIONS:
+    if open_positions >= config.resolved_max_open_positions():
         return StockRiskCheck(False, "max open positions reached", 0, 0.0)
 
-    max_exposure = equity * config.MAX_TOTAL_EXPOSURE
+    max_exposure = equity * config.resolved_max_total_exposure()
     remaining_exposure = max_exposure - current_exposure
     if remaining_exposure <= 0:
         return StockRiskCheck(False, "max total exposure reached", 0, 0.0)
 
-    max_notional = equity * config.MAX_RISK_PER_TRADE
+    max_notional = equity * config.resolved_max_risk_per_trade()
     max_notional = min(max_notional, remaining_exposure, cash)
 
     if max_notional <= 0:

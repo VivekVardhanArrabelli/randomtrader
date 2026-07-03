@@ -148,3 +148,86 @@ def test_size_for_risk_budget_returns_zero_when_unit_is_too_expensive():
 
 def test_size_for_risk_budget_floors_to_whole_units():
     assert size_for_risk_budget(1_250.0, 500.0) == 2
+
+
+def test_risk_rails_env_overrides(monkeypatch):
+    monkeypatch.setenv("MAX_RISK_PER_TRADE", "0.05")
+    monkeypatch.setenv("MAX_TOTAL_EXPOSURE", "0.25")
+    monkeypatch.setenv("MAX_OPEN_POSITIONS", "2")
+    monkeypatch.setenv("DAILY_LOSS_LIMIT", "0.05")
+
+    # Per-trade premium cap shrinks to 5% of equity
+    result = evaluate_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=0,
+        open_positions=0,
+        option_ask=5.00,
+        day_pl=0.0,
+    )
+    assert result.approved
+    assert result.max_premium <= 100_000 * 0.05 + 0.01
+
+    # Position cap now binds at 2
+    result = evaluate_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=0,
+        open_positions=2,
+        option_ask=5.00,
+        day_pl=0.0,
+    )
+    assert not result.approved
+    assert "max open positions" in result.reason
+
+    # Exposure cap now binds at 25% of equity
+    result = evaluate_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=25_000,
+        open_positions=0,
+        option_ask=5.00,
+        day_pl=0.0,
+    )
+    assert not result.approved
+    assert "max total exposure" in result.reason
+
+    # Daily loss halt now binds at -5%
+    result = evaluate_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=0,
+        open_positions=0,
+        option_ask=5.00,
+        day_pl=-6_000,
+    )
+    assert not result.approved
+    assert "daily loss" in result.reason
+
+    # Stock rails honor the same overrides
+    stock = evaluate_stock_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=0,
+        open_positions=0,
+        share_price=100.0,
+        day_pl=0.0,
+    )
+    assert stock.approved
+    assert stock.max_notional <= 100_000 * 0.05 + 0.01
+
+
+def test_risk_rails_env_overrides_ignore_garbage(monkeypatch):
+    monkeypatch.setenv("MAX_RISK_PER_TRADE", "not-a-number")
+    result = evaluate_trade_risk(
+        equity=100_000,
+        cash=50_000,
+        current_exposure=0,
+        open_positions=0,
+        option_ask=5.00,
+        day_pl=0.0,
+    )
+    assert result.approved
+    # Falls back to the 40% default
+    assert result.max_premium <= 100_000 * 0.40 + 0.01
+    assert result.max_premium > 100_000 * 0.05
