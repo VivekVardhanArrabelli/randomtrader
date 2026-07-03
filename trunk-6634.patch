@@ -1,4 +1,4 @@
-From ee70e13486c1e9dcaa00b87517afa37db8114374 Mon Sep 17 00:00:00 2001
+From 817897276a031919d4cc93fc43aad2d2840a776a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 3 Jul 2026 20:21:43 +0000
 Subject: [PATCH] TRUNK-6634: Run mysql-only changesets on MariaDB in 2.1.x
@@ -96,7 +96,7 @@ index 784f753..da4bdbb 100644
  			<columnExists tableName="cohort_member" columnName="uuid"/>
 diff --git a/api/src/test/java/org/openmrs/liquibase/MariaDbUpdateChangeSetsTest.java b/api/src/test/java/org/openmrs/liquibase/MariaDbUpdateChangeSetsTest.java
 new file mode 100644
-index 0000000..7628415
+index 0000000..fc5a110
 --- /dev/null
 +++ b/api/src/test/java/org/openmrs/liquibase/MariaDbUpdateChangeSetsTest.java
 @@ -0,0 +1,122 @@
@@ -156,7 +156,7 @@ index 0000000..7628415
 +	}
 +
 +	@Test
-+	public void cohortMemberChangeSetsShouldRunOnMariaDb() {
++	public void shouldRunCohortMemberChangeSetsOnMariaDb() {
 +		for (String id : new String[] { "201609171146-2.1", "201609171146-2.2", "201609171146-2.3" }) {
 +			ChangeSet changeSet = findById(id);
 +			Set<String> dbms = changeSet.getDbmsSet();
@@ -167,7 +167,7 @@ index 0000000..7628415
 +	}
 +
 +	@Test
-+	public void editedChangeSetsShouldKeepHistoricalChecksums() {
++	public void shouldKeepHistoricalChecksumsOfEditedChangeSets() {
 +		// Values recorded in DATABASECHANGELOG of deployments that ran these changesets before
 +		// TRUNK-6634. If one of these assertions fails, the change being made will break
 +		// "liquibase validate" on every existing OpenMRS database and must not be merged.
@@ -178,7 +178,7 @@ index 0000000..7628415
 +	}
 +
 +	@Test
-+	public void mariaDbUuidBackfillShouldRunBetweenUuidCreationAndUniqueConstraint() {
++	public void shouldRunMariaDbUuidBackfillBetweenUuidCreationAndUniqueConstraint() {
 +		ChangeSet backfill = findById(MARIADB_UUID_BACKFILL_ID);
 +		Set<String> dbms = backfill.getDbmsSet();
 +		assertNotNull(dbms, "uuid backfill should declare a dbms attribute");
@@ -197,7 +197,7 @@ index 0000000..7628415
 +	}
 +
 +	@Test
-+	public void historicalUuidBackfillShouldNotBeEditedForMariaDb() {
++	public void shouldNotEditHistoricalUuidBackfillForMariaDb() {
 +		// The mysql/oracle uuid backfill cannot be extended to mariadb in place: adding a
 +		// modifySql block changes the checksum (unlike dbms attribute or precondition edits).
 +		// MariaDB support is provided by the dedicated changeset instead.

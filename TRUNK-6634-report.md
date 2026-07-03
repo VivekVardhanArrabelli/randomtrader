@@ -103,7 +103,15 @@ File: `api/src/main/resources/org/openmrs/liquibase/updates/liquibase-update-to-
 
 Verified in this environment:
 - `mvn -pl api test -Dtest='MariaDbUpdateChangeSetsTest,ChangeLogVersionsTest,ChangeLogDetectiveTest,ChangeLogVersionFinderTest'` → 33/33 pass, with the project's default build gates (checkstyle, license headers) enabled.
-- Full `mvn -pl api test` suite run (see session notes for result).
+- Full `mvn -pl api test` suite: **5,097 tests, 45 skipped, 1 failure — the
+  failure is pre-existing and environment-specific, not related to this
+  change**: `OpenmrsConfigurationFactoryTest.getConfigurationFiles_shouldIgnoreUnreadableFiles`
+  fails only because the sandbox runs as root (`File.setReadable(false)`
+  succeeds but root can still read the file, so the "unreadable" fixture is
+  returned). It passes on unprivileged CI runners.
+  (The suite's `OpenmrsTestsTest` naming-convention checker also caught an
+  earlier draft of the new test class using non-`should*` method names; fixed
+  and re-verified before this bundle was produced.)
 - Checksum invariance measured empirically as above (JDK 21, Liquibase 4.32.0).
 
 **Not verified here** (no Docker/MariaDB server in this sandbox):
